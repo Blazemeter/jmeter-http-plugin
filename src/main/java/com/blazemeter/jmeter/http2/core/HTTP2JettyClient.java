@@ -2541,7 +2541,9 @@ public class HTTP2JettyClient {
       client.setDestinationIdleTimeout(idleTimeout);
     }
     client.setIdleTimeout(idleTimeout);
-    addConnectionLogging(client);
+    if (LowLevelDebugLog.isEnabled()) {
+      addConnectionLogging(client);
+    }
   }
 
   private static void addConnectionLogging(HttpClient client) {
@@ -2589,6 +2591,9 @@ public class HTTP2JettyClient {
   }
 
   private static void logAlpnLine(String message) {
+    if (!LowLevelDebugLog.isEnabled()) {
+      return;
+    }
     try {
       Path parent = ALPN_DEBUG_LOG_PATH.getParent();
       if (parent != null) {
