@@ -1,14 +1,19 @@
 package com.blazemeter.jmeter.http2.core;
 
+import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
+
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.Socket;
 import java.security.KeyStore;
 import java.security.Principal;
 import java.security.PrivateKey;
+import java.security.cert.CRL;
 import java.security.cert.X509Certificate;
+import java.util.Collection;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509KeyManager;
 import org.apache.jmeter.util.JsseSSLManager;
@@ -22,10 +27,20 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
 
   public JMeterJettySslContextFactory() {
     setTrustAll(true);
+    setValidatePeerCerts(false);
     String keyStorePath = System.getProperty("javax.net.ssl.keyStore");
     if (keyStorePath != null && !keyStorePath.isEmpty()) {
       if (SslStorePathResolver.isFileBasedStoreLocation(keyStorePath)) {
-        setKeyStorePath(SslStorePathResolver.toJettyFileUri(keyStorePath));
+        String jettyKeyStoreUri = SslStorePathResolver.toJettyFileUri(keyStorePath);
+        String keyStoreType = SslStorePathResolver.resolveKeyStoreType(keyStorePath);
+        lowLevelDebug(
+            "SSL keyStore path resolved: javax.net.ssl.keyStore='{}' -> jettyUri='{}'",
+            keyStorePath, jettyKeyStoreUri);
+        lowLevelDebug(
+            "SSL keyStore type resolved: javax.net.ssl.keyStoreType='{}' -> jettyType='{}'",
+            System.getProperty("javax.net.ssl.keyStoreType"), keyStoreType);
+        setKeyStorePath(jettyKeyStoreUri);
+        setKeyStoreType(keyStoreType);
       }
       keys = getKeyStore((JsseSSLManager) SSLManager.getInstance());
       /*
@@ -40,7 +55,16 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
     String truststore = System.getProperty("javax.net.ssl.trustStore");
     if (truststore != null && !truststore.isEmpty()) {
       if (SslStorePathResolver.isFileBasedStoreLocation(truststore)) {
-        setTrustStorePath(SslStorePathResolver.toJettyFileUri(truststore));
+        String jettyTrustStoreUri = SslStorePathResolver.toJettyFileUri(truststore);
+        String trustStoreType = SslStorePathResolver.resolveTrustStoreType(truststore);
+        lowLevelDebug(
+            "SSL trustStore path resolved: javax.net.ssl.trustStore='{}' -> jettyUri='{}'",
+            truststore, jettyTrustStoreUri);
+        lowLevelDebug(
+            "SSL trustStore type resolved: javax.net.ssl.trustStoreType='{}' -> jettyType='{}'",
+            System.getProperty("javax.net.ssl.trustStoreType"), trustStoreType);
+        setTrustStorePath(jettyTrustStoreUri);
+        setTrustStoreType(trustStoreType);
       }
       getTrustStore((JsseSSLManager) SSLManager.getInstance());
       /*
@@ -79,6 +103,18 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
   // Overwritten to avoid warning logging
   @Override
   protected void checkEndPointIdentificationAlgorithm() {
+  }
+
+  // JMeter HTTP uses CustomX509TrustManager which does not validate server certificates.
+  // Jetty still runs PKIX when a keyStore is configured unless trust managers are overridden.
+  @Override
+  protected TrustManager[] getTrustManagers(KeyStore trustStore,
+      Collection<? extends CRL> crls) throws Exception {
+    if (isTrustAll()) {
+      lowLevelDebug("SSL trust managers: using TRUST_ALL_CERTS (JMeter HTTP parity)");
+      return TRUST_ALL_CERTS;
+    }
+    return super.getTrustManagers(trustStore, crls);
   }
 
   // Overwritten to provide jmeter SSLManager configured keyManagers

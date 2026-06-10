@@ -57,6 +57,66 @@ public class SslStorePathResolverTest {
     assertThat(SslStorePathResolver.isFileBasedStoreLocation(RELATIVE_STORE)).isTrue();
   }
 
+  @Test
+  public void resolveKeyStoreTypeUsesPropertyWhenSet() {
+    String previous = System.getProperty("javax.net.ssl.keyStoreType");
+    try {
+      System.setProperty("javax.net.ssl.keyStoreType", "PKCS12");
+      assertThat(SslStorePathResolver.resolveKeyStoreType("certs/keystore.jks"))
+          .isEqualTo("PKCS12");
+    } finally {
+      restoreProperty("javax.net.ssl.keyStoreType", previous);
+    }
+  }
+
+  @Test
+  public void resolveKeyStoreTypeInfersPkcs12FromP12ExtensionLikeJMeter() {
+    String previous = System.getProperty("javax.net.ssl.keyStoreType");
+    try {
+      System.clearProperty("javax.net.ssl.keyStoreType");
+      assertThat(SslStorePathResolver.resolveKeyStoreType(RELATIVE_STORE)).isEqualTo("pkcs12");
+      assertThat(SslStorePathResolver.resolveKeyStoreType("certs/keystore.jks")).isEqualTo("JKS");
+      assertThat(SslStorePathResolver.resolveKeyStoreType("certs/keystore.pfx")).isEqualTo("JKS");
+    } finally {
+      restoreProperty("javax.net.ssl.keyStoreType", previous);
+    }
+  }
+
+  @Test
+  public void resolveTrustStoreTypeUsesPropertyWhenSet() {
+    String previous = System.getProperty("javax.net.ssl.trustStoreType");
+    try {
+      System.setProperty("javax.net.ssl.trustStoreType", "JKS");
+      assertThat(SslStorePathResolver.resolveTrustStoreType("certs/trust.p12"))
+          .isEqualTo("JKS");
+    } finally {
+      restoreProperty("javax.net.ssl.trustStoreType", previous);
+    }
+  }
+
+  @Test
+  public void resolveTrustStoreTypeInfersPkcs12FromP12OrPfxWhenUnset() {
+    String previous = System.getProperty("javax.net.ssl.trustStoreType");
+    try {
+      System.clearProperty("javax.net.ssl.trustStoreType");
+      assertThat(SslStorePathResolver.resolveTrustStoreType("certs/trust.p12"))
+          .isEqualTo("pkcs12");
+      assertThat(SslStorePathResolver.resolveTrustStoreType("certs/trust.pfx"))
+          .isEqualTo("pkcs12");
+      assertThat(SslStorePathResolver.resolveTrustStoreType("certs/trust.jks")).isEqualTo("JKS");
+    } finally {
+      restoreProperty("javax.net.ssl.trustStoreType", previous);
+    }
+  }
+
+  private static void restoreProperty(String key, String value) {
+    if (value == null) {
+      System.clearProperty(key);
+    } else {
+      System.setProperty(key, value);
+    }
+  }
+
   private static boolean isWindows() {
     return File.separatorChar == '\\';
   }
