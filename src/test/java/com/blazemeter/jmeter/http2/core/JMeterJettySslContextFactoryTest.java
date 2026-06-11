@@ -20,12 +20,16 @@ public class JMeterJettySslContextFactoryTest extends HTTP2TestBase {
 
   private String previousKeyStore;
   private String previousKeyStorePassword;
+  private String previousTrustStore;
+  private String previousTrustStorePassword;
   private Path tempKeystore;
 
   @After
   public void restoreSystemProperties() throws IOException {
     restoreProperty("javax.net.ssl.keyStore", previousKeyStore);
     restoreProperty("javax.net.ssl.keyStorePassword", previousKeyStorePassword);
+    restoreProperty("javax.net.ssl.trustStore", previousTrustStore);
+    restoreProperty("javax.net.ssl.trustStorePassword", previousTrustStorePassword);
     SSLManager.reset();
     if (tempKeystore != null) {
       Files.deleteIfExists(tempKeystore);
@@ -88,12 +92,70 @@ public class JMeterJettySslContextFactoryTest extends HTTP2TestBase {
     assertThatCode(JMeterJettySslContextFactory::new).doesNotThrowAnyException();
   }
 
+  @Test
+  public void shouldNotThrowWhenJettyKeyStorePathDoesNotExist() {
+    String missingPath = "certs/nonexistent-jmeter-jetty-keystore.p12";
+    TestableJMeterJettySslContextFactory factory = new TestableJMeterJettySslContextFactory();
+
+    assertThatCode(() -> factory.configureKeyStorePathForJetty(
+        missingPath,
+        SslStorePathResolver.toJettyFileUri(missingPath),
+        "pkcs12"))
+        .doesNotThrowAnyException();
+  }
+
+  @Test
+  public void shouldNotThrowWhenJettyTrustStorePathDoesNotExist() {
+    String missingPath = "certs/nonexistent-jmeter-jetty-truststore.jks";
+    TestableJMeterJettySslContextFactory factory = new TestableJMeterJettySslContextFactory();
+
+    assertThatCode(() -> factory.configureTrustStorePathForJetty(
+        missingPath,
+        SslStorePathResolver.toJettyFileUri(missingPath),
+        "JKS"))
+        .doesNotThrowAnyException();
+  }
+
+  @Test
+  public void shouldNotThrowWhenSetKeyStorePathFails() {
+    FailingKeyStorePathFactory factory = new FailingKeyStorePathFactory();
+
+    assertThatCode(() -> factory.configureKeyStorePathForJetty(
+        "certs/keystore.p12", "file:///certs/keystore.p12", "pkcs12"))
+        .doesNotThrowAnyException();
+  }
+
+  @Test
+  public void shouldNotThrowWhenSetTrustStorePathFails() {
+    FailingTrustStorePathFactory factory = new FailingTrustStorePathFactory();
+
+    assertThatCode(() -> factory.configureTrustStorePathForJetty(
+        "certs/truststore.jks", "file:///certs/truststore.jks", "JKS"))
+        .doesNotThrowAnyException();
+  }
+
   private static final class TestableJMeterJettySslContextFactory
       extends JMeterJettySslContextFactory {
 
     TrustManager[] getTrustManagersForTest(java.security.KeyStore trustStore,
         Collection<? extends CRL> crls) throws Exception {
       return getTrustManagers(trustStore, crls);
+    }
+  }
+
+  private static final class FailingKeyStorePathFactory extends JMeterJettySslContextFactory {
+
+    @Override
+    public void setKeyStorePath(String path) {
+      throw new IllegalArgumentException("Could not find keyStore at " + path);
+    }
+  }
+
+  private static final class FailingTrustStorePathFactory extends JMeterJettySslContextFactory {
+
+    @Override
+    public void setTrustStorePath(String path) {
+      throw new IllegalArgumentException("Could not find trustStore at " + path);
     }
   }
 

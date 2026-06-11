@@ -20,8 +20,12 @@ import org.apache.jmeter.util.JsseSSLManager;
 import org.apache.jmeter.util.SSLManager;
 import org.apache.jmeter.util.keystore.JmeterKeyStore;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class JMeterJettySslContextFactory extends SslContextFactory.Client {
+
+  private static final Logger LOG = LoggerFactory.getLogger(JMeterJettySslContextFactory.class);
 
   private final JmeterKeyStore keys;
 
@@ -39,8 +43,7 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
         lowLevelDebug(
             "SSL keyStore type resolved: javax.net.ssl.keyStoreType='{}' -> jettyType='{}'",
             System.getProperty("javax.net.ssl.keyStoreType"), keyStoreType);
-        setKeyStorePath(jettyKeyStoreUri);
-        setKeyStoreType(keyStoreType);
+        configureKeyStorePathForJetty(keyStorePath, jettyKeyStoreUri, keyStoreType);
       }
       keys = getKeyStore((JsseSSLManager) SSLManager.getInstance());
       /*
@@ -63,8 +66,7 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
         lowLevelDebug(
             "SSL trustStore type resolved: javax.net.ssl.trustStoreType='{}' -> jettyType='{}'",
             System.getProperty("javax.net.ssl.trustStoreType"), trustStoreType);
-        setTrustStorePath(jettyTrustStoreUri);
-        setTrustStoreType(trustStoreType);
+        configureTrustStorePathForJetty(truststore, jettyTrustStoreUri, trustStoreType);
       }
       getTrustStore((JsseSSLManager) SSLManager.getInstance());
       /*
@@ -72,6 +74,30 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
        password.
       */
       setTrustStorePassword(System.getProperty("javax.net.ssl.trustStorePassword"));
+    }
+  }
+
+  void configureKeyStorePathForJetty(String originalPath, String jettyUri, String storeType) {
+    try {
+      setKeyStorePath(jettyUri);
+      setKeyStoreType(storeType);
+    } catch (RuntimeException e) {
+      LOG.warn("Could not set Jetty keyStore path for '{}': {}. "
+              + "Client certificate authentication may not work.",
+          originalPath, e.getMessage());
+      lowLevelDebug("Could not set Jetty keyStore path for '{}'", originalPath, e);
+    }
+  }
+
+  void configureTrustStorePathForJetty(String originalPath, String jettyUri, String storeType) {
+    try {
+      setTrustStorePath(jettyUri);
+      setTrustStoreType(storeType);
+    } catch (RuntimeException e) {
+      LOG.warn("Could not set Jetty trustStore path for '{}': {}. "
+              + "Trust-all SSL configuration will still be used.",
+          originalPath, e.getMessage());
+      lowLevelDebug("Could not set Jetty trustStore path for '{}'", originalPath, e);
     }
   }
 
