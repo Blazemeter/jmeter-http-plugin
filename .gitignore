@@ -211,6 +211,7 @@ Temporary Items
 
 ### Maven ###
 target/
+cp.txt
 pom.xml.tag
 pom.xml.releaseBackup
 pom.xml.versionsBackup

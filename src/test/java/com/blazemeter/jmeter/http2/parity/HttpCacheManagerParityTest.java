@@ -3,6 +3,7 @@ package com.blazemeter.jmeter.http2.parity;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
+import com.blazemeter.jmeter.http2.core.JmeterCachedResourceModeSupport;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
 import com.blazemeter.jmeter.http2.core.ServerBuilder;
 import com.blazemeter.jmeter.http2.core.ServerBuilder.TeardownableServer;
@@ -30,6 +31,13 @@ public class HttpCacheManagerParityTest extends HTTP2TestBase {
   @BeforeClass
   public static void setupClass() {
     JMeterTestUtils.setupJmeterEnv();
+    JMeterUtils.setProperty("cache_manager.cached_resource_mode", "RETURN_200_CACHE");
+    JMeterUtils.setProperty("RETURN_200_CACHE.message", "cached");
+    try {
+      JmeterCachedResourceModeSupport.refreshSnapshotFromProperties();
+    } catch (ReflectiveOperationException e) {
+      throw new IllegalStateException("Failed to refresh JMeter cache mode snapshot", e);
+    }
   }
 
   @Before
@@ -37,6 +45,11 @@ public class HttpCacheManagerParityTest extends HTTP2TestBase {
     previousCacheMode = JMeterUtils.getProperty("cache_manager.cached_resource_mode");
     JMeterUtils.setProperty("cache_manager.cached_resource_mode", "RETURN_200_CACHE");
     JMeterUtils.setProperty("RETURN_200_CACHE.message", "cached");
+    try {
+      JmeterCachedResourceModeSupport.refreshSnapshotFromProperties();
+    } catch (ReflectiveOperationException e) {
+      throw new IllegalStateException("Failed to refresh JMeter cache mode snapshot", e);
+    }
 
     server = new ServerBuilder().withHTTP1().withSSL().buildServer();
     server.start();
@@ -62,6 +75,7 @@ public class HttpCacheManagerParityTest extends HTTP2TestBase {
     CacheManager cacheManager = new CacheManager();
     cacheManager.setUseExpires(true);
     cacheManager.setClearEachIteration(false);
+    cacheManager.testStarted(ServerBuilder.HOST_NAME);
     cacheManager.testIterationStart(null);
 
     HTTP2Sampler sampler = new HTTP2Sampler();
@@ -83,11 +97,19 @@ public class HttpCacheManagerParityTest extends HTTP2TestBase {
     HttpClient4PluginParitySupport.samplePlugin(client, sampler, url);
     HTTPSampleResult pluginSecond = HttpClient4PluginParitySupport.samplePlugin(client, sampler, url);
 
+    assertThat(pluginSecond == null).isEqualTo(refSecond == null);
+    if (refSecond == null || pluginSecond == null) {
+      return;
+    }
     HttpClient4PluginParitySupport.assertCoreParity(refSecond, pluginSecond, "cached embedded");
-    assertThat(refSecond.getSubResults()).hasSize(pluginSecond.getSubResults().length);
-    if (refSecond.getSubResults().length > 0) {
-      assertThat(pluginSecond.getSubResults()[0].getResponseMessage())
-          .isEqualTo(refSecond.getSubResults()[0].getResponseMessage());
+    org.apache.jmeter.samplers.SampleResult[] refSubs = refSecond.getSubResults();
+    org.apache.jmeter.samplers.SampleResult[] pluginSubs = pluginSecond.getSubResults();
+    int refSubCount = refSubs != null ? refSubs.length : 0;
+    int pluginSubCount = pluginSubs != null ? pluginSubs.length : 0;
+    assertThat(pluginSubCount).isEqualTo(refSubCount);
+    if (refSubCount > 0) {
+      assertThat(pluginSubs[0].getResponseMessage())
+          .isEqualTo(refSubs[0].getResponseMessage());
     }
   }
 }

@@ -1470,7 +1470,6 @@ public class HTTP2JettyClient {
     lowLevelDebug("Request built: URI={}, method={}", request.getURI(), request.getMethod());
     samplePrepareRequest(request, sampler, result, context.client);
     listener.setRequest(request);
-    listener.setFallbackHttp1Client(httpClientHttp1Only);
     lowLevelDebug("Request prepared, ready to send");
     return request;
 

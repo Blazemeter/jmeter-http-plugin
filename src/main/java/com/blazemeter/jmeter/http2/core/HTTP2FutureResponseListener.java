@@ -3,7 +3,6 @@ package com.blazemeter.jmeter.http2.core;
 import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
 
 import java.io.IOException;
-import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.charset.IllegalCharsetNameException;
 import java.nio.charset.StandardCharsets;
@@ -16,12 +15,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import org.eclipse.jetty.client.BufferingResponseListener;
 import org.eclipse.jetty.client.ContentResponse;
-import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.client.Response;
 import org.eclipse.jetty.client.Result;
-import org.eclipse.jetty.http.HttpFields;
-import org.eclipse.jetty.http.HttpHeader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,7 +30,6 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
   private volatile boolean onCompleteCalled = false;
   private final CountDownLatch latch = new CountDownLatch(1);
   private Request request;
-  private HttpClient fallbackHttp1Client;
   private ContentResponse response;
   private Throwable failure;
   private volatile boolean cancelled;
@@ -62,10 +57,6 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
 
   public Request getRequest() {
     return request;
-  }
-
-  public void setFallbackHttp1Client(HttpClient fallbackHttp1Client) {
-    this.fallbackHttp1Client = fallbackHttp1Client;
   }
 
   protected void setStart() {
@@ -341,13 +332,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     try {
       return getResult();
     } catch (ProtocolErrorException e) {
-      ContentResponse fallback = tryHttp11Fallback();
-      if (fallback != null) {
-        return fallback;
-      }
       LOG.error("ProtocolErrorException caught in get(), wrapping in ExecutionException");
-      // Wrap ProtocolErrorException in ExecutionException to maintain interface contract
-      // The calling code will unwrap it and handle the fallback
       throw new ExecutionException(e);
     }
   }
@@ -371,13 +356,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     try {
       return getResult();
     } catch (ProtocolErrorException e) {
-      ContentResponse fallback = tryHttp11Fallback();
-      if (fallback != null) {
-        return fallback;
-      }
       LOG.error("ProtocolErrorException caught in get(timeout), wrapping in ExecutionException");
-      // Wrap ProtocolErrorException in ExecutionException to maintain interface contract
-      // The calling code will unwrap it and handle the fallback
       throw new ExecutionException(e);
     }
   }
@@ -463,47 +442,6 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
           response.getStatus(), response.getVersion());
     }
     return response;
-  }
-
-  private ContentResponse tryHttp11Fallback() {
-    if (fallbackHttp1Client == null || request == null) {
-      return null;
-    }
-    try {
-      Request http11Request = fallbackHttp1Client.newRequest(request.getURI())
-          .method(request.getMethod())
-          .followRedirects(request.isFollowRedirects());
-      if (request.getHeaders() != null) {
-        HttpFields originalHeaders = request.getHeaders();
-        HttpFields requestHeaders = http11Request.getHeaders();
-        if (requestHeaders instanceof HttpFields.Mutable) {
-          HttpFields.Mutable newHeaders = (HttpFields.Mutable) requestHeaders;
-          originalHeaders.forEach(field -> {
-            String name = field.getName();
-            if (!name.startsWith(":")) {
-              newHeaders.put(name, field.getValue());
-            }
-          });
-          if (!newHeaders.contains(HttpHeader.HOST)) {
-            URI uri = request.getURI();
-            String host = uri.getHost() != null ? uri.getHost() : uri.getAuthority();
-            int port = uri.getPort();
-            int defaultPort = "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
-            boolean includePort = port > 0 && port != defaultPort;
-            String hostValue = includePort ? host + ":" + port : host;
-            newHeaders.put(HttpHeader.HOST, hostValue);
-          }
-        }
-      }
-      if (request.getBody() != null) {
-        http11Request.body(request.getBody());
-      }
-      lowLevelDebug("Retrying request with HTTP/1.1 in listener fallback: {}", request.getURI());
-      return http11Request.send();
-    } catch (Exception e) {
-      LOG.error("HTTP/1.1 fallback in listener failed", e);
-      return null;
-    }
   }
 
 }
