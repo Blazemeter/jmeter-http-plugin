@@ -43,12 +43,22 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.jmeter
-          key: jmeter-${{ runner.os }}-${{ hashFiles('pom.xml', 'src/test/resources/jmeter/**') }}
+          key: jmeter-${{ runner.os }}-${{ hashFiles('pom.xml', 'src/test/resources/jmeter/**', 'src/test/resources/jmeter-regression/**') }}
           restore-keys: |
             jmeter-${{ runner.os }}-
 
       - name: Build project and jmeter-test bundle
         run: xvfb-run -a mvn -U --batch-mode clean install
+
+      - name: Run JMeter HTTP parity regression (all tiers)
+        run: >-
+          xvfb-run -a mvn -Pjmeter-regression
+          -Dcheckstyle.skip=true
+          -DskipTests
+          -Djmeter.regression.tier=all
+          -Djmeter.regression.tolerateExternalServiceDrift=true
+          --batch-mode
+          verify
 
       - name: Run compatibility matrix on Java 17
         working-directory: target/jmeter-test

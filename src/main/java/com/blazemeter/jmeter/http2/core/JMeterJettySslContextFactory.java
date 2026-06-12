@@ -16,6 +16,11 @@ import org.apache.jmeter.util.SSLManager;
 import org.apache.jmeter.util.keystore.JmeterKeyStore;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 
+/**
+ * Jetty SSL client wired to JMeter {@link SSLManager}.
+ * Keystore/truststore path resolution improvements are tracked in
+ * <a href="https://github.com/Blazemeter/jmeter-http-plugin/pull/112">PR #112</a>.
+ */
 public class JMeterJettySslContextFactory extends SslContextFactory.Client {
 
   private final JmeterKeyStore keys;

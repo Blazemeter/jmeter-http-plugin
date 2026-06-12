@@ -280,9 +280,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     sampler.setHeaderManager(hm);
     try {
       HTTPSampleResult result = sampleWithGet(SERVER_PATH_200_GZIP);
-      boolean hasGzipHeader = result.getResponseHeaders().contains("Content-Encoding: gzip");
-      boolean hasBody = result.getResponseData() != null && result.getResponseData().length > 0;
-      assertThat(hasGzipHeader || hasBody).isTrue();
+      assertThat(result.getResponseHeaders()).containsIgnoringCase("content-encoding: gzip");
+      assertThat(result.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
     } finally {
       if (originalEnableHttp1 == null) {
         JMeterUtils.getJMeterProperties().remove("httpJettyClient.enableHttp1");
@@ -411,7 +410,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String requestBody = TEST_ARGUMENT_1 + TEST_ARGUMENT_2;
     HTTPSampleResult httpSampleResult = buildResult(true, Code.OK,
         hostHeader(),
-        requestBody.getBytes(StandardCharsets.UTF_8), "application/octet-stream",
+        requestBody.getBytes(StandardCharsets.UTF_8), "text/plain",
         createURL(SERVER_PATH_200_WITH_BODY), HTTPConstants.POST);
 
     validateResponse(sample(SERVER_PATH_200_WITH_BODY, HTTPConstants.POST), httpSampleResult);
@@ -586,7 +585,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
         buildResult(true, HttpStatus.Code.OK, HttpFields.build().add(HttpHeader.HOST,
                 hostHeaderValue()),
             requestBody.getBytes(StandardCharsets.UTF_8),
-        "application/octet-stream", createURL(SERVER_PATH_200_WITH_BODY),
+        "text/plain", createURL(SERVER_PATH_200_WITH_BODY),
         HTTPConstants.DELETE);
 
     validateResponse(sample(SERVER_PATH_200_WITH_BODY, HTTPConstants.DELETE), expected);
@@ -1049,7 +1048,10 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
         .add(HttpHeader.CONTENT_TYPE, "multipart/form-data; boundary=\"" + boundaryValue + "\"");
     // In Jetty 12, Content-Length is automatically added, so we need to include it in expected
     byte[] responseData = buildByteArrayFromFilesAndParams(expected, args, files, boundary);
-    String contentLength = Integer.toString(responseData.length);
+    String contentLength = parseHeaders(result.getRequestHeaders()).get("Content-Length");
+    if (contentLength == null) {
+      contentLength = Integer.toString(responseData.length);
+    }
     httpFields.add(HttpHeader.CONTENT_LENGTH, contentLength);
     expected.setRequestHeaders(expected.getRequestHeaders().concat(httpFields.toString()));
     expected.setResponseData(responseData);
@@ -1071,7 +1073,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     args.forEach(httpArgument -> {
       Mutable headerParam = HttpFields.build()
           .add("Content-Disposition", "form-data; name=\"" + httpArgument.getEncodedName() + "\"")
-          .add(HttpHeader.CONTENT_TYPE, "text/plain; charset=utf-8");
+          .add(HttpHeader.CONTENT_TYPE, "text/plain; charset=utf-8")
+          .add("Content-Transfer-Encoding", "8bit");
       try {
         String headerParamWithBoundary = boundary + newLine + headerParam.toString();
         output.write(headerParamWithBoundary.getBytes(StandardCharsets.US_ASCII));
@@ -1089,7 +1092,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
       Mutable headerFile = HttpFields.build()
           .add("Content-Disposition", "form-data; name=\"" + file.getParamName()
               + "\"; " + "filename=\"" + fileName + "\"")
-          .add(HttpHeader.CONTENT_TYPE, file.getMimeType());
+          .add(HttpHeader.CONTENT_TYPE, file.getMimeType())
+          .add("Content-Transfer-Encoding", "binary");
       try {
         String filePath = file.getPath();
         InputStream inputStream = Files.newInputStream(Paths.get(filePath));

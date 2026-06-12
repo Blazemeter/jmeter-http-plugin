@@ -6,6 +6,7 @@ import com.blazemeter.jmeter.http2.control.HTTP2Controller;
 import com.blazemeter.jmeter.http2.core.HTTP2ClientProfileConfig;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
+import com.blazemeter.jmeter.http2.core.JmeterHttpClientExceptionMapper;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -119,28 +120,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       JMeterUtils.getProperty("HTTPResponse.parsers"); //$NON-NLS-1$
 
   static {
-    String[] parsers =
-        JOrphanUtils.split(RESPONSE_PARSERS, " ", true); // returns empty array for null
-    for (final String parser : parsers) {
-      String classname = JMeterUtils.getProperty(parser + ".className"); //$NON-NLS-1$
-      if (classname == null) {
-        LOG.error("Cannot find .className property for {}, ensure you set property: '{}.className'",
-            parser, parser);
-        continue;
-      }
-      String typeList = JMeterUtils.getProperty(parser + ".types"); //$NON-NLS-1$
-      if (typeList != null) {
-        String[] types = JOrphanUtils.split(typeList, " ", true);
-        for (final String type : types) {
-          registerParser(type, classname);
-        }
-      } else {
-        LOG.warn(
-            "Cannot find .types property for {}, as a consequence parser " +
-                "will not be used, to make it usable, define property:'{}.types'",
-            parser, parser);
-      }
-    }
+    loadResponseParsersFromProperties();
   }
 
   private final transient Callable<HTTP2JettyClient> clientFactory;
@@ -626,7 +606,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         result.sampleEnd();
       }
     }
-    return errorResult(e, result);
+    return errorResult(
+        JmeterHttpClientExceptionMapper.forSampleResult(e, getAutoRedirects(), result.getURL()),
+        result);
   }
 
   /**
@@ -636,6 +618,47 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
    * the global HTTP/1.1-only origin cache ({@link HTTP2JettyClient}) even when the parent has
    * HTTP/1.1 explicitly disabled (e.g. HTTP/2-only mode).
    */
+  private HTTP2Sampler newFileEmbeddedSampler(URL url) {
+    HTTP2Sampler fileSampler = new HTTP2Sampler();
+    copyJettyProtocolSettingsToEmbeddedSampler(fileSampler);
+    String path = url.getPath();
+    boolean htmlResource = path != null
+        && (path.endsWith(".html") || path.endsWith(".htm"));
+    fileSampler.setImageParser(htmlResource);
+    fileSampler.setMethod(HTTPConstants.GET);
+    fileSampler.setProtocol(url.getProtocol());
+    fileSampler.setDomain(url.getHost());
+    fileSampler.setPort(url.getPort());
+    if (url.getQuery() == null) {
+      fileSampler.setPath(url.getPath());
+    } else {
+      fileSampler.setPath(url.getPath() + url.getQuery());
+    }
+    fileSampler.setHeaderManager(getHeaderManager());
+    fileSampler.setCookieManager(getCookieManager());
+    return fileSampler;
+  }
+
+  private static String formatFileEmbeddedLabel(URL url, int index) {
+    String path = url.getPath();
+    if (path != null && path.startsWith("/")) {
+      path = path.substring(1);
+    }
+    return url.getProtocol() + ":" + path + "-" + index;
+  }
+
+  private static void relabelFileEmbeddedChildren(HTTPSampleResult parent) {
+    int childIndex = 0;
+    for (SampleResult child : parent.getSubResults()) {
+      if (child instanceof HTTPSampleResult httpChild && httpChild.getURL() != null
+          && "file".equalsIgnoreCase(httpChild.getURL().getProtocol())) {
+        httpChild.setSampleLabel(
+            formatFileEmbeddedLabel(httpChild.getURL(), childIndex++));
+        relabelFileEmbeddedChildren(httpChild);
+      }
+    }
+  }
+
   private void copyJettyProtocolSettingsToEmbeddedSampler(HTTP2Sampler embedded) {
     embedded.setProfile(getProfile());
     embedded.setEnableHttp3(getEnableHttp3());
@@ -736,8 +759,49 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     PARSERS_FOR_CONTENT_TYPE.put(contentType, className);
   }
 
+  /**
+   * JMeter batch plans configure HTML parsers via {@code -q jmeter-batch.properties}. The plugin
+   * class may load before those properties exist, so register parsers lazily on first use.
+   */
+  private static void ensureResponseParsersLoaded() {
+    if (!PARSERS_FOR_CONTENT_TYPE.isEmpty()) {
+      return;
+    }
+    synchronized (PARSERS_FOR_CONTENT_TYPE) {
+      if (PARSERS_FOR_CONTENT_TYPE.isEmpty()) {
+        loadResponseParsersFromProperties();
+      }
+    }
+  }
+
+  private static void loadResponseParsersFromProperties() {
+    String responseParsers = JMeterUtils.getProperty("HTTPResponse.parsers");
+    String[] parsers = JOrphanUtils.split(responseParsers, " ", true);
+    for (final String parser : parsers) {
+      String classname = JMeterUtils.getProperty(parser + ".className");
+      if (classname == null) {
+        LOG.error("Cannot find .className property for {}, ensure you set property: '{}.className'",
+            parser, parser);
+        continue;
+      }
+      String typeList = JMeterUtils.getProperty(parser + ".types");
+      if (typeList != null) {
+        String[] types = JOrphanUtils.split(typeList, " ", true);
+        for (final String type : types) {
+          registerParser(type, classname);
+        }
+      } else {
+        LOG.warn(
+            "Cannot find .types property for {}, as a consequence parser "
+                + "will not be used, to make it usable, define property:'{}.types'",
+            parser, parser);
+      }
+    }
+  }
+
   private LinkExtractorParser getParser(HTTPSampleResult res)
       throws LinkExtractorParseException {
+    ensureResponseParsersLoaded();
     String parserClassName =
         PARSERS_FOR_CONTENT_TYPE.get(res.getMediaType());
     if (!StringUtils.isEmpty(parserClassName)) {
@@ -755,13 +819,12 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       // see HTTPJavaImpl#getConnectionHeaders
       //': ' is used by JMeter to fill-in requestHeaders, see getConnectionHeaders
       final String userAgentPrefix = USER_AGENT + ": ";
-      String userAgentHdr = res.substring(
-          index + userAgentPrefix.length(),
-          res.indexOf(
-              '\n',
-              // '\n' is used by JMeter to fill-in requestHeaders, see getConnectionHeaders
-              index + userAgentPrefix.length() + 1));
-      return userAgentHdr.trim();
+      int valueStart = index + userAgentPrefix.length();
+      int lineEnd = res.indexOf('\n', valueStart);
+      if (lineEnd < 0) {
+        lineEnd = res.length();
+      }
+      return res.substring(valueStart, lineEnd).trim();
     } else {
       if (LOG.isDebugEnabled()) {
         LOG.debug("No user agent extracted from requestHeaders:{}", res);
@@ -928,6 +991,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
       setSyncRequest(!isConcurrentDwn); // Change default from main request based on sub request
 
+      int fileEmbeddedIndex = 0;
       while (urls.hasNext()) {
         Object binURL = urls.next(); // See catch clause below
         try {
@@ -957,6 +1021,20 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
                   errorResult(new Exception(url.toString() + " URI can not be normalized", e),
                       new HTTPSampleResult(subres)));
               setParentSampleSuccess(subres, false);
+              continue;
+            }
+
+            if ("file".equalsIgnoreCase(url.getProtocol())) {
+              HTTP2Sampler fileSampler = newFileEmbeddedSampler(url);
+              HTTPSampleResult binRes =
+                  fileSampler.sample(url, HTTPConstants.GET, false, frameDepth + 1);
+              if (binRes != null) {
+                binRes.setSampleLabel(formatFileEmbeddedLabel(url, fileEmbeddedIndex++));
+                relabelFileEmbeddedChildren(binRes);
+              }
+              subres.addSubResult(binRes);
+              setParentSampleSuccess(subres,
+                  subres.isSuccessful() && (binRes == null || binRes.isSuccessful()));
               continue;
             }
 
