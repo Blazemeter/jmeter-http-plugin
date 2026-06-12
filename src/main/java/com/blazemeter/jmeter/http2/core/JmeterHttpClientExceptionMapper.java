@@ -1,6 +1,5 @@
 package com.blazemeter.jmeter.http2.core;
 
-import java.io.IOException;
 import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.URL;

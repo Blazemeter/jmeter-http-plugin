@@ -59,10 +59,10 @@ import org.apache.jmeter.protocol.http.control.CookieManager;
 import org.apache.jmeter.protocol.http.control.Header;
 import org.apache.jmeter.protocol.http.control.HeaderManager;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
-import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPArgument;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
+import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.services.FileServer;
 import org.apache.jmeter.testelement.property.JMeterProperty;
 import org.apache.jmeter.util.JMeterUtils;
@@ -1282,7 +1282,8 @@ public class HTTP2JettyClient {
       return null;
     }
     URI uri = request.getURI();
-    if (uri == null || !"http".equalsIgnoreCase(uri.getScheme()) || !wasH2cUpgradeAttempt(request)) {
+    if (uri == null || !"http".equalsIgnoreCase(uri.getScheme())
+        || !wasH2cUpgradeAttempt(request)) {
       return null;
     }
     if (Boolean.TRUE.equals(
@@ -1928,7 +1929,8 @@ public class HTTP2JettyClient {
             response.getStatus(), response.getVersion(), elapsed, contentLength);
         int headerCount = response.getHeaders() != null ? response.getHeaders().size() : 0;
         lowLevelDebug("Response headers: {}", headerCount);
-        if (originalRequest != null && shouldRetryAfterFailedH2cUpgrade(originalRequest, response)) {
+        if (originalRequest != null
+            && shouldRetryAfterFailedH2cUpgrade(originalRequest, response)) {
           lowLevelDebug("H2C upgrade did not negotiate HTTP/2; retrying with HTTP/1.1 for {}",
               originalRequest.getURI());
           markCleartextHttp1Only(originalRequest.getURI());
@@ -3258,21 +3260,6 @@ public class HTTP2JettyClient {
     mutableHeaders.put(HttpHeader.HOST, hostValue);
   }
 
-  /**
-   * Matches {@code HTTPHC4Impl}: sends an explicit empty {@code User-Agent} header when none
-   * is configured, instead of omitting the header entirely.
-   */
-  private void ensureEmptyUserAgentHeader(Request request) {
-    HttpFields headers = request.getHeaders();
-    if (!(headers instanceof HttpFields.Mutable)) {
-      return;
-    }
-    HttpFields.Mutable mutableHeaders = (HttpFields.Mutable) headers;
-    if (!mutableHeaders.contains(HttpHeader.USER_AGENT)) {
-      mutableHeaders.put(HttpHeader.USER_AGENT, "");
-    }
-  }
-
   private void ensureHostHeader(Request request, URI uri) {
     if (request == null || uri == null) {
       return;
@@ -3294,6 +3281,21 @@ public class HTTP2JettyClient {
     boolean includePort = port > 0 && port != defaultPort;
     String hostValue = includePort ? host + ":" + port : host;
     mutableHeaders.put(HttpHeader.HOST, hostValue);
+  }
+
+  /**
+   * Matches {@code HTTPHC4Impl}: sends an explicit empty {@code User-Agent} header when none
+   * is configured, instead of omitting the header entirely.
+   */
+  private void ensureEmptyUserAgentHeader(Request request) {
+    HttpFields headers = request.getHeaders();
+    if (!(headers instanceof HttpFields.Mutable)) {
+      return;
+    }
+    HttpFields.Mutable mutableHeaders = (HttpFields.Mutable) headers;
+    if (!mutableHeaders.contains(HttpHeader.USER_AGENT)) {
+      mutableHeaders.put(HttpHeader.USER_AGENT, "");
+    }
   }
 
   private void addPreemptiveAuthorizationHeader(Request request, URL url,
@@ -3804,7 +3806,7 @@ public class HTTP2JettyClient {
         + value + LINE_SEPARATOR;
   }
 
-  /** HttpClient4 uses canonical header names; Jetty {@link HttpFields#toString()} lowercases them. */
+  /** HC4 canonical header casing; Jetty {@link HttpFields#toString()} lowercases names. */
   private String formatMultipartPartHeaders(String disposition, String contentType,
                                             String transferEncoding) {
     StringBuilder headers = new StringBuilder();

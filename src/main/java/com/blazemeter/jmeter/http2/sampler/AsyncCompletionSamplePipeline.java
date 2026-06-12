@@ -28,7 +28,8 @@ final class AsyncCompletionSamplePipeline {
 
   private static final Logger LOG = LoggerFactory.getLogger(AsyncCompletionSamplePipeline.class);
 
-  private AsyncCompletionSamplePipeline() {}
+  private AsyncCompletionSamplePipeline() {
+  }
 
   /**
    * Mirrors {@code JMeterThread.executeSamplePackage} for the fragment after a successful sample,
