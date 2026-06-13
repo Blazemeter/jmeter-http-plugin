@@ -46,7 +46,9 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Base64;
@@ -1402,6 +1404,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String keyStorePasswordPropertyName = "javax.net.ssl.keyStorePassword";
     System.setProperty(keyStorePropertyName, getKeyStorePathForClientSsl());
     System.setProperty(keyStorePasswordPropertyName, KEYSTORE_PASSWORD);
+    System.setProperty("javax.net.ssl.keyStoreType", "PKCS12");
     SSLManager.reset();
     client.stop();
     client = new HTTP2JettyClient(false, "client-cert-test",
@@ -1418,24 +1421,20 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     } finally {
       System.clearProperty(keyStorePropertyName);
       System.clearProperty(keyStorePasswordPropertyName);
+      System.clearProperty("javax.net.ssl.keyStoreType");
       SSLManager.reset();
     }
   }
 
-  private String getKeyStorePathForClientSsl() {
-    URL resource = getClass().getResource("keystore.p12");
-    if (resource == null) {
-      throw new IllegalStateException("classpath resource keystore.p12 not found");
-    }
-    if (!"file".equalsIgnoreCase(resource.getProtocol())) {
-      throw new IllegalStateException(
-          "keystore.p12 must be a file URL (tests run from target/test-classes), got: "
-              + resource);
-    }
-    try {
-      return Paths.get(resource.toURI()).toAbsolutePath().normalize().toString();
-    } catch (URISyntaxException e) {
-      throw new IllegalStateException(e);
+  private String getKeyStorePathForClientSsl() throws IOException {
+    try (InputStream in = getClass().getResourceAsStream("keystore.p12")) {
+      if (in == null) {
+        throw new IllegalStateException("classpath resource keystore.p12 not found");
+      }
+      Path tempKeystore = Files.createTempFile("http2-client-cert-", ".p12");
+      Files.copy(in, tempKeystore, StandardCopyOption.REPLACE_EXISTING);
+      tempKeystore.toFile().deleteOnExit();
+      return tempKeystore.toAbsolutePath().normalize().toString();
     }
   }
 

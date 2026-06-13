@@ -14,6 +14,7 @@ import java.security.PrivateKey;
 import java.security.cert.X509Certificate;
 import java.util.Locale;
 import javax.net.ssl.KeyManager;
+import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509KeyManager;
@@ -30,6 +31,7 @@ import org.eclipse.jetty.util.ssl.SslContextFactory;
 public class JMeterJettySslContextFactory extends SslContextFactory.Client {
 
   private final JmeterKeyStore keys;
+  private final KeyManager[] configuredKeyManagers;
 
   public JMeterJettySslContextFactory() {
     setTrustAll(true);
@@ -37,8 +39,10 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
     if (keyStorePath != null && !keyStorePath.isEmpty()) {
       setKeyStorePath(toStoreUri(keyStorePath));
       setKeyStorePassword(System.getProperty("javax.net.ssl.keyStorePassword"));
-      keys = loadKeyStoreFromPath(keyStorePath);
+      configuredKeyManagers = loadKeyManagersFromPath(keyStorePath);
+      keys = loadJmeterKeyStoreFromPath(keyStorePath);
     } else {
+      configuredKeyManagers = null;
       keys = null;
     }
 
@@ -62,20 +66,45 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
     return path.toUri().toString();
   }
 
-  private static JmeterKeyStore loadKeyStoreFromPath(String keyStorePath) {
+  private static String resolveKeyStoreType(String keyStorePath) {
+    String keyStoreType = System.getProperty("javax.net.ssl.keyStoreType");
+    if (keyStoreType != null && !keyStoreType.isEmpty()) {
+      return keyStoreType;
+    }
+    String lowerPath = keyStorePath.toLowerCase(Locale.ENGLISH);
+    if (lowerPath.endsWith(".p12") || lowerPath.endsWith(".pfx")) {
+      return "PKCS12";
+    }
+    return KeyStore.getDefaultType();
+  }
+
+  private static KeyManager[] loadKeyManagersFromPath(String keyStorePath) {
     File storeFile = new File(keyStorePath);
     if (!storeFile.isFile()) {
       throw new RuntimeException("Keystore file not found: " + keyStorePath);
     }
-    String keyStoreType = System.getProperty("javax.net.ssl.keyStoreType");
-    if (keyStoreType == null || keyStoreType.isEmpty()) {
-      String lowerPath = keyStorePath.toLowerCase(Locale.ENGLISH);
-      if (lowerPath.endsWith(".p12") || lowerPath.endsWith(".pfx")) {
-        keyStoreType = "pkcs12";
-      } else {
-        keyStoreType = KeyStore.getDefaultType();
+    String keyStoreType = resolveKeyStoreType(keyStorePath);
+    String password = System.getProperty("javax.net.ssl.keyStorePassword", "");
+    try {
+      KeyStore keyStore = KeyStore.getInstance(keyStoreType);
+      try (InputStream in = new FileInputStream(storeFile)) {
+        keyStore.load(in, password.toCharArray());
       }
+      KeyManagerFactory keyManagerFactory =
+          KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+      keyManagerFactory.init(keyStore, password.toCharArray());
+      return keyManagerFactory.getKeyManagers();
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to load key managers from " + keyStorePath, e);
     }
+  }
+
+  private static JmeterKeyStore loadJmeterKeyStoreFromPath(String keyStorePath) {
+    File storeFile = new File(keyStorePath);
+    if (!storeFile.isFile()) {
+      throw new RuntimeException("Keystore file not found: " + keyStorePath);
+    }
+    String keyStoreType = resolveKeyStoreType(keyStorePath);
     String password = System.getProperty("javax.net.ssl.keyStorePassword", "");
     try {
       JmeterKeyStore keyStore = JmeterKeyStore.getInstance(keyStoreType, 0, -1, "");
@@ -113,17 +142,18 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
    */
   @Override
   protected KeyManager[] getKeyManagers(KeyStore keyStore) throws Exception {
-    // based in logic extracted from JsseSSLManager.createContext
-    KeyManager[] ret = super.getKeyManagers(keyStore);
-    if (keys == null) {
-      return ret;
+    if (configuredKeyManagers == null) {
+      return super.getKeyManagers(keyStore);
     }
-    for (int i = 0; i < ret.length; i++) {
-      if (ret[i] instanceof X509KeyManager) {
-        ret[i] = new WrappedX509KeyManager((X509KeyManager) ret[i], keys);
+    KeyManager[] managers = configuredKeyManagers.clone();
+    if (keys != null) {
+      for (int i = 0; i < managers.length; i++) {
+        if (managers[i] instanceof X509KeyManager) {
+          managers[i] = new WrappedX509KeyManager((X509KeyManager) managers[i], keys);
+        }
       }
     }
-    return ret;
+    return managers;
   }
 
   // based in logic extracted from JsseSSLManager.WrappedX509KeyManager
@@ -162,6 +192,7 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
       return resolveClientAlias(keyType, issuers);
     }
 
+    @Override
     public String chooseEngineClientAlias(String[] keyType, Principal[] issuers,
                                           SSLEngine engine) {
       return resolveClientAlias(keyType, issuers);
@@ -183,7 +214,10 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
       if (store.getAliasCount() > 0) {
         return store.getAlias(0);
       }
-      return store.getAlias();
+      if (manager instanceof X509ExtendedKeyManager extendedManager) {
+        return extendedManager.chooseEngineClientAlias(keyTypes, issuers, null);
+      }
+      return manager.chooseClientAlias(keyTypes, issuers, null);
     }
 
     @Override
