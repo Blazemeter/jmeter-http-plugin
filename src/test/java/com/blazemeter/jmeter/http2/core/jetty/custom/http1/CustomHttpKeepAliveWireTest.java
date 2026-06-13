@@ -14,14 +14,13 @@ import java.net.Socket;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import org.apache.jmeter.protocol.http.util.HTTPFileArg;
-import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
-import org.apache.jmeter.util.JMeterUtils;
-import org.junit.BeforeClass;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
+import org.apache.jmeter.protocol.http.util.HTTPFileArg;
+import org.apache.jmeter.util.JMeterUtils;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.HttpClientTransport;
 import org.eclipse.jetty.client.Request;
@@ -34,9 +33,14 @@ import org.eclipse.jetty.io.ClientConnectionFactory;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
-public class CustomHttpKeepAliveWireIntegrationTest {
+/**
+ * Wire-level HTTP/1 keep-alive parity checks. Runs under Surefire (not Failsafe) so tests use
+ * unshaded {@code target/classes} and avoid Jetty type mismatches from the shaded plugin jar.
+ */
+public class CustomHttpKeepAliveWireTest {
 
   @BeforeClass
   public static void setupJmeter() {
