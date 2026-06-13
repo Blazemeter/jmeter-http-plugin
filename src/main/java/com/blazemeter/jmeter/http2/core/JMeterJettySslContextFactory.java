@@ -1,5 +1,8 @@
 package com.blazemeter.jmeter.http2.core;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.Socket;
@@ -9,6 +12,7 @@ import java.security.KeyStore;
 import java.security.Principal;
 import java.security.PrivateKey;
 import java.security.cert.X509Certificate;
+import java.util.Locale;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.X509ExtendedKeyManager;
@@ -32,12 +36,8 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
     String keyStorePath = System.getProperty("javax.net.ssl.keyStore");
     if (keyStorePath != null && !keyStorePath.isEmpty()) {
       setKeyStorePath(toStoreUri(keyStorePath));
-      keys = getKeyStore((JsseSSLManager) SSLManager.getInstance());
-      /*
-       we need to set password after getting keystore since getKeystore may ask the user for the
-       password.
-      */
       setKeyStorePassword(System.getProperty("javax.net.ssl.keyStorePassword"));
+      keys = loadKeyStoreFromPath(keyStorePath);
     } else {
       keys = null;
     }
@@ -62,13 +62,29 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
     return path.toUri().toString();
   }
 
-  private JmeterKeyStore getKeyStore(JsseSSLManager sslManager) {
+  private static JmeterKeyStore loadKeyStoreFromPath(String keyStorePath) {
+    File storeFile = new File(keyStorePath);
+    if (!storeFile.isFile()) {
+      throw new RuntimeException("Keystore file not found: " + keyStorePath);
+    }
+    String keyStoreType = System.getProperty("javax.net.ssl.keyStoreType");
+    if (keyStoreType == null || keyStoreType.isEmpty()) {
+      String lowerPath = keyStorePath.toLowerCase(Locale.ENGLISH);
+      if (lowerPath.endsWith(".p12") || lowerPath.endsWith(".pfx")) {
+        keyStoreType = "pkcs12";
+      } else {
+        keyStoreType = KeyStore.getDefaultType();
+      }
+    }
+    String password = System.getProperty("javax.net.ssl.keyStorePassword", "");
     try {
-      Method keystoreMethod = SSLManager.class.getDeclaredMethod("getKeyStore");
-      keystoreMethod.setAccessible(true);
-      return (JmeterKeyStore) keystoreMethod.invoke(sslManager);
-    } catch (InvocationTargetException | IllegalAccessException | NoSuchMethodException e) {
-      throw new RuntimeException(e);
+      JmeterKeyStore keyStore = JmeterKeyStore.getInstance(keyStoreType, 0, -1, "");
+      try (InputStream in = new FileInputStream(storeFile)) {
+        keyStore.load(in, password);
+      }
+      return keyStore;
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to load keystore from " + keyStorePath, e);
     }
   }
 
@@ -92,7 +108,9 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
   protected void checkEndPointIdentificationAlgorithm() {
   }
 
-  // Overwritten to provide jmeter SSLManager configured keyManagers
+  /**
+   * Overwritten to provide JMeter SSLManager configured keyManagers.
+   */
   @Override
   protected KeyManager[] getKeyManagers(KeyStore keyStore) throws Exception {
     // based in logic extracted from JsseSSLManager.createContext
@@ -141,11 +159,30 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
 
     @Override
     public String chooseClientAlias(String[] keyType, Principal[] issuers, Socket socket) {
-      return store.getAlias();
+      return resolveClientAlias(keyType, issuers);
     }
 
     public String chooseEngineClientAlias(String[] keyType, Principal[] issuers,
                                           SSLEngine engine) {
+      return resolveClientAlias(keyType, issuers);
+    }
+
+    private String resolveClientAlias(String[] keyTypes, Principal[] issuers) {
+      if (keyTypes != null) {
+        for (String keyType : keyTypes) {
+          String[] aliases = store.getClientAliases(keyType, issuers);
+          if (aliases != null && aliases.length > 0) {
+            return aliases[0];
+          }
+        }
+      }
+      String[] aliases = store.getClientAliases(null, issuers);
+      if (aliases != null && aliases.length > 0) {
+        return aliases[0];
+      }
+      if (store.getAliasCount() > 0) {
+        return store.getAlias(0);
+      }
       return store.getAlias();
     }
 

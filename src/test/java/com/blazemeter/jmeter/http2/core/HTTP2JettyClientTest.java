@@ -73,6 +73,7 @@ import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
 import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.util.JMeterUtils;
+import org.apache.jmeter.util.SSLManager;
 import org.assertj.core.api.JUnitSoftAssertions;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.client.ContentResponse;
@@ -1401,6 +1402,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String keyStorePasswordPropertyName = "javax.net.ssl.keyStorePassword";
     System.setProperty(keyStorePropertyName, getKeyStorePathForClientSsl());
     System.setProperty(keyStorePasswordPropertyName, KEYSTORE_PASSWORD);
+    SSLManager.reset();
     client.stop();
     client = new HTTP2JettyClient(false, "client-cert-test",
         HTTP2ClientProfileConfig.builder()
@@ -1416,6 +1418,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     } finally {
       System.clearProperty(keyStorePropertyName);
       System.clearProperty(keyStorePasswordPropertyName);
+      SSLManager.reset();
     }
   }
 
