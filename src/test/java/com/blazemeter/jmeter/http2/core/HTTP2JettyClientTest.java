@@ -1384,18 +1384,6 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     sampleWithGet();
   }
 
-  private String getKeyStorePathAsUriPathWithNetSslKeyStoreFormat() {
-    try {
-      // Generate a absolute path in URI format with compatibility with Windows
-      // IMPORTANT: javax.net.ssl.keyStore use a particular format,
-      // this method try to generate in that format and with compatibility with Windows
-      return "/" + new File("//").toURI().relativize(getClass().getResource("keystore.p12").toURI())
-          .getPath();
-    } catch (URISyntaxException e) {
-      throw new RuntimeException(e);
-    }
-  }
-
   @Test
   public void shouldGetSuccessResponseWhenServerRequiresClientCertAndOneIsConfigured()
       throws Exception {
@@ -1411,7 +1399,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     syncServerPort();
     String keyStorePropertyName = "javax.net.ssl.keyStore";
     String keyStorePasswordPropertyName = "javax.net.ssl.keyStorePassword";
-    System.setProperty(keyStorePropertyName, getKeyStorePathAsUriPathWithNetSslKeyStoreFormat());
+    System.setProperty(keyStorePropertyName, getKeyStorePathForClientSsl());
     System.setProperty(keyStorePasswordPropertyName, KEYSTORE_PASSWORD);
     client.stop();
     client = new HTTP2JettyClient();
@@ -1420,8 +1408,25 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
       HTTPSampleResult result = sampleWithGet();
       assertThat(result.getResponseDataAsString()).isEqualTo(SERVER_RESPONSE);
     } finally {
-      System.setProperty(keyStorePropertyName, "");
-      System.setProperty(keyStorePasswordPropertyName, "");
+      System.clearProperty(keyStorePropertyName);
+      System.clearProperty(keyStorePasswordPropertyName);
+    }
+  }
+
+  private String getKeyStorePathForClientSsl() {
+    URL resource = getClass().getResource("keystore.p12");
+    if (resource == null) {
+      throw new IllegalStateException("classpath resource keystore.p12 not found");
+    }
+    if (!"file".equalsIgnoreCase(resource.getProtocol())) {
+      throw new IllegalStateException(
+          "keystore.p12 must be a file URL (tests run from target/test-classes), got: "
+              + resource);
+    }
+    try {
+      return Paths.get(resource.toURI()).toAbsolutePath().normalize().toString();
+    } catch (URISyntaxException e) {
+      throw new IllegalStateException(e);
     }
   }
 

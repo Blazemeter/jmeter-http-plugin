@@ -3,6 +3,8 @@ package com.blazemeter.jmeter.http2.core;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.Socket;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.KeyStore;
 import java.security.Principal;
 import java.security.PrivateKey;
@@ -29,7 +31,7 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
     setTrustAll(true);
     String keyStorePath = System.getProperty("javax.net.ssl.keyStore");
     if (keyStorePath != null && !keyStorePath.isEmpty()) {
-      setKeyStorePath("file://" + keyStorePath);
+      setKeyStorePath(toStoreUri(keyStorePath));
       keys = getKeyStore((JsseSSLManager) SSLManager.getInstance());
       /*
        we need to set password after getting keystore since getKeystore may ask the user for the
@@ -42,7 +44,7 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
 
     String truststore = System.getProperty("javax.net.ssl.trustStore");
     if (truststore != null && !truststore.isEmpty()) {
-      setTrustStorePath("file://" + truststore);
+      setTrustStorePath(toStoreUri(truststore));
       getTrustStore((JsseSSLManager) SSLManager.getInstance());
       /*
        we need to set password after getting truststore since getTrustStore may ask the user for the
@@ -50,6 +52,14 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
       */
       setTrustStorePassword(System.getProperty("javax.net.ssl.trustStorePassword"));
     }
+  }
+
+  private static String toStoreUri(String storePath) {
+    if (storePath.regionMatches(true, 0, "file:", 0, 5)) {
+      return storePath;
+    }
+    Path path = Paths.get(storePath);
+    return path.toUri().toString();
   }
 
   private JmeterKeyStore getKeyStore(JsseSSLManager sslManager) {

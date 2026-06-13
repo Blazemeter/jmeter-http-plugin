@@ -1522,8 +1522,10 @@ public class HTTP2JettyClient {
       }
       throw e;
     } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
       if (protocolErrorFallbackEnabled && enableHttp1
-          && ProtocolErrorException.isProtocolError(e)) {
+          && (ProtocolErrorException.isProtocolError(e)
+              || ProtocolErrorException.isProtocolError(cause))) {
         LOG.warn("Protocol error during send(), retrying with HTTP/1.1 only");
         return retryWithHTTP11Only(sampler, result);
       }
