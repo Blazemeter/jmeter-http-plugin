@@ -30,6 +30,7 @@ import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpVersion;
 import org.eclipse.jetty.io.ClientConnector;
+import org.eclipse.jetty.io.ClientConnectionFactory;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.junit.After;
 import org.junit.Before;
@@ -54,7 +55,7 @@ public class CustomHttpKeepAliveWireIntegrationTest {
     threadPool.setName("keepalive-wire-test");
     connector.setExecutor(threadPool);
     executor = Executors.newSingleThreadExecutor();
-    CustomHttpClientConnectionFactory.HTTP11 http11 = new CustomHttpClientConnectionFactory.HTTP11();
+    ClientConnectionFactory.Info http11 = CustomHttpClientConnectionFactory.CUSTOM_HTTP11;
     HttpClientTransport transport = new HttpClientTransportDynamic(connector, http11);
     client = new HttpClient(transport);
     client.setUserAgentField(null);
