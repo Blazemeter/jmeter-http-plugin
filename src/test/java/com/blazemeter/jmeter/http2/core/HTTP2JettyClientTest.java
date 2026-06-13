@@ -1402,7 +1402,13 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     System.setProperty(keyStorePropertyName, getKeyStorePathForClientSsl());
     System.setProperty(keyStorePasswordPropertyName, KEYSTORE_PASSWORD);
     client.stop();
-    client = new HTTP2JettyClient();
+    client = new HTTP2JettyClient(false, "client-cert-test",
+        HTTP2ClientProfileConfig.builder()
+            .enableHttp1(true)
+            .enableHttp2(false)
+            .enableHttp3(false)
+            .alpnEnabled(false)
+            .build());
     client.start();
     try {
       HTTPSampleResult result = sampleWithGet();

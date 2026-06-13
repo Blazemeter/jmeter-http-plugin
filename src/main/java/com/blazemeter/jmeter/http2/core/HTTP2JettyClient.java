@@ -22,6 +22,7 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -1523,10 +1524,8 @@ public class HTTP2JettyClient {
       throw e;
     } catch (ExecutionException e) {
       Throwable cause = e.getCause();
-      if (protocolErrorFallbackEnabled && enableHttp1
-          && (ProtocolErrorException.isProtocolError(e)
-              || ProtocolErrorException.isProtocolError(cause))) {
-        LOG.warn("Protocol error during send(), retrying with HTTP/1.1 only");
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+        LOG.warn("Transport failure during send(), retrying with HTTP/1.1 only");
         return retryWithHTTP11Only(sampler, result);
       }
       throw e;
@@ -1710,10 +1709,8 @@ public class HTTP2JettyClient {
           throw e;
         }
       }
-      if ((cause instanceof ProtocolErrorException
-          || ProtocolErrorException.isProtocolError(cause))
-          && protocolErrorFallbackEnabled) {
-        LOG.warn("HTTP/2 protocol_error detected in send()! Attempting fallback to HTTP/1.1");
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+        LOG.warn("Transport failure detected in send()! Attempting fallback to HTTP/1.1");
         LOG.warn("Error details: message='{}', exception={}",
             cause != null ? cause.getMessage() : e.getMessage(),
             cause != null ? cause.getClass().getName() : "unknown");
@@ -2001,10 +1998,8 @@ public class HTTP2JettyClient {
           }
         }
       }
-      if ((cause instanceof ProtocolErrorException
-          || ProtocolErrorException.isProtocolError(cause))
-          && protocolErrorFallbackEnabled) {
-        LOG.warn("HTTP/2 protocol_error detected in getContent()! "
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+        LOG.warn("Transport failure detected in getContent()! "
             + "Attempting fallback to HTTP/1.1");
         LOG.warn("Error details: message='{}', exception={}",
             cause != null ? cause.getMessage() : e.getMessage(),
@@ -2587,6 +2582,25 @@ public class HTTP2JettyClient {
       current = current.getCause();
     }
     return null;
+  }
+
+  private boolean shouldFallbackToHttp11AfterTransportFailure(Throwable cause,
+      Throwable wrapped) {
+    if (!protocolErrorFallbackEnabled || !enableHttp1) {
+      return false;
+    }
+    return ProtocolErrorException.isProtocolError(wrapped)
+        || ProtocolErrorException.isProtocolError(cause)
+        || isClosedChannelFailure(cause != null ? cause : wrapped);
+  }
+
+  private static boolean isClosedChannelFailure(Throwable throwable) {
+    for (Throwable current = throwable; current != null; current = current.getCause()) {
+      if (current instanceof ClosedChannelException) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private ContentResponse retryAfterGoAway(Request originalRequest)
