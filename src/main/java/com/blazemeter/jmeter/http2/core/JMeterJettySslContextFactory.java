@@ -11,19 +11,24 @@ import java.security.PrivateKey;
 import java.security.cert.CRL;
 import java.security.cert.X509Certificate;
 import java.util.Collection;
+import java.util.Map;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509KeyManager;
+import org.apache.jmeter.threads.JMeterContextService;
+import org.apache.jmeter.threads.JMeterVariables;
 import org.apache.jmeter.util.JsseSSLManager;
 import org.apache.jmeter.util.SSLManager;
 import org.apache.jmeter.util.keystore.JmeterKeyStore;
+import org.eclipse.jetty.io.ssl.SslClientConnectionFactory;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class JMeterJettySslContextFactory extends SslContextFactory.Client {
+public class JMeterJettySslContextFactory extends SslContextFactory.Client
+    implements SslClientConnectionFactory.SslEngineFactory {
 
   private static final Logger LOG = LoggerFactory.getLogger(JMeterJettySslContextFactory.class);
 
@@ -143,6 +148,20 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
     return super.getTrustManagers(trustStore, crls);
   }
 
+  @Override
+  public SSLEngine newSslEngine(String host, int port, Map<String, Object> context) {
+    SSLEngine engine = super.newSSLEngine(host, port);
+    bindAliasFromContext(engine, context);
+    return engine;
+  }
+
+  private static void bindAliasFromContext(SSLEngine engine, Map<String, Object> context) {
+    String alias = SslClientCertAliasContext.readAlias(context);
+    if (alias != null) {
+      SslClientCertAliasContext.bindEngine(engine, alias);
+    }
+  }
+
   // Overwritten to provide jmeter SSLManager configured keyManagers
   @Override
   protected KeyManager[] getKeyManagers(KeyStore keyStore) throws Exception {
@@ -192,12 +211,33 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
 
     @Override
     public String chooseClientAlias(String[] keyType, Principal[] issuers, Socket socket) {
-      return store.getAlias();
+      return resolveClientAlias(null);
     }
 
+    @Override
     public String chooseEngineClientAlias(String[] keyType, Principal[] issuers,
                                           SSLEngine engine) {
-      return store.getAlias();
+      return resolveClientAlias(engine);
+    }
+
+    private String resolveClientAlias(SSLEngine engine) {
+      String boundAlias = SslClientCertAliasContext.resolveFromEngine(engine);
+      if (boundAlias != null) {
+        return boundAlias;
+      }
+      JMeterVariables variables = JMeterContextService.getContext().getVariables();
+      if (variables != null) {
+        return store.getAlias();
+      }
+      return firstConfiguredAlias();
+    }
+
+    private String firstConfiguredAlias() {
+      String[] aliases = store.getClientAliases("RSA", null);
+      if (aliases == null || aliases.length == 0) {
+        aliases = store.getClientAliases("EC", null);
+      }
+      return aliases != null && aliases.length > 0 ? aliases[0] : null;
     }
 
     @Override
