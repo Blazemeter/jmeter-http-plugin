@@ -1503,7 +1503,9 @@ public class HTTP2JettyClient {
       LOG.error("isProtocolError(cause): {}", isProtocolErrorCause);
       LOG.error("isProtocolError(exception): {}", isProtocolErrorException);
 
-      if ((isProtocolErrorCause || isProtocolErrorException) && protocolErrorFallbackEnabled) {
+      if ((isProtocolErrorCause || isProtocolErrorException) && protocolErrorFallbackEnabled
+          && !HpackFailureDetector.indicatesHpackFailure(e)
+          && !HpackFailureDetector.indicatesHpackFailure(cause)) {
         LOG.warn("HTTP/2 protocol_error detected in sampleFromListener()! "
             + "Attempting fallback to HTTP/1.1");
         LOG.warn("Error: {}", cause != null ? cause.getMessage() : e.getMessage());
