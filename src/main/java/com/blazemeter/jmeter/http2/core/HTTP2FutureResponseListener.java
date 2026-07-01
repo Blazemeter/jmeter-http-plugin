@@ -498,6 +498,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
       if (request.getBody() != null) {
         http11Request.body(request.getBody());
       }
+      SslClientCertAliasSupport.copyFromRequest(request, http11Request);
       lowLevelDebug("Retrying request with HTTP/1.1 in listener fallback: {}", request.getURI());
       return http11Request.send();
     } catch (Exception e) {

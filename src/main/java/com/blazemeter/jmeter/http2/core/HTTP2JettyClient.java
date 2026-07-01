@@ -1206,6 +1206,7 @@ public class HTTP2JettyClient {
       if (originalRequest.getBody() != null) {
         http11Request.body(originalRequest.getBody());
       }
+      SslClientCertAliasSupport.copyFromRequest(originalRequest, http11Request);
 
       // Send request and wait for response
       lowLevelDebug("Sending HTTP/1.1 fallback request");
@@ -2511,6 +2512,7 @@ public class HTTP2JettyClient {
     if (originalRequest.getBody() != null) {
       request.body(originalRequest.getBody());
     }
+    SslClientCertAliasSupport.copyFromRequest(originalRequest, request);
     configureContentDecoders(client, request);
     return request;
   }
@@ -2541,7 +2543,9 @@ public class HTTP2JettyClient {
       client.setDestinationIdleTimeout(idleTimeout);
     }
     client.setIdleTimeout(idleTimeout);
-    addConnectionLogging(client);
+    if (LowLevelDebugLog.isEnabled()) {
+      addConnectionLogging(client);
+    }
   }
 
   private static void addConnectionLogging(HttpClient client) {
@@ -2589,6 +2593,9 @@ public class HTTP2JettyClient {
   }
 
   private static void logAlpnLine(String message) {
+    if (!LowLevelDebugLog.isEnabled()) {
+      return;
+    }
     try {
       Path parent = ALPN_DEBUG_LOG_PATH.getParent();
       if (parent != null) {
@@ -2888,6 +2895,10 @@ public class HTTP2JettyClient {
     boolean http3Attempted = enableHttp3 && client == httpClient && shouldAttemptHttp3(uri);
     request.attribute(ATTR_HTTP3_ATTEMPTED, http3Attempted);
     request.attribute(ATTR_ORIGIN_KEY, originKey(uri));
+    if ("https".equalsIgnoreCase(uri.getScheme())) {
+      String clientCertAlias = JMeterSslAliasResolver.resolveForRequest();
+      SslClientCertAliasSupport.bindToRequest(request, clientCertAlias);
+    }
     request.onRequestBegin(r -> result.connectEnd());
     request.onRequestContent(
         (r, c) -> result.setSentBytes(result.getSentBytes() + c.limit()));
