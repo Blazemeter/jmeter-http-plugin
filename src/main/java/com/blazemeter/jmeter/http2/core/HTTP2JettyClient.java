@@ -272,6 +272,11 @@ public class HTTP2JettyClient {
     ClientConnectionFactory.Info http11 = HttpClientConnectionFactory.HTTP11;
 
     HTTP2Client http2Client = new HTTP2Client(clientConnector);
+    // HTTP2Client defaults to 8 KiB; HttpClient defaults to -1 (no local HPACK cap). Match
+    // HttpClient here so parsers are not created with 8192. On start(), Jetty configure()
+    // re-syncs from HttpClient.getMaxResponseHeadersSize(), so this stays dynamic if callers
+    // change HttpClient before start().
+    http2Client.setMaxResponseHeadersSize(-1);
     enableFrameLoggingIfConfigured(http2Client);
 
     // Add session listener to log SETTINGS frames received from server (for debugging Issue #12071)
@@ -506,6 +511,7 @@ public class HTTP2JettyClient {
 
     ClientConnector h2cUpgradeConnector = createClientConnector(name + "-h2c-upgrade");
     HTTP2Client http2cUpgradeClient = new HTTP2Client(h2cUpgradeConnector);
+    http2cUpgradeClient.setMaxResponseHeadersSize(-1);
     http2cUpgradeClient.setUseALPN(false);
     if (disableServerPush) {
       http2cUpgradeClient.setMaxConcurrentPushedStreams(0);
@@ -524,6 +530,7 @@ public class HTTP2JettyClient {
 
     ClientConnector h2cConnector = createClientConnector(name + "-h2c");
     HTTP2Client http2cClient = new HTTP2Client(h2cConnector);
+    http2cClient.setMaxResponseHeadersSize(-1);
     http2cClient.setUseALPN(false);
     if (disableServerPush) {
       http2cClient.setMaxConcurrentPushedStreams(0);
