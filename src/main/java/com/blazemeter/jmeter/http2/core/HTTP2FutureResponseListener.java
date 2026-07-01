@@ -112,7 +112,8 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
         : "null";
     lowLevelDebug("Failure: {}", failureInfo);
     
-    // Store the failure immediately. If HPACK decode failed earlier, avoid protocol_error handling.
+    // Store the failure immediately. If HPACK decode failed earlier,
+    // avoid protocol_error handling.
     this.failure = failure;
     if (failure != null && HpackFailureDetector.indicatesHpackFailure(failure)) {
       lowLevelDebug("HPACK-related failure detected for request");
@@ -451,7 +452,8 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
             response.getStatus(), response.getVersion(), failure.getClass().getName());
         
         // Check if this is a protocol_error even though we have a response
-        if (ProtocolErrorException.isProtocolError(failure) && !HpackFailureDetector.indicatesHpackFailure(failure)) {
+        if (ProtocolErrorException.isProtocolError(failure)
+            && !HpackFailureDetector.indicatesHpackFailure(failure)) {
           String message = failure.getMessage();
           LOG.error("HTTP/2 protocol_error detected after response - "
               + "throwing ProtocolErrorException");
