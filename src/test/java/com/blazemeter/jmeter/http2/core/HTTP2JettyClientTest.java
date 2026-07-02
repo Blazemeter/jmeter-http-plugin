@@ -281,9 +281,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     sampler.setHeaderManager(hm);
     try {
       HTTPSampleResult result = sampleWithGet(SERVER_PATH_200_GZIP);
-      boolean hasGzipHeader = result.getResponseHeaders().contains("Content-Encoding: gzip");
-      boolean hasBody = result.getResponseData() != null && result.getResponseData().length > 0;
-      assertThat(hasGzipHeader || hasBody).isTrue();
+      assertThat(result.getResponseHeaders()).containsIgnoringCase("content-encoding: gzip");
+      assertThat(result.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
     } finally {
       if (originalEnableHttp1 == null) {
         JMeterUtils.getJMeterProperties().remove("httpJettyClient.enableHttp1");
@@ -301,8 +300,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     hm.add(new Header(HttpHeader.ACCEPT_ENCODING.asString(), "br"));
     sampler.setHeaderManager(hm);
     HTTPSampleResult result = sampleWithGet(SERVER_PATH_200_BROTLI);
-    // Verify that the request was successful and content was decompressed
     assertThat(result.isSuccessful()).isTrue();
+    assertThat(result.getResponseHeaders()).containsIgnoringCase("content-encoding: br");
     assertThat(result.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
   }
 
@@ -314,8 +313,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     hm.add(new Header(HttpHeader.ACCEPT_ENCODING.asString(), "zstd"));
     sampler.setHeaderManager(hm);
     HTTPSampleResult result = sampleWithGet(SERVER_PATH_200_ZSTD);
-    // Verify that the request was successful and content was decompressed
     assertThat(result.isSuccessful()).isTrue();
+    assertThat(result.getResponseHeaders()).containsIgnoringCase("content-encoding: zstd");
     assertThat(result.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
   }
 

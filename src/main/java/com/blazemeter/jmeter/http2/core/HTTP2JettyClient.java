@@ -1134,7 +1134,7 @@ public class HTTP2JettyClient {
     }
     ensureHostHeader(http11Request, url);
 
-    configureContentDecoders(httpClientHttp1Only, http11Request);
+    configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
 
     // Copy body if present
     setBody(http11Request, sampler, result);
@@ -1200,7 +1200,7 @@ public class HTTP2JettyClient {
       }
       ensureHostHeader(http11Request, uri);
 
-      configureContentDecoders(httpClientHttp1Only, http11Request);
+      configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
 
       // Copy body if present
       if (originalRequest.getBody() != null) {
@@ -1255,7 +1255,7 @@ public class HTTP2JettyClient {
       }
     }
     ensureHostHeader(h2cRequest, uri);
-    configureContentDecoders(httpClientH2cPrior, h2cRequest);
+    configureContentDecodersAndCapture(httpClientH2cPrior, h2cRequest);
     if (originalRequest.getBody() != null) {
       h2cRequest.body(originalRequest.getBody());
     }
@@ -1300,7 +1300,7 @@ public class HTTP2JettyClient {
     addPreemptiveAuthorizationHeader(request, url, sampler.getAuthManager());
     lowLevelDebug("Headers set, request URI: {}", request.getURI());
 
-    configureContentDecoders(client, request);
+    configureContentDecodersAndCapture(client, request);
 
     String ae = request.getHeaders() != null
         ? request.getHeaders().get(HttpHeader.ACCEPT_ENCODING)
@@ -2106,6 +2106,11 @@ public class HTTP2JettyClient {
     }
   }
 
+  private void configureContentDecodersAndCapture(HttpClient client, Request request) {
+    configureContentDecoders(client, request);
+    JmeterCompressionHeadersSupport.installCapture(request);
+  }
+
   private HttpClient selectHttpClient(URI uri) {
     if (uri != null && "http".equalsIgnoreCase(uri.getScheme())) {
       if (!enableHttp2 && enableHttp1) {
@@ -2513,7 +2518,7 @@ public class HTTP2JettyClient {
       request.body(originalRequest.getBody());
     }
     SslClientCertAliasSupport.copyFromRequest(originalRequest, request);
-    configureContentDecoders(client, request);
+    configureContentDecodersAndCapture(client, request);
     return request;
   }
 
@@ -3648,9 +3653,11 @@ public class HTTP2JettyClient {
       result.setURL(contentResponse.getRequest().getURI().toURL());
     }
 
+    HttpFields sampleResultHeaders =
+        JmeterCompressionHeadersSupport.headersForSampleResult(contentResponse);
     long headerBytes =
         (long) result.getResponseHeaders().length()   // condensed length (without \r)
-            + (long) contentResponse.getHeaders().asString().length() // Add \r for each header
+            + (long) sampleResultHeaders.asString().length() // Add \r for each header
             + 1L // Add \r for initial header
             + 2L; // final \r\n before data
     result.setHeadersSize((int) headerBytes);
@@ -3658,8 +3665,9 @@ public class HTTP2JettyClient {
 
   private String extractResponseHeaders(ContentResponse contentResponse,
                                         String message) {
+    HttpFields headers = JmeterCompressionHeadersSupport.headersForSampleResult(contentResponse);
     return contentResponse.getVersion() + " " + contentResponse.getStatus() + " " + message + "\n"
-        + buildHeadersString(contentResponse.getHeaders());
+        + buildHeadersString(headers);
   }
 
   private String extractRedirectLocation(ContentResponse contentResponse) {
@@ -3749,6 +3757,8 @@ public class HTTP2JettyClient {
     if (contentEncoding == null || contentEncoding.trim().isEmpty()) {
       return content;
     }
+    JmeterCompressionHeadersSupport.captureIfCompressed(
+        contentResponse.getRequest(), contentResponse.getHeaders());
     String encodingToken = normalizeEncodingToken(contentEncoding);
     if (encodingToken.isEmpty()) {
       return content;
