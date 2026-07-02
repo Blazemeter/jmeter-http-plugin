@@ -73,7 +73,8 @@ final class JmeterRequestHeadersSupport {
     }
   }
 
-  private static void restoreConnectionHeaderForSample(Request request, HttpFields.Mutable headers) {
+  private static void restoreConnectionHeaderForSample(
+      Request request, HttpFields.Mutable headers) {
     Object useKeepAlive = request.getAttributes().get(ATTR_USE_KEEPALIVE);
     if (useKeepAlive == null || !shouldSendConnectionHeader(request)) {
       return;
