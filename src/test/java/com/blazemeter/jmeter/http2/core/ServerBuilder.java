@@ -106,6 +106,8 @@ public class ServerBuilder {
   private final TeardownableServer server = new TeardownableServer();
   private final HttpConfiguration httpsConfig = new HttpConfiguration();
   private boolean withSSL;
+  private String serverKeyStorePathOverride;
+  private String serverKeyStoreTypeOverride;
   private HTTP2ServerConnectionFactory http2ConnectionFactory;
   private HttpConnectionFactory http1ConnectionFactory;
   private HTTP2CServerConnectionFactory http2cConnectionFactory;
@@ -136,6 +138,15 @@ public class ServerBuilder {
 
   public ServerBuilder withSSL() {
     this.withSSL = true;
+    return this;
+  }
+
+  /**
+   * Uses a filesystem keystore for the server TLS certificate (e.g. an untrusted JKS in tests).
+   */
+  public ServerBuilder withServerKeyStorePath(String keyStorePath, String keyStoreType) {
+    this.serverKeyStorePathOverride = keyStorePath;
+    this.serverKeyStoreTypeOverride = keyStoreType;
     return this;
   }
 
@@ -244,7 +255,13 @@ public class ServerBuilder {
 
   private SslContextFactory.Server buildServerSslContextFactory() {
     SslContextFactory.Server sslContextFactory = new SslContextFactory.Server();
-    sslContextFactory.setKeyStorePath(getKeyStorePathAsUriPathInSSLContextFactoryFormat());
+    if (serverKeyStorePathOverride != null) {
+      sslContextFactory.setKeyStorePath(
+          SslStorePathResolver.toJettyFileUri(serverKeyStorePathOverride));
+      sslContextFactory.setKeyStoreType(serverKeyStoreTypeOverride);
+    } else {
+      sslContextFactory.setKeyStorePath(getKeyStorePathAsUriPathInSSLContextFactoryFormat());
+    }
     sslContextFactory.setKeyStorePassword(KEYSTORE_PASSWORD);
     return sslContextFactory;
   }
