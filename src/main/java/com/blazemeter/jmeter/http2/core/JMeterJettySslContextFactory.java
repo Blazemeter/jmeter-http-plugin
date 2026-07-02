@@ -50,7 +50,7 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client
             System.getProperty("javax.net.ssl.keyStoreType"), keyStoreType);
         configureKeyStorePathForJetty(keyStorePath, jettyKeyStoreUri, keyStoreType);
       }
-      keys = getKeyStore((JsseSSLManager) SSLManager.getInstance());
+      keys = loadJMeterKeyStore(keyStorePath);
       /*
        we need to set password after getting keystore since getKeystore may ask the user for the
        password.
@@ -79,6 +79,18 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client
        password.
       */
       setTrustStorePassword(System.getProperty("javax.net.ssl.trustStorePassword"));
+    }
+  }
+
+  private JmeterKeyStore loadJMeterKeyStore(String keyStorePath) {
+    try {
+      return getKeyStore((JsseSSLManager) SSLManager.getInstance());
+    } catch (RuntimeException e) {
+      LOG.warn("Could not load JMeter keyStore from '{}': {}. "
+              + "Client certificate alias selection may be unavailable.",
+          keyStorePath, e.getMessage());
+      lowLevelDebug("Could not load JMeter keyStore from '{}'", keyStorePath, e);
+      return null;
     }
   }
 

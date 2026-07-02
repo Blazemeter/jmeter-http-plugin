@@ -1383,15 +1383,24 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String keyStorePasswordPropertyName = "javax.net.ssl.keyStorePassword";
     System.setProperty(keyStorePropertyName, getKeyStorePathAsUriPathWithNetSslKeyStoreFormat());
     System.setProperty(keyStorePasswordPropertyName, KEYSTORE_PASSWORD);
+    System.setProperty("javax.net.ssl.keyStoreType", "PKCS12");
+    SSLManager.reset();
     client.stop();
-    client = new HTTP2JettyClient();
+    client = new HTTP2JettyClient(false, "client-cert-test",
+        HTTP2ClientProfileConfig.builder()
+            .enableHttp1(true)
+            .enableHttp2(false)
+            .enableHttp3(false)
+            .alpnEnabled(false)
+            .build());
     client.start();
     try {
       HTTPSampleResult result = sampleWithGet();
       assertThat(result.getResponseDataAsString()).isEqualTo(SERVER_RESPONSE);
     } finally {
-      System.setProperty(keyStorePropertyName, "");
-      System.setProperty(keyStorePasswordPropertyName, "");
+      System.clearProperty(keyStorePropertyName);
+      System.clearProperty(keyStorePasswordPropertyName);
+      System.clearProperty("javax.net.ssl.keyStoreType");
       SSLManager.reset();
     }
   }
