@@ -1138,6 +1138,7 @@ public class HTTP2JettyClient {
 
     // Copy body if present
     setBody(http11Request, sampler, result);
+    JmeterRequestHeadersSupport.prepareFromSampler(http11Request, sampler.getUseKeepAlive());
 
     // Send request
     lowLevelDebug("Sending HTTP/1.1 fallback request");
@@ -1199,6 +1200,7 @@ public class HTTP2JettyClient {
         // will be lost, but this is an edge case.
       }
       ensureHostHeader(http11Request, uri);
+      JmeterRequestHeadersSupport.copySamplerHeaderState(originalRequest, http11Request);
 
       configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
 
@@ -1324,6 +1326,7 @@ public class HTTP2JettyClient {
     result.sampleStart();
 
     setBody(request, sampler, result);
+    JmeterRequestHeadersSupport.prepareFromSampler(request, sampler.getUseKeepAlive());
     initializeSentBytes(result, request);
 
   }
@@ -3452,7 +3455,8 @@ public class HTTP2JettyClient {
     if (!refresh && cached instanceof String) {
       return (String) cached;
     }
-    String serialized = buildHeadersString(request.getHeaders());
+    String serialized = buildHeadersString(
+        JmeterRequestHeadersSupport.headersForSampleResult(request));
     request.attribute(ATTR_REQUEST_HEADERS_SERIALIZED, serialized);
     return serialized;
   }
