@@ -1,54 +1,78 @@
 package com.blazemeter.jmeter.http2.core;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.InputStream;
+import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
+
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.Socket;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.security.KeyStore;
 import java.security.Principal;
 import java.security.PrivateKey;
+import java.security.cert.CRL;
 import java.security.cert.X509Certificate;
-import java.util.Locale;
+import java.util.Collection;
+import java.util.Map;
 import javax.net.ssl.KeyManager;
-import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509KeyManager;
+import org.apache.jmeter.threads.JMeterContextService;
+import org.apache.jmeter.threads.JMeterVariables;
 import org.apache.jmeter.util.JsseSSLManager;
 import org.apache.jmeter.util.SSLManager;
 import org.apache.jmeter.util.keystore.JmeterKeyStore;
+import org.eclipse.jetty.io.ssl.SslClientConnectionFactory;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- * Jetty SSL client wired to JMeter {@link SSLManager}.
- * Keystore/truststore path resolution improvements are tracked in
- * <a href="https://github.com/Blazemeter/jmeter-http-plugin/pull/112">PR #112</a>.
- */
-public class JMeterJettySslContextFactory extends SslContextFactory.Client {
+public class JMeterJettySslContextFactory extends SslContextFactory.Client
+    implements SslClientConnectionFactory.SslEngineFactory {
+
+  private static final Logger LOG = LoggerFactory.getLogger(JMeterJettySslContextFactory.class);
 
   private final JmeterKeyStore keys;
-  private final KeyManager[] configuredKeyManagers;
 
   public JMeterJettySslContextFactory() {
     setTrustAll(true);
+    setValidatePeerCerts(false);
     String keyStorePath = System.getProperty("javax.net.ssl.keyStore");
     if (keyStorePath != null && !keyStorePath.isEmpty()) {
-      setKeyStorePath(toStoreUri(keyStorePath));
+      if (SslStorePathResolver.isFileBasedStoreLocation(keyStorePath)) {
+        String jettyKeyStoreUri = SslStorePathResolver.toJettyFileUri(keyStorePath);
+        String keyStoreType = SslStorePathResolver.resolveKeyStoreType(keyStorePath);
+        lowLevelDebug(
+            "SSL keyStore path resolved: javax.net.ssl.keyStore='{}' -> jettyUri='{}'",
+            keyStorePath, jettyKeyStoreUri);
+        lowLevelDebug(
+            "SSL keyStore type resolved: javax.net.ssl.keyStoreType='{}' -> jettyType='{}'",
+            System.getProperty("javax.net.ssl.keyStoreType"), keyStoreType);
+        configureKeyStorePathForJetty(keyStorePath, jettyKeyStoreUri, keyStoreType);
+      }
+      keys = loadJMeterKeyStore(keyStorePath);
+      /*
+       we need to set password after getting keystore since getKeystore may ask the user for the
+       password.
+      */
       setKeyStorePassword(System.getProperty("javax.net.ssl.keyStorePassword"));
-      configuredKeyManagers = loadKeyManagersFromPath(keyStorePath);
-      keys = loadJmeterKeyStoreFromPath(keyStorePath);
     } else {
-      configuredKeyManagers = null;
       keys = null;
     }
 
     String truststore = System.getProperty("javax.net.ssl.trustStore");
     if (truststore != null && !truststore.isEmpty()) {
-      setTrustStorePath(toStoreUri(truststore));
+      if (SslStorePathResolver.isFileBasedStoreLocation(truststore)) {
+        String jettyTrustStoreUri = SslStorePathResolver.toJettyFileUri(truststore);
+        String trustStoreType = SslStorePathResolver.resolveTrustStoreType(truststore);
+        lowLevelDebug(
+            "SSL trustStore path resolved: javax.net.ssl.trustStore='{}' -> jettyUri='{}'",
+            truststore, jettyTrustStoreUri);
+        lowLevelDebug(
+            "SSL trustStore type resolved: javax.net.ssl.trustStoreType='{}' -> jettyType='{}'",
+            System.getProperty("javax.net.ssl.trustStoreType"), trustStoreType);
+        configureTrustStorePathForJetty(truststore, jettyTrustStoreUri, trustStoreType);
+      }
       getTrustStore((JsseSSLManager) SSLManager.getInstance());
       /*
        we need to set password after getting truststore since getTrustStore may ask the user for the
@@ -58,62 +82,49 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
     }
   }
 
-  private static String toStoreUri(String storePath) {
-    if (storePath.regionMatches(true, 0, "file:", 0, 5)) {
-      return storePath;
-    }
-    Path path = Paths.get(storePath);
-    return path.toUri().toString();
-  }
-
-  private static String resolveKeyStoreType(String keyStorePath) {
-    String keyStoreType = System.getProperty("javax.net.ssl.keyStoreType");
-    if (keyStoreType != null && !keyStoreType.isEmpty()) {
-      return keyStoreType;
-    }
-    String lowerPath = keyStorePath.toLowerCase(Locale.ENGLISH);
-    if (lowerPath.endsWith(".p12") || lowerPath.endsWith(".pfx")) {
-      return "PKCS12";
-    }
-    return KeyStore.getDefaultType();
-  }
-
-  private static KeyManager[] loadKeyManagersFromPath(String keyStorePath) {
-    File storeFile = new File(keyStorePath);
-    if (!storeFile.isFile()) {
-      throw new RuntimeException("Keystore file not found: " + keyStorePath);
-    }
-    String keyStoreType = resolveKeyStoreType(keyStorePath);
-    String password = System.getProperty("javax.net.ssl.keyStorePassword", "");
+  private JmeterKeyStore loadJMeterKeyStore(String keyStorePath) {
     try {
-      KeyStore keyStore = KeyStore.getInstance(keyStoreType);
-      try (InputStream in = new FileInputStream(storeFile)) {
-        keyStore.load(in, password.toCharArray());
-      }
-      KeyManagerFactory keyManagerFactory =
-          KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-      keyManagerFactory.init(keyStore, password.toCharArray());
-      return keyManagerFactory.getKeyManagers();
-    } catch (Exception e) {
-      throw new RuntimeException("Failed to load key managers from " + keyStorePath, e);
+      return getKeyStore((JsseSSLManager) SSLManager.getInstance());
+    } catch (RuntimeException e) {
+      LOG.warn("Could not load JMeter keyStore from '{}': {}. "
+              + "Client certificate alias selection may be unavailable.",
+          keyStorePath, e.getMessage());
+      lowLevelDebug("Could not load JMeter keyStore from '{}'", keyStorePath, e);
+      return null;
     }
   }
 
-  private static JmeterKeyStore loadJmeterKeyStoreFromPath(String keyStorePath) {
-    File storeFile = new File(keyStorePath);
-    if (!storeFile.isFile()) {
-      throw new RuntimeException("Keystore file not found: " + keyStorePath);
-    }
-    String keyStoreType = resolveKeyStoreType(keyStorePath);
-    String password = System.getProperty("javax.net.ssl.keyStorePassword", "");
+  void configureKeyStorePathForJetty(String originalPath, String jettyUri, String storeType) {
     try {
-      JmeterKeyStore keyStore = JmeterKeyStore.getInstance(keyStoreType, 0, -1, "");
-      try (InputStream in = new FileInputStream(storeFile)) {
-        keyStore.load(in, password);
-      }
-      return keyStore;
-    } catch (Exception e) {
-      throw new RuntimeException("Failed to load keystore from " + keyStorePath, e);
+      setKeyStorePath(jettyUri);
+      setKeyStoreType(storeType);
+    } catch (RuntimeException e) {
+      LOG.warn("Could not set Jetty keyStore path for '{}': {}. "
+              + "Client certificate authentication may not work.",
+          originalPath, e.getMessage());
+      lowLevelDebug("Could not set Jetty keyStore path for '{}'", originalPath, e);
+    }
+  }
+
+  void configureTrustStorePathForJetty(String originalPath, String jettyUri, String storeType) {
+    try {
+      setTrustStorePath(jettyUri);
+      setTrustStoreType(storeType);
+    } catch (RuntimeException e) {
+      LOG.warn("Could not set Jetty trustStore path for '{}': {}. "
+              + "Trust-all SSL configuration will still be used.",
+          originalPath, e.getMessage());
+      lowLevelDebug("Could not set Jetty trustStore path for '{}'", originalPath, e);
+    }
+  }
+
+  private JmeterKeyStore getKeyStore(JsseSSLManager sslManager) {
+    try {
+      Method keystoreMethod = SSLManager.class.getDeclaredMethod("getKeyStore");
+      keystoreMethod.setAccessible(true);
+      return (JmeterKeyStore) keystoreMethod.invoke(sslManager);
+    } catch (InvocationTargetException | IllegalAccessException | NoSuchMethodException e) {
+      throw new RuntimeException(e);
     }
   }
 
@@ -137,23 +148,46 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
   protected void checkEndPointIdentificationAlgorithm() {
   }
 
-  /**
-   * Overwritten to provide JMeter SSLManager configured keyManagers.
-   */
+  // JMeter HTTP uses CustomX509TrustManager which does not validate server certificates.
+  // Jetty still runs PKIX when a keyStore is configured unless trust managers are overridden.
+  @Override
+  protected TrustManager[] getTrustManagers(KeyStore trustStore,
+      Collection<? extends CRL> crls) throws Exception {
+    if (isTrustAll()) {
+      lowLevelDebug("SSL trust managers: using TRUST_ALL_CERTS (JMeter HTTP parity)");
+      return TRUST_ALL_CERTS;
+    }
+    return super.getTrustManagers(trustStore, crls);
+  }
+
+  @Override
+  public SSLEngine newSslEngine(String host, int port, Map<String, Object> context) {
+    SSLEngine engine = super.newSSLEngine(host, port);
+    bindAliasFromContext(engine, context);
+    return engine;
+  }
+
+  private static void bindAliasFromContext(SSLEngine engine, Map<String, Object> context) {
+    String alias = SslClientCertAliasContext.readAlias(context);
+    if (alias != null) {
+      SslClientCertAliasContext.bindEngine(engine, alias);
+    }
+  }
+
+  // Overwritten to provide jmeter SSLManager configured keyManagers
   @Override
   protected KeyManager[] getKeyManagers(KeyStore keyStore) throws Exception {
-    if (configuredKeyManagers == null) {
-      return super.getKeyManagers(keyStore);
+    // based in logic extracted from JsseSSLManager.createContext
+    KeyManager[] ret = super.getKeyManagers(keyStore);
+    if (keys == null) {
+      return ret;
     }
-    KeyManager[] managers = configuredKeyManagers.clone();
-    if (keys != null) {
-      for (int i = 0; i < managers.length; i++) {
-        if (managers[i] instanceof X509KeyManager) {
-          managers[i] = new WrappedX509KeyManager((X509KeyManager) managers[i], keys);
-        }
+    for (int i = 0; i < ret.length; i++) {
+      if (ret[i] instanceof X509KeyManager) {
+        ret[i] = new WrappedX509KeyManager((X509KeyManager) ret[i], keys);
       }
     }
-    return managers;
+    return ret;
   }
 
   // based in logic extracted from JsseSSLManager.WrappedX509KeyManager
@@ -189,35 +223,33 @@ public class JMeterJettySslContextFactory extends SslContextFactory.Client {
 
     @Override
     public String chooseClientAlias(String[] keyType, Principal[] issuers, Socket socket) {
-      return resolveClientAlias(keyType, issuers);
+      return resolveClientAlias(null);
     }
 
     @Override
     public String chooseEngineClientAlias(String[] keyType, Principal[] issuers,
                                           SSLEngine engine) {
-      return resolveClientAlias(keyType, issuers);
+      return resolveClientAlias(engine);
     }
 
-    private String resolveClientAlias(String[] keyTypes, Principal[] issuers) {
-      if (keyTypes != null) {
-        for (String keyType : keyTypes) {
-          String[] aliases = store.getClientAliases(keyType, issuers);
-          if (aliases != null && aliases.length > 0) {
-            return aliases[0];
-          }
-        }
+    private String resolveClientAlias(SSLEngine engine) {
+      String boundAlias = SslClientCertAliasContext.resolveFromEngine(engine);
+      if (boundAlias != null) {
+        return boundAlias;
       }
-      String[] aliases = store.getClientAliases(null, issuers);
-      if (aliases != null && aliases.length > 0) {
-        return aliases[0];
+      JMeterVariables variables = JMeterContextService.getContext().getVariables();
+      if (variables != null) {
+        return store.getAlias();
       }
-      if (store.getAliasCount() > 0) {
-        return store.getAlias(0);
+      return firstConfiguredAlias();
+    }
+
+    private String firstConfiguredAlias() {
+      String[] aliases = store.getClientAliases("RSA", null);
+      if (aliases == null || aliases.length == 0) {
+        aliases = store.getClientAliases("EC", null);
       }
-      if (manager instanceof X509ExtendedKeyManager extendedManager) {
-        return extendedManager.chooseEngineClientAlias(keyTypes, issuers, null);
-      }
-      return manager.chooseClientAlias(keyTypes, issuers, null);
+      return aliases != null && aliases.length > 0 ? aliases[0] : null;
     }
 
     @Override
