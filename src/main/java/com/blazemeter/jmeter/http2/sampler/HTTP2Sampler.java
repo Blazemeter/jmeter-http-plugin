@@ -6,6 +6,7 @@ import com.blazemeter.jmeter.http2.control.HTTP2Controller;
 import com.blazemeter.jmeter.http2.core.HTTP2ClientProfileConfig;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
+import com.blazemeter.jmeter.http2.core.HpackFailureDetector;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -478,7 +479,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       LOG.debug("isProtocolError(cause): {}", isProtocolErrorCause);
       LOG.debug("isProtocolError(exception): {}", isProtocolErrorException);
 
-      if (isProtocolErrorCause || isProtocolErrorException) {
+      if ((isProtocolErrorCause || isProtocolErrorException)
+          && !HpackFailureDetector.indicatesHpackFailure(e)
+          && !HpackFailureDetector.indicatesHpackFailure(cause)) {
         boolean fallbackEnabled = isProtocolErrorFallbackEnabled();
         if (!fallbackEnabled) {
           LOG.warn("HTTP/2 protocol_error detected and fallback is DISABLED. "
