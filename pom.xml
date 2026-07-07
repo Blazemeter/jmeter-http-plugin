@@ -189,10 +189,27 @@
       <version>2.28.2</version>
       <scope>test</scope>
     </dependency>
+    <!-- Pin byte-buddy to 1.14.18 to resolve classpath conflict:
+         mockito-core 2.28.2 pulls byte-buddy ~1.9.x which lacks ElementMatchers.namedOneOf(),
+         a method required by assertj-core 3.27.7's SoftProxies initialisation.
+         1.14.x is the last series compatible with the Mockito 2.x instrumentation API
+         while also satisfying assertj-core 3.27.x. Remove these pins when mockito is upgraded. -->
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy</artifactId>
+      <version>1.14.18</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy-agent</artifactId>
+      <version>1.14.18</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.assertj</groupId>
       <artifactId>assertj-core</artifactId>
-      <version>3.12.2</version>
+      <version>3.27.7</version>
       <scope>test</scope>
     </dependency>
     <dependency>
