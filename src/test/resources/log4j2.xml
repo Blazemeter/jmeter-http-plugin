@@ -1,16 +1,30 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Configuration>
+<Configuration status="WARN">
   <Appenders>
     <Console name="Console" target="SYSTEM_OUT">
-      <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
+      <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
     </Console>
+    <File name="File" fileName="target/test-output.log">
+      <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
+    </File>
   </Appenders>
   <Loggers>
+    <!-- Set logging level for our plugin to DEBUG to capture ALL messages -->
+    <Logger name="com.blazemeter.jmeter.http2" level="DEBUG" additivity="false">
+      <AppenderRef ref="Console"/>
+      <AppenderRef ref="File"/>
+    </Logger>
+    <!-- Set logging level for Jetty to INFO to avoid excessive test logs -->
+    <Logger name="org.eclipse.jetty" level="INFO"/>
+    <!-- Set logging level for HTTP/2 specific classes to DEBUG -->
+    <Logger name="org.eclipse.jetty.http2" level="DEBUG"/>
+    <Logger name="org.eclipse.jetty.http2.client" level="DEBUG"/>
+    <Logger name="org.eclipse.jetty.http2.client.transport" level="DEBUG"/>
+    <!-- Set logging level for JMeter to INFO -->
+    <Logger name="org.apache.jmeter" level="INFO"/>
     <Root level="INFO">
       <AppenderRef ref="Console"/>
+      <AppenderRef ref="File"/>
     </Root>
-    <Logger name="com.blazemeter.jmeter.http2" level="DEBUG"/>
-    <Logger name="org.eclipse.jetty" level="WARN"/>
-    <Logger name="org.apache.jmeter" level="WARN"/>
   </Loggers>
 </Configuration>

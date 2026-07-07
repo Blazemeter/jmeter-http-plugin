@@ -1,18 +1,17 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# runs the plugin with the given JMeter version (through taurus)
+# environment variables:
+#   JMETER_VERSION (required)
+#   JMETER_PATH    (optional, defaults to $PWD/.jmeter/$JMETER_VERSION)
+#   JVM_VERSION    (optional, defaults to 8; only used to switch JDKs via update-java-alternatives)
 set -e
 
-export JMETER_VERSION=$1
-export JMETER_PATH=$2/$JMETER_VERSION
-export JMETER_TEST_PATH=${project.basedir}/target/jmeter-test
-export APLN_JAR=$(ls $JMETER_TEST_PATH/lib/ | grep alpn-boot)
-export JVM_ARGS="-Xbootclasspath/p:$JMETER_TEST_PATH/lib/alpn-boot.jar"
-JARS=$(ls $JMETER_TEST_PATH/lib/ | grep -v alpn-boot)
+JMETER_PATH=${JMETER_PATH:-$PWD/.jmeter/$JMETER_VERSION}
+DEFAULT_JVM_VERSION=8
+JVM_VERSION=${JVM_VERSION:-$DEFAULT_JVM_VERSION}
 
-cd $JMETER_TEST_PATH/lib/
-mkdir -p $JMETER_PATH/lib/ext/ && cp -f $JARS $JMETER_PATH/lib/ext/
-cd $JMETER_TEST_PATH
-bzt -o modules.jmeter.path=$JMETER_PATH -o modules.jmeter.version=$JMETER_VERSION testJMeter.yaml || ERROR=$?
-cd $JMETER_PATH/lib/ext/
-rm $JARS
+ERROR=0
+[ "$JVM_VERSION" != "$DEFAULT_JVM_VERSION" ] && update-java-alternatives --set java-1.${JVM_VERSION}.0-openjdk-amd64
+bzt testJMeter.yaml -o modules.jmeter.version=$JMETER_VERSION -o modules.jmeter.path=$JMETER_PATH || ERROR=$?
+[ "$JVM_VERSION" != "$DEFAULT_JVM_VERSION" ] && update-java-alternatives --set java-1.${DEFAULT_JVM_VERSION}.0-openjdk-amd64
 exit $ERROR
-

@@ -1,23 +1,41 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
   <modelVersion>4.0.0</modelVersion>
-
   <groupId>com.blazemeter.jmeter</groupId>
   <artifactId>jmeter-bzm-http2</artifactId>
   <packaging>jar</packaging>
-  <version>2.0.2</version>
-  <name>HTTP/2 Sampler</name>
-  <description>HTTP/2 protocol sampler</description>
-
+  <version>3.0.2-SNAPSHOT</version>
+  <name>BlazeMeter HTTP</name>
+  <description>BlazeMeter HTTP Plugin for JMeter (HTTP/1.1, HTTP/2, HTTP/3/QUIC)</description>
+  <licenses>
+    <license>
+      <name>The Apache Software License, Version 2.0</name>
+      <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+  <url>https://github.com/Blazemeter/jmeter-http2-plugin</url>
+  <scm>
+    <connection>scm:git:git://github.com/Blazemeter/jmeter-http2-plugin.git</connection>
+    <developerConnection>scm:git:ssh://github.com:Blazemeter/jmeter-http2-plugin.git</developerConnection>
+    <url>https://github.com/Blazemeter/jmeter-http2-plugin/tree/master</url>
+  </scm>
+  <developers>
+    <developer>
+      <id>team</id>
+      <name>blazelabs</name>
+      <email>blazelabs@perforce.com</email>
+    </developer>
+  </developers>
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <jmeter.version>5.4.1</jmeter.version>
-    <jetty.version>11.0.10</jetty.version>
+    <jetty.version>12.1.7</jetty.version>
+    <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.7 -->
+    <brotli4j.version>1.20.0</brotli4j.version>
+    <checkstyle.skip>false</checkstyle.skip>
   </properties>
-
   <dependencies>
     <dependency>
       <groupId>org.apache.jmeter</groupId>
@@ -31,9 +49,29 @@
       <version>${jmeter.version}</version>
       <scope>provided</scope>
     </dependency>
+    <!-- Apache HttpClient for compilation (classes used in JettyCacheManager) -->
+    <!-- Using same version as JMeter 5.4.1 -->
+    <dependency>
+      <groupId>org.apache.httpcomponents</groupId>
+      <artifactId>httpcore</artifactId>
+      <version>4.4.14</version>
+      <scope>compile</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.httpcomponents</groupId>
+      <artifactId>httpclient</artifactId>
+      <version>4.5.14</version>
+      <scope>compile</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-lang3</artifactId>
+      <version>3.18.0</version>
+      <scope>compile</scope>
+    </dependency>
     <dependency>
       <groupId>org.eclipse.jetty.http2</groupId>
-      <artifactId>http2-client</artifactId>
+      <artifactId>jetty-http2-client</artifactId>
       <version>${jetty.version}</version>
     </dependency>
     <dependency>
@@ -43,14 +81,107 @@
     </dependency>
     <dependency>
       <groupId>org.eclipse.jetty.http2</groupId>
-      <artifactId>http2-http-client-transport</artifactId>
+      <artifactId>jetty-http2-client-transport</artifactId>
+      <version>${jetty.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.http3</groupId>
+      <artifactId>jetty-http3-client</artifactId>
+      <version>${jetty.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.http3</groupId>
+      <artifactId>jetty-http3-client-transport</artifactId>
+      <version>${jetty.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.http3</groupId>
+      <artifactId>jetty-http3-server</artifactId>
+      <version>${jetty.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.quic</groupId>
+      <artifactId>jetty-quic-client</artifactId>
+      <version>${jetty.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.quic</groupId>
+      <artifactId>jetty-quic-quiche-client</artifactId>
+      <version>${jetty.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.quic</groupId>
+      <artifactId>jetty-quic-quiche-server</artifactId>
+      <version>${jetty.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.compression</groupId>
+      <artifactId>jetty-compression-client</artifactId>
+      <version>${jetty.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.compression</groupId>
+      <artifactId>jetty-compression-server</artifactId>
+      <version>${jetty.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.compression</groupId>
+      <artifactId>jetty-compression-brotli</artifactId>
+      <version>${jetty.version}</version>
+    </dependency>
+    <!-- brotli4j pulls one native-* for the build OS only; add the rest for cross-platform shaded jar -->
+    <dependency>
+      <groupId>com.aayushatharva.brotli4j</groupId>
+      <artifactId>native-linux-x86_64</artifactId>
+      <version>${brotli4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.aayushatharva.brotli4j</groupId>
+      <artifactId>native-linux-aarch64</artifactId>
+      <version>${brotli4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.aayushatharva.brotli4j</groupId>
+      <artifactId>native-windows-x86_64</artifactId>
+      <version>${brotli4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.aayushatharva.brotli4j</groupId>
+      <artifactId>native-windows-aarch64</artifactId>
+      <version>${brotli4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.aayushatharva.brotli4j</groupId>
+      <artifactId>native-osx-x86_64</artifactId>
+      <version>${brotli4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.aayushatharva.brotli4j</groupId>
+      <artifactId>native-osx-aarch64</artifactId>
+      <version>${brotli4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.compression</groupId>
+      <artifactId>jetty-compression-zstandard</artifactId>
+      <version>${jetty.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty.compression</groupId>
+      <artifactId>jetty-compression-gzip</artifactId>
       <version>${jetty.version}</version>
     </dependency>
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
-      <version>1.7.26</version>
-      <scope>provided</scope>
+      <version>2.0.9</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>2.0.9</version>
+      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.mockito</groupId>
@@ -58,10 +189,27 @@
       <version>2.28.2</version>
       <scope>test</scope>
     </dependency>
+    <!-- Pin byte-buddy to 1.14.18 to resolve classpath conflict:
+         mockito-core 2.28.2 pulls byte-buddy ~1.9.x which lacks ElementMatchers.namedOneOf(),
+         a method required by assertj-core 3.27.7's SoftProxies initialisation.
+         1.14.x is the last series compatible with the Mockito 2.x instrumentation API
+         while also satisfying assertj-core 3.27.x. Remove these pins when mockito is upgraded. -->
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy</artifactId>
+      <version>1.14.18</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy-agent</artifactId>
+      <version>1.14.18</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.assertj</groupId>
       <artifactId>assertj-core</artifactId>
-      <version>3.12.2</version>
+      <version>3.27.7</version>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -71,9 +219,20 @@
       <scope>test</scope>
     </dependency>
     <dependency>
+      <groupId>com.blazemeter</groupId>
+      <artifactId>jmeter-bzm-commons</artifactId>
+      <version>0.2.3</version>
+      <exclusions>
+        <exclusion>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-checkstyle-plugin</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
       <groupId>kg.apc</groupId>
       <artifactId>jmeter-plugins-emulators</artifactId>
-      <version>0.4</version>
+      <version>0.5</version>
       <scope>test</scope>
       <exclusions>
         <exclusion>
@@ -101,20 +260,26 @@
       <scope>test</scope>
     </dependency>
     <dependency>
-      <groupId>org.eclipse.jetty</groupId>
-      <artifactId>jetty-servlet</artifactId>
+      <groupId>org.eclipse.jetty.ee10</groupId>
+      <artifactId>jetty-ee10-servlet</artifactId>
       <version>${jetty.version}</version>
       <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.eclipse.jetty.http2</groupId>
-      <artifactId>http2-server</artifactId>
+      <artifactId>jetty-http2-server</artifactId>
       <version>${jetty.version}</version>
       <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.eclipse.jetty</groupId>
       <artifactId>jetty-server</artifactId>
+      <version>${jetty.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty</groupId>
+      <artifactId>jetty-security</artifactId>
       <version>${jetty.version}</version>
       <scope>test</scope>
     </dependency>
@@ -131,7 +296,6 @@
       <scope>test</scope>
     </dependency>
   </dependencies>
-
   <build>
     <resources>
       <resource>
@@ -142,21 +306,166 @@
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.3.0</version>
+        <executions>
+          <execution>
+            <id>default-jar</id>
+            <phase>process-test-classes</phase>
+            <goals>
+              <goal>jar</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <shadedArtifactAttached>false</shadedArtifactAttached>
+              <artifactSet>
+                <excludes>
+                  <exclude>org.apache.jmeter:*</exclude>
+                </excludes>
+              </artifactSet>
+              <relocations>
+                <!-- Keep Jetty's SLF4J 2.x isolated from JMeter's SLF4J 1.7.x runtime. -->
+                <relocation>
+                  <pattern>org.eclipse.jetty</pattern>
+                  <shadedPattern>com.blazemeter.jmeter.http2.shaded.org.eclipse.jetty</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.slf4j</pattern>
+                  <shadedPattern>com.blazemeter.jmeter.http2.shaded.org.slf4j</shadedPattern>
+                </relocation>
+                <!-- Do not relocate com.github.luben.zstd; zstd-jni uses native linkage. -->
+                <relocation>
+                  <pattern>com.github.benmanes.caffeine</pattern>
+                  <shadedPattern>com.blazemeter.jmeter.http2.shaded.com.github.benmanes.caffeine</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.helger</pattern>
+                  <shadedPattern>com.blazemeter.jmeter.http2.shaded.com.helger</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.apache.httpcomponents</pattern>
+                  <shadedPattern>com.blazemeter.jmeter.http2.shaded.org.apache.httpcomponents</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.apache.commons</pattern>
+                  <shadedPattern>com.blazemeter.jmeter.http2.shaded.org.apache.commons</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.google</pattern>
+                  <shadedPattern>com.blazemeter.jmeter.http2.shaded.com.google</shadedPattern>
+                </relocation>
+              </relocations>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer"/>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>2.22.2</version>
+        <dependencies>
+          <dependency>
+            <groupId>org.apache.maven.surefire</groupId>
+            <artifactId>maven-surefire-common</artifactId>
+            <version>2.22.2</version>
+          </dependency>
+        </dependencies>
         <configuration>
-          <!-- avoid issue with jdk 11 -->
+          <!-- avoid issue with jdk 11+ -->
           <useSystemClassLoader>false</useSystemClassLoader>
+          <!-- Allow slf4j-simple in unit tests to enable Jetty frame logging. -->
+          <excludes>
+            <exclude>**/*IntegrationTest.java</exclude>
+          </excludes>
         </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
         <version>3.8.1</version>
+        <executions>
+          <!-- Java 8 bootstrap (SPI + installer) before main sources -->
+          <execution>
+            <id>compile-bootstrap-java8</id>
+            <phase>compile</phase>
+            <goals>
+              <goal>compile</goal>
+            </goals>
+            <configuration>
+              <compileSourceRoots>
+                <compileSourceRoot>${project.basedir}/src/main/java8</compileSourceRoot>
+              </compileSourceRoots>
+              <source>1.8</source>
+              <target>1.8</target>
+              <outputDirectory>${project.build.outputDirectory}</outputDirectory>
+            </configuration>
+          </execution>
+          <execution>
+            <id>default-compile</id>
+            <phase>compile</phase>
+            <goals>
+              <goal>compile</goal>
+            </goals>
+            <configuration>
+              <compileSourceRoots>
+                <compileSourceRoot>${project.basedir}/src/main/java</compileSourceRoot>
+              </compileSourceRoots>
+              <source>17</source>
+              <target>17</target>
+            </configuration>
+          </execution>
+        </executions>
         <configuration>
-          <source>1.8</source>
-          <target>1.8</target>
+          <source>17</source>
+          <target>17</target>
         </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <!-- Expose bootstrap sources to IDEs and test compilation -->
+          <execution>
+            <id>add-bootstrap-java8-source</id>
+            <phase>generate-sources</phase>
+            <goals>
+              <goal>add-source</goal>
+            </goals>
+            <configuration>
+              <sources>
+                <source>${project.basedir}/src/main/java8</source>
+              </sources>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -170,6 +479,7 @@
               <configLocation>checkstyle.xml</configLocation>
               <failsOnError>true</failsOnError>
               <consoleOutput>true</consoleOutput>
+              <skip>${checkstyle.skip}</skip>
             </configuration>
             <goals>
               <goal>check</goal>
@@ -181,6 +491,11 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
         <version>2.22.2</version>
+        <configuration>
+          <includes>
+            <include>**/*IntegrationTest.java</include>
+          </includes>
+        </configuration>
         <executions>
           <execution>
             <goals>
@@ -195,23 +510,6 @@
         <artifactId>maven-dependency-plugin</artifactId>
         <version>3.0.2</version>
         <executions>
-          <execution>
-            <id>copy-jmeter-dependencies</id>
-            <phase>install</phase>
-            <goals>
-              <goal>
-                copy-dependencies
-              </goal>
-            </goals>
-            <configuration>
-              <includeArtifactIds>
-                http2-client, jetty-client, http2-http-client-transport, http2-common, http2-hpack,
-                jetty-http, jetty-alpn-client, jetty-alpn-java-client, jetty-io, jetty-util
-              </includeArtifactIds>
-              <outputDirectory>${project.build.directory}/jmeter-test/lib</outputDirectory>
-              <stripVersion>true</stripVersion>
-            </configuration>
-          </execution>
           <execution>
             <id>copy-plugin-to-jmeter-dependencies</id>
             <phase>install</phase>
@@ -257,4 +555,99 @@
       </plugin>
     </plugins>
   </build>
+  <profiles>
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <version>3.6.2</version>
+            <executions>
+              <execution>
+                <id>enforce-no-snapshots</id>
+                <goals>
+                  <goal>enforce</goal>
+                </goals>
+                <configuration>
+                  <rules>
+                    <requireReleaseDeps>
+                      <message>No Snapshots Allowed!</message>
+                      <excludes>
+                        <exclude>org.apache.maven:maven-core</exclude>
+                        <exclude>org.apache.maven.plugins:*</exclude>
+                      </excludes>
+                    </requireReleaseDeps>
+                  </rules>
+                  <fail>true</fail>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.0</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.5.0</version>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+            <configuration>
+              <source>17</source>
+              <failOnError>false</failOnError>
+              <doclint>none</doclint>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.1.0</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+                <configuration>
+                  <gpgArguments>
+                    <arg>--pinentry-mode</arg>
+                    <arg>loopback</arg>
+                  </gpgArguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.9.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

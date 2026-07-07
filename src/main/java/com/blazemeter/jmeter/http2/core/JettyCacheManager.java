@@ -22,9 +22,8 @@ import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.sampler.HttpWebdav;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.util.JMeterUtils;
-import org.eclipse.jetty.client.HttpRequest;
-import org.eclipse.jetty.client.api.ContentResponse;
-import org.eclipse.jetty.http.HttpField;
+import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpVersion;
 
@@ -40,7 +39,7 @@ public class JettyCacheManager {
     return cacheManager == null ? null : new JettyCacheManager(cacheManager);
   }
 
-  public void setHeaders(URL url, HttpRequest request) throws URISyntaxException {
+  public void setHeaders(URL url, Request request) throws URISyntaxException {
     HttpRequestBase apacheRequest = buildApacheRequest(url, request.getMethod());
     cacheManager.setHeaders(url, apacheRequest);
     setRequestHeaderFromApache(HTTPConstants.VARY, apacheRequest, request);
@@ -77,10 +76,13 @@ public class JettyCacheManager {
   }
 
   private void setRequestHeaderFromApache(String headerName, HttpRequestBase apacheRequest,
-      HttpRequest request) {
+      Request request) {
     Header header = apacheRequest.getFirstHeader(headerName);
     if (header != null) {
-      request.addHeader(new HttpField(headerName, header.getValue()));
+      HttpFields headers = request.getHeaders();
+      if (headers instanceof HttpFields.Mutable) {
+        ((HttpFields.Mutable) headers).put(headerName, header.getValue());
+      }
     }
   }
 
@@ -149,5 +151,4 @@ public class JettyCacheManager {
       HttpResponse apacheResponse) {
     apacheResponse.addHeader(headerName, response.getHeaders().get(headerName));
   }
-
 }

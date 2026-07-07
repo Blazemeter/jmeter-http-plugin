@@ -1,74 +1,82 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.1-SNAPSHOT.20181109">
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
   <hashTree>
-    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Test Plan" enabled="true">
-      <stringProp name="TestPlan.comments"></stringProp>
-      <boolProp name="TestPlan.functional_mode">false</boolProp>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Test Plan">
       <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
-      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
-      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="User Defined Variables">
         <collectionProp name="Arguments.arguments"/>
       </elementProp>
-      <stringProp name="TestPlan.user_define_classpath"></stringProp>
     </TestPlan>
     <hashTree>
-      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Thread Group" enabled="true">
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Thread Group">
+        <intProp name="ThreadGroup.num_threads">2</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
         <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
-        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Loop Controller" enabled="true">
-          <boolProp name="LoopController.continue_forever">false</boolProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Loop Controller">
           <stringProp name="LoopController.loops">2</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
         </elementProp>
-        <stringProp name="ThreadGroup.num_threads">2</stringProp>
-        <stringProp name="ThreadGroup.ramp_time">1</stringProp>
-        <boolProp name="ThreadGroup.scheduler">false</boolProp>
-        <stringProp name="ThreadGroup.duration"></stringProp>
-        <stringProp name="ThreadGroup.delay"></stringProp>
-        <longProp name="ThreadGroup.start_time">1527189498000</longProp>
-        <longProp name="ThreadGroup.end_time">1527189498000</longProp>
       </ThreadGroup>
       <hashTree>
-        <ConfigTestElement guiclass="com.blazemeter.jmeter.http2.sampler.gui.Http2DefaultsGui" testclass="ConfigTestElement" testname="HTTP2 Request Defaults" enabled="false">
-          <elementProp name="HTTP2Request.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
+        <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP2 Request Defaults" enabled="false">
+          <stringProp name="HTTPSampler.domain">webtide.com</stringProp>
+          <stringProp name="HTTPSampler.port">443</stringProp>
+          <stringProp name="HTTPSampler.protocol">https</stringProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables">
             <collectionProp name="Arguments.arguments"/>
           </elementProp>
-          <stringProp name="HTTP2Request.domain">webtide.com</stringProp>
-          <stringProp name="HTTPSampler.port">443</stringProp>
-          <stringProp name="HTTP2Request.response_timeout"></stringProp>
-          <stringProp name="HTTP2Request.protocol">https</stringProp>
-          <stringProp name="HTTP2Request.contentEncoding"></stringProp>
-          <stringProp name="HTTP2Request.path"></stringProp>
+          <stringProp name="HTTPSampler.implementation"></stringProp>
         </ConfigTestElement>
         <hashTree/>
-        <CookieManager guiclass="CookiePanel" testclass="CookieManager" testname="HTTP Cookie Manager" enabled="true">
+        <CookieManager guiclass="CookiePanel" testclass="CookieManager" testname="HTTP Cookie Manager">
           <collectionProp name="CookieManager.cookies"/>
           <boolProp name="CookieManager.clearEachIteration">false</boolProp>
+          <boolProp name="CookieManager.controlledByThreadGroup">false</boolProp>
         </CookieManager>
         <hashTree/>
-        <com.blazemeter.jmeter.http2.sampler.HTTP2Request guiclass="com.blazemeter.jmeter.http2.sampler.gui.HTTP2RequestGui" testclass="com.blazemeter.jmeter.http2.sampler.HTTP2Request" testname="GET webtide.com" enabled="true">
-          <boolProp name="HTTP2Request.postBodyRaw">true</boolProp>
-          <elementProp name="HTTP2Request.Arguments" elementType="Arguments">
-            <collectionProp name="Arguments.arguments">
-              <elementProp name="" elementType="HTTPArgument">
-                <boolProp name="HTTPArgument.always_encode">false</boolProp>
-                <stringProp name="Argument.value"></stringProp>
-                <stringProp name="Argument.metadata">=</stringProp>
-              </elementProp>
-            </collectionProp>
-          </elementProp>
-          <stringProp name="HTTP2Request.domain">http2cdn.cdnsun.com</stringProp>
-          <stringProp name="HTTPSampler.port">443</stringProp>
-          <stringProp name="HTTP2Request.response_timeout">5000</stringProp>
-          <stringProp name="HTTP2Request.protocol">https</stringProp>
-          <stringProp name="HTTP2Request.contentEncoding"></stringProp>
-          <stringProp name="HTTP2Request.path"></stringProp>
-          <stringProp name="HTTP2Sampler.method">GET</stringProp>
-          <boolProp name="HTTP2Request.follow_redirects">true</boolProp>
-          <boolProp name="HTTP2Request.auto_redirects">false</boolProp>
-          <stringProp name="HTTP2Request.request_id"></stringProp>
+        <com.blazemeter.jmeter.http2.sampler.HTTP2Sampler guiclass="com.blazemeter.jmeter.http2.sampler.gui.HTTP2SamplerGui" testclass="com.blazemeter.jmeter.http2.sampler.HTTP2Sampler" testname="GET webtide.com">
+          <boolProp name="HTTPSampler.image_parser">false</boolProp>
+          <boolProp name="HTTPSampler.concurrentDwn">true</boolProp>
+          <stringProp name="HTTPSampler.concurrentPool">6</stringProp>
           <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
-        </com.blazemeter.jmeter.http2.sampler.HTTP2Request>
+          <stringProp name="HTTPSampler.connect_timeout"></stringProp>
+          <stringProp name="HTTPSampler.response_timeout">5000</stringProp>
+          <stringProp name="HTTPSampler.proxyHost"></stringProp>
+          <stringProp name="HTTPSampler.proxyScheme"></stringProp>
+          <stringProp name="HTTPSampler.proxyPort"></stringProp>
+          <stringProp name="HTTPSampler.proxyUser"></stringProp>
+          <stringProp name="HTTPSampler.proxyPass"></stringProp>
+          <stringProp name="version">3.0.0</stringProp>
+          <stringProp name="HTTPSampler.domain">http2cdn.cdnsun.com</stringProp>
+          <stringProp name="HTTPSampler.port">443</stringProp>
+          <stringProp name="HTTPSampler.protocol">https</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+          <intProp name="HTTP2Sampler.uiTabIndex">0</intProp>
+          <boolProp name="HTTP2Sampler.http1_upgrade">false</boolProp>
+          <stringProp name="HTTP2Sampler.profile">browser-like</stringProp>
+          <boolProp name="HTTP2Sampler.enableHttp3">true</boolProp>
+          <boolProp name="HTTP2Sampler.enableHttp2">true</boolProp>
+          <boolProp name="HTTP2Sampler.enableHttp1">true</boolProp>
+          <boolProp name="HTTP2Sampler.alpnEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.fallbackEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.protocolErrorFallbackEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.altSvcCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.http1OnlyCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.h2cCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.http2PriorKnowledge">false</boolProp>
+          <stringProp name="HTTP2Sampler.happyEyeballsDelayMs">250</stringProp>
+          <stringProp name="HTTP2Sampler.http3BrokenCooldownMs">300000</stringProp>
+          <stringProp name="HTTP2Sampler.http1OnlyCooldownMs">300000</stringProp>
+          <stringProp name="HTTP2Sampler.h2cCacheTtlMs">300000</stringProp>
+        </com.blazemeter.jmeter.http2.sampler.HTTP2Sampler>
         <hashTree>
-          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP Header Manager" enabled="true">
+          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP Header Manager">
             <collectionProp name="HeaderManager.headers">
               <elementProp name="" elementType="Header">
                 <stringProp name="Header.name">header1</stringProp>
@@ -81,9 +89,9 @@
             </collectionProp>
           </HeaderManager>
           <hashTree/>
-          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion">
             <collectionProp name="Asserion.test_strings">
-              <stringProp name="1996129610">etty and CometD Ex</stringProp>
+              <stringProp name="69609650">Hello</stringProp>
             </collectionProp>
             <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
             <boolProp name="Assertion.assume_success">false</boolProp>
@@ -92,29 +100,45 @@
           </ResponseAssertion>
           <hashTree/>
         </hashTree>
-        <com.blazemeter.jmeter.http2.sampler.HTTP2Request guiclass="com.blazemeter.jmeter.http2.sampler.gui.HTTP2RequestGui" testclass="com.blazemeter.jmeter.http2.sampler.HTTP2Request" testname="GET webtide.com/why-choose-webtide/" enabled="false">
-          <boolProp name="HTTP2Request.postBodyRaw">true</boolProp>
-          <elementProp name="HTTP2Request.Arguments" elementType="Arguments">
-            <collectionProp name="Arguments.arguments">
-              <elementProp name="" elementType="HTTPArgument">
-                <boolProp name="HTTPArgument.always_encode">false</boolProp>
-                <stringProp name="Argument.value"></stringProp>
-                <stringProp name="Argument.metadata">=</stringProp>
-              </elementProp>
-            </collectionProp>
-          </elementProp>
-          <stringProp name="HTTP2Request.domain">webtide.com</stringProp>
-          <stringProp name="HTTPSampler.port"></stringProp>
-          <stringProp name="HTTP2Request.response_timeout">5000</stringProp>
-          <stringProp name="HTTP2Request.protocol"></stringProp>
-          <stringProp name="HTTP2Request.contentEncoding"></stringProp>
-          <stringProp name="HTTP2Request.path">/why-choose-webtide/</stringProp>
-          <stringProp name="HTTP2Sampler.method">GET</stringProp>
-          <boolProp name="HTTP2Request.follow_redirects">true</boolProp>
-          <boolProp name="HTTP2Request.auto_redirects">false</boolProp>
-          <stringProp name="HTTP2Request.request_id"></stringProp>
+        <com.blazemeter.jmeter.http2.sampler.HTTP2Sampler guiclass="com.blazemeter.jmeter.http2.sampler.gui.HTTP2SamplerGui" testclass="com.blazemeter.jmeter.http2.sampler.HTTP2Sampler" testname="GET webtide.com/why-choose-webtide/" enabled="false">
+          <boolProp name="HTTPSampler.image_parser">false</boolProp>
+          <boolProp name="HTTPSampler.concurrentDwn">true</boolProp>
+          <stringProp name="HTTPSampler.concurrentPool">6</stringProp>
           <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
-        </com.blazemeter.jmeter.http2.sampler.HTTP2Request>
+          <stringProp name="HTTPSampler.connect_timeout"></stringProp>
+          <stringProp name="HTTPSampler.response_timeout">5000</stringProp>
+          <stringProp name="HTTPSampler.proxyHost"></stringProp>
+          <stringProp name="HTTPSampler.proxyScheme"></stringProp>
+          <stringProp name="HTTPSampler.proxyPort"></stringProp>
+          <stringProp name="HTTPSampler.proxyUser"></stringProp>
+          <stringProp name="HTTPSampler.proxyPass"></stringProp>
+          <stringProp name="version">3.0.0</stringProp>
+          <stringProp name="HTTPSampler.domain">webtide.com</stringProp>
+          <stringProp name="HTTPSampler.path">/why-choose-webtide/</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+          <intProp name="HTTP2Sampler.uiTabIndex">0</intProp>
+          <boolProp name="HTTP2Sampler.http1_upgrade">false</boolProp>
+          <stringProp name="HTTP2Sampler.profile">browser-like</stringProp>
+          <boolProp name="HTTP2Sampler.enableHttp3">true</boolProp>
+          <boolProp name="HTTP2Sampler.enableHttp2">true</boolProp>
+          <boolProp name="HTTP2Sampler.enableHttp1">true</boolProp>
+          <boolProp name="HTTP2Sampler.alpnEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.fallbackEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.protocolErrorFallbackEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.altSvcCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.http1OnlyCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.h2cCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.http2PriorKnowledge">false</boolProp>
+          <stringProp name="HTTP2Sampler.happyEyeballsDelayMs">250</stringProp>
+          <stringProp name="HTTP2Sampler.http3BrokenCooldownMs">300000</stringProp>
+          <stringProp name="HTTP2Sampler.http1OnlyCooldownMs">300000</stringProp>
+          <stringProp name="HTTP2Sampler.h2cCacheTtlMs">300000</stringProp>
+        </com.blazemeter.jmeter.http2.sampler.HTTP2Sampler>
         <hashTree>
           <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP Header Manager" enabled="true">
             <collectionProp name="HeaderManager.headers">
@@ -140,9 +164,27 @@
           </ResponseAssertion>
           <hashTree/>
         </hashTree>
-        <com.blazemeter.jmeter.http2.sampler.HTTP2Request guiclass="com.blazemeter.jmeter.http2.sampler.gui.HTTP2RequestGui" testclass="com.blazemeter.jmeter.http2.sampler.HTTP2Request" testname="POST nghttp2.org" enabled="false">
-          <boolProp name="HTTP2Request.postBodyRaw">true</boolProp>
-          <elementProp name="HTTP2Request.Arguments" elementType="Arguments">
+        <com.blazemeter.jmeter.http2.sampler.HTTP2Sampler guiclass="com.blazemeter.jmeter.http2.sampler.gui.HTTP2SamplerGui" testclass="com.blazemeter.jmeter.http2.sampler.HTTP2Sampler" testname="POST nghttp2.org" enabled="false">
+          <boolProp name="HTTPSampler.image_parser">false</boolProp>
+          <boolProp name="HTTPSampler.concurrentDwn">true</boolProp>
+          <stringProp name="HTTPSampler.concurrentPool">6</stringProp>
+          <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
+          <stringProp name="HTTPSampler.connect_timeout"></stringProp>
+          <stringProp name="HTTPSampler.response_timeout"></stringProp>
+          <stringProp name="HTTPSampler.proxyHost"></stringProp>
+          <stringProp name="HTTPSampler.proxyScheme"></stringProp>
+          <stringProp name="HTTPSampler.proxyPort"></stringProp>
+          <stringProp name="HTTPSampler.proxyUser"></stringProp>
+          <stringProp name="HTTPSampler.proxyPass"></stringProp>
+          <stringProp name="version">3.0.0</stringProp>
+          <stringProp name="HTTPSampler.domain">nghttp2.org</stringProp>
+          <stringProp name="HTTPSampler.port">443</stringProp>
+          <stringProp name="HTTPSampler.protocol">https</stringProp>
+          <stringProp name="HTTPSampler.path">/httpbin/post</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
             <collectionProp name="Arguments.arguments">
               <elementProp name="" elementType="HTTPArgument">
                 <boolProp name="HTTPArgument.always_encode">false</boolProp>
@@ -153,19 +195,24 @@
               </elementProp>
             </collectionProp>
           </elementProp>
-          <stringProp name="HTTP2Request.domain">nghttp2.org</stringProp>
-          <stringProp name="HTTPSampler.port">443</stringProp>
-          <stringProp name="HTTP2Request.response_timeout"></stringProp>
-          <stringProp name="HTTP2Request.protocol">https</stringProp>
-          <stringProp name="HTTP2Request.contentEncoding"></stringProp>
-          <stringProp name="HTTP2Request.path">/httpbin/post</stringProp>
-          <stringProp name="HTTP2Sampler.method">POST</stringProp>
-          <boolProp name="HTTP2Request.follow_redirects">true</boolProp>
-          <boolProp name="HTTP2Request.auto_redirects">false</boolProp>
-          <stringProp name="HTTP2Request.request_id"></stringProp>
-          <boolProp name="HTTP2Request.sync_request">true</boolProp>
-          <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
-        </com.blazemeter.jmeter.http2.sampler.HTTP2Request>
+          <intProp name="HTTP2Sampler.uiTabIndex">0</intProp>
+          <boolProp name="HTTP2Sampler.http1_upgrade">false</boolProp>
+          <stringProp name="HTTP2Sampler.profile">browser-like</stringProp>
+          <boolProp name="HTTP2Sampler.enableHttp3">true</boolProp>
+          <boolProp name="HTTP2Sampler.enableHttp2">true</boolProp>
+          <boolProp name="HTTP2Sampler.enableHttp1">true</boolProp>
+          <boolProp name="HTTP2Sampler.alpnEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.fallbackEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.protocolErrorFallbackEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.altSvcCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.http1OnlyCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.h2cCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.http2PriorKnowledge">false</boolProp>
+          <stringProp name="HTTP2Sampler.happyEyeballsDelayMs">250</stringProp>
+          <stringProp name="HTTP2Sampler.http3BrokenCooldownMs">300000</stringProp>
+          <stringProp name="HTTP2Sampler.http1OnlyCooldownMs">300000</stringProp>
+          <stringProp name="HTTP2Sampler.h2cCacheTtlMs">300000</stringProp>
+        </com.blazemeter.jmeter.http2.sampler.HTTP2Sampler>
         <hashTree>
           <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP Header Manager" enabled="true">
             <collectionProp name="HeaderManager.headers">
@@ -191,24 +238,47 @@
           </ResponseAssertion>
           <hashTree/>
         </hashTree>
-        <com.blazemeter.jmeter.http2.sampler.HTTP2Request guiclass="com.blazemeter.jmeter.http2.sampler.gui.HTTP2RequestGui" testclass="com.blazemeter.jmeter.http2.sampler.HTTP2Request" testname="HTTP2 Request" enabled="false">
-          <elementProp name="HTTP2Request.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
+        <com.blazemeter.jmeter.http2.sampler.HTTP2Sampler guiclass="com.blazemeter.jmeter.http2.sampler.gui.HTTP2SamplerGui" testclass="com.blazemeter.jmeter.http2.sampler.HTTP2Sampler" testname="HTTP2 Request" enabled="false">
+          <boolProp name="HTTPSampler.image_parser">false</boolProp>
+          <boolProp name="HTTPSampler.concurrentDwn">true</boolProp>
+          <stringProp name="HTTPSampler.concurrentPool">6</stringProp>
+          <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
+          <stringProp name="HTTPSampler.connect_timeout"></stringProp>
+          <stringProp name="HTTPSampler.response_timeout"></stringProp>
+          <stringProp name="HTTPSampler.proxyHost"></stringProp>
+          <stringProp name="HTTPSampler.proxyScheme"></stringProp>
+          <stringProp name="HTTPSampler.proxyPort"></stringProp>
+          <stringProp name="HTTPSampler.proxyUser"></stringProp>
+          <stringProp name="HTTPSampler.proxyPass"></stringProp>
+          <stringProp name="version">3.0.0</stringProp>
+          <stringProp name="HTTPSampler.domain">nghttp2.org</stringProp>
+          <stringProp name="HTTPSampler.path">/httpbin/get</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables">
             <collectionProp name="Arguments.arguments"/>
           </elementProp>
-          <stringProp name="HTTP2Request.domain">nghttp2.org</stringProp>
-          <stringProp name="HTTPSampler.port"></stringProp>
-          <stringProp name="HTTP2Request.response_timeout"></stringProp>
-          <stringProp name="HTTP2Request.protocol"></stringProp>
-          <stringProp name="HTTP2Request.contentEncoding"></stringProp>
-          <stringProp name="HTTP2Request.path">/httpbin/get</stringProp>
-          <stringProp name="HTTP2Sampler.method">GET</stringProp>
-          <boolProp name="HTTP2Request.follow_redirects">true</boolProp>
-          <boolProp name="HTTP2Request.auto_redirects">false</boolProp>
-          <stringProp name="HTTP2Request.request_id"></stringProp>
-          <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
-        </com.blazemeter.jmeter.http2.sampler.HTTP2Request>
+          <intProp name="HTTP2Sampler.uiTabIndex">0</intProp>
+          <boolProp name="HTTP2Sampler.http1_upgrade">false</boolProp>
+          <stringProp name="HTTP2Sampler.profile">browser-like</stringProp>
+          <boolProp name="HTTP2Sampler.enableHttp3">true</boolProp>
+          <boolProp name="HTTP2Sampler.enableHttp2">true</boolProp>
+          <boolProp name="HTTP2Sampler.enableHttp1">true</boolProp>
+          <boolProp name="HTTP2Sampler.alpnEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.fallbackEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.protocolErrorFallbackEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.altSvcCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.http1OnlyCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.h2cCacheEnabled">true</boolProp>
+          <boolProp name="HTTP2Sampler.http2PriorKnowledge">false</boolProp>
+          <stringProp name="HTTP2Sampler.happyEyeballsDelayMs">250</stringProp>
+          <stringProp name="HTTP2Sampler.http3BrokenCooldownMs">300000</stringProp>
+          <stringProp name="HTTP2Sampler.http1OnlyCooldownMs">300000</stringProp>
+          <stringProp name="HTTP2Sampler.h2cCacheTtlMs">300000</stringProp>
+        </com.blazemeter.jmeter.http2.sampler.HTTP2Sampler>
         <hashTree/>
-        <ResultCollector guiclass="ViewResultsFullVisualizer" testclass="ResultCollector" testname="View Results Tree" enabled="true">
+        <ResultCollector guiclass="ViewResultsFullVisualizer" testclass="ResultCollector" testname="View Results Tree">
           <boolProp name="ResultCollector.error_logging">false</boolProp>
           <objProp>
             <name>saveConfig</name>
@@ -244,7 +314,7 @@
           <stringProp name="filename"></stringProp>
         </ResultCollector>
         <hashTree/>
-        <com.blazemeter.jmeter.http2.visualizers.ResultCollector guiclass="com.blazemeter.jmeter.http2.visualizers.ViewResultsFullVisualizer" testclass="com.blazemeter.jmeter.http2.visualizers.ResultCollector" testname="View Result Tree Http2" enabled="true">
+        <com.blazemeter.jmeter.http2.visualizers.ResultCollector guiclass="ViewResultsFullVisualizer" testclass="com.blazemeter.jmeter.http2.visualizers.ResultCollector" testname="View Result Tree Http2" enabled="true">
           <boolProp name="ResultCollector.error_logging">false</boolProp>
           <objProp>
             <name>saveConfig</name>

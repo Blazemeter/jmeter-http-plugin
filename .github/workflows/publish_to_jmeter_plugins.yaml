@@ -1,0 +1,25 @@
+name: Deploy to JMeter Plugins
+
+on:
+  workflow_dispatch:
+    inputs:
+      changes:
+        description: 'Release notes for the update'
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Publish JMeter Plugin Action
+        id: publish-plugin
+        uses: abstracta/jmeter-plugin-publish-action@main
+        with:
+          forked-repository: https://github.com/Abstracta/jmeter-plugins.git
+          plugin-artifact-name: jmeter-bzm-http2
+          plugin-id: bzm-http2
+          changes: ${{ inputs.changes }}
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Pull Request URL
+        run: echo ${{ steps.publish-plugin.outputs.pull_request }}

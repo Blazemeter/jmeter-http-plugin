@@ -6,6 +6,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.when;
 
+import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
 import java.util.concurrent.TimeoutException;
 import org.apache.jmeter.samplers.SampleResult;
@@ -19,18 +20,13 @@ import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
 
 @RunWith(MockitoJUnitRunner.class)
-public class HTTP2SamplerTest {
+public class HTTP2SamplerTest extends HTTP2TestBase {
 
   @Rule
   public final JUnitSoftAssertions softly = new JUnitSoftAssertions();
   @Mock
   private HTTP2JettyClient client;
   private HTTP2Sampler sampler;
-
-  @BeforeClass
-  public static void setupClass() {
-    JMeterTestUtils.setupJmeterEnv();
-  }
 
   @Before
   public void setup() {

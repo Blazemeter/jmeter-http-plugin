@@ -1,5 +1,6 @@
 package com.blazemeter.jmeter.http2.sampler;
 
+import java.util.Locale;
 import kg.apc.emulators.TestJMeterUtils;
 import org.apache.jmeter.util.JMeterUtils;
 
@@ -14,6 +15,8 @@ public class JMeterTestUtils {
     if (!jeerEnvironmentInitialized) {
       jeerEnvironmentInitialized = true;
       TestJMeterUtils.createJmeterEnv();
+      // Use a real locale to avoid ignoreresources warnings in test logs.
+      JMeterUtils.setLocale(Locale.ENGLISH);
       JMeterUtils.setProperty("HTTPResponse.parsers", "htmlParser wmlParser cssParser");
       JMeterUtils.setProperty("htmlParser.className",
           "org.apache.jmeter.protocol.http.parser.LagartoBasedHtmlParser");

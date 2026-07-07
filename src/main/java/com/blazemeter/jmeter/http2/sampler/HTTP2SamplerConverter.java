@@ -102,8 +102,13 @@ public class HTTP2SamplerConverter extends TestElementConverter {
     testElementReturn.setProperty(HTTPSamplerBase.POST_BODY_RAW,
         testElement.getPropertyAsBoolean(HTTP2Request.POST_BODY_RAW, false),
         HTTPSamplerBase.POST_BODY_RAW_DEFAULT);
-    testElementReturn.setProperty(new TestElementProperty(HTTPSamplerBase.ARGUMENTS,
-        (Arguments) testElement.getProperty(HTTP2Request.ARGUMENTS).getObjectValue()));
+    Arguments arguments =
+        (Arguments) testElement.getProperty(HTTP2Request.ARGUMENTS).getObjectValue();
+    if (arguments == null) {
+      arguments = new Arguments();
+    }
+    testElementReturn.setProperty(
+        new TestElementProperty(HTTPSamplerBase.ARGUMENTS, arguments));
     testElementReturn.setProperty(HTTPSamplerBase.DOMAIN,
         testElement.getPropertyAsString(HTTP2Request.DOMAIN, ""));
     testElementReturn
