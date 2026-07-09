@@ -286,11 +286,11 @@ public final class CustomWwwAuthenticationProtocolHandler implements ProtocolHan
         } else {
           newRequest.send(listener);
         }
-      } catch (Throwable x) {
+      } catch (Throwable ex) {
         if (LOG.isDebugEnabled()) {
-          LOG.atDebug().setCause(x).log("Authentication failed");
+          LOG.atDebug().setCause(ex).log("Authentication failed");
         }
-        forwardFailureComplete(request, null, response, x);
+        forwardFailureComplete(request, null, response, ex);
       }
     }
 
