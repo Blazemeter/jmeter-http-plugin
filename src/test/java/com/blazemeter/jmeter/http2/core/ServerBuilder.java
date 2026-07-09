@@ -81,6 +81,11 @@ public class ServerBuilder {
   public static final String SERVER_PATH_200_FILE_SENT = "/test/file";
   public static final String SERVER_PATH_BIG_RESPONSE = "/test/big-response";
   public static final String SERVER_PATH_400 = "/test/400";
+  /**
+   * 401 without {@code WWW-Authenticate}: common for app-level auth (JWT, API key, etc.), not an
+   * HTTP Auth challenge. Used to assert Jetty does not fail the exchange (JMeter HttpClient4 parity).
+   */
+  public static final String SERVER_PATH_401_NO_WWW_AUTHENTICATE = "/test/401-no-www-authenticate";
   public static final String SERVER_PATH_302 = "/test/302";
   public static final String SERVER_PATH_200_WITH_BODY = "/test/body";
   public static final String SERVER_PATH_JSON_ONLY = "/test/json-only";
@@ -305,6 +310,12 @@ public class ServerBuilder {
             break;
           case SERVER_PATH_400:
             resp.setStatus(HttpStatus.BAD_REQUEST_400);
+            break;
+          case SERVER_PATH_401_NO_WWW_AUTHENTICATE:
+            // App-level unauthorized: no WWW-Authenticate (not an HTTP Auth challenge).
+            resp.setStatus(HttpStatus.UNAUTHORIZED_401);
+            resp.setContentType("text/plain; charset=utf-8");
+            resp.getWriter().write("Unauthorized");
             break;
           case SERVER_PATH_302:
             resp.addHeader(HTTPConstants.HEADER_LOCATION,

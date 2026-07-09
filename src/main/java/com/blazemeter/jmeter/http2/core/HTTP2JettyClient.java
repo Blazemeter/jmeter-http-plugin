@@ -2,6 +2,7 @@ package com.blazemeter.jmeter.http2.core;
 
 import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
 
+import com.blazemeter.jmeter.http2.core.jetty.CustomWwwAuthenticationProtocolHandler;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http2.CustomClientConnectionFactoryOverHTTP2;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http3.CustomClientConnectionFactoryOverHTTP3;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
@@ -1049,6 +1050,7 @@ public class HTTP2JettyClient {
       lowLevelDebug("Starting HttpClient: name={}, http1UpgradeRequired={}",
           httpClient.getName(), http1UpgradeRequired);
       httpClient.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClient);
       lowLevelDebug("HttpClient started successfully");
     } else {
       lowLevelDebug("HttpClient already started");
@@ -1056,22 +1058,26 @@ public class HTTP2JettyClient {
     if (httpClientNoH3 != httpClient && !httpClientNoH3.isStarted()) {
       lowLevelDebug("Starting HttpClient (no HTTP/3): name={}", httpClientNoH3.getName());
       httpClientNoH3.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientNoH3);
       lowLevelDebug("HttpClient (no HTTP/3) started successfully");
     }
     if (!httpClientHttp1Only.isStarted()) {
       lowLevelDebug("Starting HttpClient (HTTP/1.1 only): name={}", httpClientHttp1Only.getName());
       httpClientHttp1Only.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientHttp1Only);
       lowLevelDebug("HttpClient (HTTP/1.1 only) started successfully");
     }
     if (!httpClientH2cPrior.isStarted()) {
       lowLevelDebug("Starting HttpClient (H2C prior knowledge): name={}",
           httpClientH2cPrior.getName());
       httpClientH2cPrior.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientH2cPrior);
       lowLevelDebug("HttpClient (H2C prior knowledge) started successfully");
     }
     if (!httpClientH2cUpgrade.isStarted()) {
       lowLevelDebug("Starting HttpClient (H2C upgrade): name={}", httpClientH2cUpgrade.getName());
       httpClientH2cUpgrade.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientH2cUpgrade);
       lowLevelDebug("HttpClient (H2C upgrade) started successfully");
     }
   }
@@ -1107,6 +1113,7 @@ public class HTTP2JettyClient {
     // Start the client
     if (!http11Client.isStarted()) {
       http11Client.start();
+      CustomWwwAuthenticationProtocolHandler.install(http11Client);
       lowLevelDebug("HTTP/1.1-only fallback client started");
     }
 
