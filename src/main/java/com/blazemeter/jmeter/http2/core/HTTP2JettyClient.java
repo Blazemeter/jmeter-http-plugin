@@ -3273,6 +3273,15 @@ public class HTTP2JettyClient {
 
   private void setBody(Request request, HTTP2Sampler sampler, HTTPSampleResult result)
       throws IOException {
+    String effectiveMethod = result.getHTTPMethod();
+    if (!effectiveMethod.equals(sampler.getMethod()) && !isMethodWithBody(effectiveMethod)) {
+      // The method being sent only differs from the sampler's configured one when JMeter core
+      // rewrites it while following a redirect (e.g. POST -> GET after a 301/302/303). The
+      // entity belongs to the original request, so the method-rewritten follow-up must not
+      // re-send it (RFC 9110 section 15.4), matching HTTPSamplerProxy behavior.
+      result.setQueryString("");
+      return;
+    }
     String contentEncoding = sampler.getContentEncoding();
     String contentTypeHeader =
         request.getHeaders() != null ? request.getHeaders().get(HTTPConstants.HEADER_CONTENT_TYPE)
@@ -3368,7 +3377,7 @@ public class HTTP2JettyClient {
               new StringRequestContent(contentTypeHeader, postBody.toString(),
                   contentCharset);
           request.body(requestContent);
-        } else if (isMethodWithBody(sampler.getMethod())) {
+        } else if (isMethodWithBody(effectiveMethod)) {
           Fields fields = new Fields();
           for (JMeterProperty p : sampler.getArguments()) {
             HTTPArgument arg = (HTTPArgument) p.getObjectValue();

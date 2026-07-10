@@ -82,6 +82,7 @@ public class ServerBuilder {
   public static final String SERVER_PATH_BIG_RESPONSE = "/test/big-response";
   public static final String SERVER_PATH_400 = "/test/400";
   public static final String SERVER_PATH_302 = "/test/302";
+  public static final String SERVER_PATH_302_TO_ECHO = "/test/302-to-echo";
   public static final String SERVER_PATH_200_WITH_BODY = "/test/body";
   public static final String SERVER_PATH_JSON_ONLY = "/test/json-only";
   public static final String SERVER_PATH_DELETE_DATA = "/test/delete";
@@ -292,6 +293,11 @@ public class ServerBuilder {
           case SERVER_PATH_302:
             resp.addHeader(HTTPConstants.HEADER_LOCATION,
                 "https://localhost:" + req.getLocalPort() + SERVER_PATH_200);
+            resp.setStatus(HttpStatus.FOUND_302);
+            break;
+          case SERVER_PATH_302_TO_ECHO:
+            resp.addHeader(HTTPConstants.HEADER_LOCATION,
+                "https://localhost:" + req.getLocalPort() + SERVER_PATH_200_WITH_BODY);
             resp.setStatus(HttpStatus.FOUND_302);
             break;
           case SERVER_PATH_200_WITH_BODY:

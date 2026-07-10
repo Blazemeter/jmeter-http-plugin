@@ -19,6 +19,7 @@ import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_BRO
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_ZSTD;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_WITH_BODY;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_302;
+import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_302_TO_ECHO;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_400;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_BIG_RESPONSE;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_DEFLATE;
@@ -844,6 +845,27 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     validateResponse(result, expected);
     softly.assertThat(result.getSubResults().length).isGreaterThan(0);
     softly.assertThat(result.getRedirectLocation()).isEqualTo(expected.getRedirectLocation());
+  }
+
+  @Test
+  public void shouldNotResendRequestBodyWhenPostRedirectIsFollowedAsGet() throws Exception {
+    buildStartedServer();
+    sampler.setFollowRedirects(true);
+    sampler.setMethod(HTTPConstants.POST);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+    HTTPSampleResult result = sample(SERVER_PATH_302_TO_ECHO, HTTPConstants.POST);
+
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    SampleResult[] subResults = result.getSubResults();
+    softly.assertThat(subResults.length).isGreaterThan(0);
+    HTTPSampleResult followUp = (HTTPSampleResult) subResults[subResults.length - 1];
+    softly.assertThat(followUp.getHTTPMethod()).isEqualTo(HTTPConstants.GET);
+    // The redirect target echoes back any request body it receives. JMeter core rewrites
+    // POST to GET when following a 302, so the follow-up request must not carry the
+    // original POST entity (RFC 9110 section 15.4; matches HTTPSamplerProxy behavior).
+    softly.assertThat(followUp.getResponseDataAsString()).isEmpty();
   }
 
   @Test
