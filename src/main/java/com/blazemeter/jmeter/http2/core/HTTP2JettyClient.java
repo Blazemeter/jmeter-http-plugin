@@ -133,8 +133,8 @@ public class HTTP2JettyClient {
       "HTTP2JettyClient build: host-header-filter+http3-always-v2026-01-26";
   private static final boolean FORCE_HTTP2_ONLY = false;
   private static final Set<String> SUPPORTED_METHODS = new HashSet<>(Arrays
-      .asList(HTTPConstants.GET, HTTPConstants.POST, HTTPConstants.PUT, HTTPConstants.PATCH,
-          HTTPConstants.OPTIONS, HTTPConstants.DELETE));
+      .asList(HTTPConstants.GET, HTTPConstants.HEAD, HTTPConstants.POST, HTTPConstants.PUT,
+          HTTPConstants.PATCH, HTTPConstants.OPTIONS, HTTPConstants.DELETE));
   private static final Set<String> METHODS_WITH_BODY = new HashSet<>(Arrays
       .asList(HTTPConstants.POST, HTTPConstants.PUT, HTTPConstants.PATCH));
   private static final Path ALPN_DEBUG_LOG_PATH = resolveAlpnLogPath();
