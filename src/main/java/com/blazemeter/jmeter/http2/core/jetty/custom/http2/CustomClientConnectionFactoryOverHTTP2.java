@@ -10,7 +10,6 @@ import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.transport.HttpClientConnectionFactory;
 import org.eclipse.jetty.client.transport.HttpDestination;
 import org.eclipse.jetty.http2.client.HTTP2Client;
-import org.eclipse.jetty.http2.client.HTTP2ClientConnectionFactory;
 import org.eclipse.jetty.http2.client.transport.internal.HttpConnectionOverHTTP2;
 import org.eclipse.jetty.io.ClientConnectionFactory;
 import org.eclipse.jetty.io.EndPoint;
@@ -22,7 +21,7 @@ import org.eclipse.jetty.util.component.ContainerLifeCycle;
  */
 public class CustomClientConnectionFactoryOverHTTP2 extends ContainerLifeCycle
     implements ClientConnectionFactory, HttpClient.Aware {
-  private final ClientConnectionFactory factory = new HTTP2ClientConnectionFactory();
+  private final ClientConnectionFactory factory = new CustomHTTP2ClientConnectionFactory();
   private final HTTP2Client http2Client;
 
   public CustomClientConnectionFactoryOverHTTP2(HTTP2Client http2Client) {
