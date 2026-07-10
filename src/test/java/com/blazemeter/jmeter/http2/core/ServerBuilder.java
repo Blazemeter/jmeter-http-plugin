@@ -298,7 +298,10 @@ public class ServerBuilder {
           case SERVER_PATH_200:
             resp.setStatus(HttpStatus.OK_200);
             resp.setContentType(MimeTypes.MIME_TEXT_HTML + ";" + StandardCharsets.UTF_8.name());
-            resp.getWriter().write(SERVER_RESPONSE);
+            // HEAD must not include a response body (RFC 9110).
+            if (!"HEAD".equalsIgnoreCase(req.getMethod())) {
+              resp.getWriter().write(SERVER_RESPONSE);
+            }
             break;
           case SERVER_PATH_SLOW:
             try {
