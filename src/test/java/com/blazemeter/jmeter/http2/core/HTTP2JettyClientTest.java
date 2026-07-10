@@ -20,6 +20,7 @@ import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_ZST
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_WITH_BODY;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_302;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_400;
+import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_401_NO_WWW_AUTHENTICATE;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_BIG_RESPONSE;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_DEFLATE;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_JSON_ONLY;
@@ -302,8 +303,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     hm.add(new Header(HttpHeader.ACCEPT_ENCODING.asString(), "br"));
     sampler.setHeaderManager(hm);
     HTTPSampleResult result = sampleWithGet(SERVER_PATH_200_BROTLI);
-    // Verify that the request was successful and content was decompressed
     assertThat(result.isSuccessful()).isTrue();
+    assertThat(result.getResponseHeaders()).containsIgnoringCase("content-encoding: br");
     assertThat(result.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
   }
 
@@ -315,8 +316,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     hm.add(new Header(HttpHeader.ACCEPT_ENCODING.asString(), "zstd"));
     sampler.setHeaderManager(hm);
     HTTPSampleResult result = sampleWithGet(SERVER_PATH_200_ZSTD);
-    // Verify that the request was successful and content was decompressed
     assertThat(result.isSuccessful()).isTrue();
+    assertThat(result.getResponseHeaders()).containsIgnoringCase("content-encoding: zstd");
     assertThat(result.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
   }
 
@@ -609,6 +610,33 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
         null,
       null, createURL(SERVER_PATH_400), HTTPConstants.GET);
     validateResponse(sampleWithGet(SERVER_PATH_400), expected);
+  }
+
+  /**
+   * 401 without {@code WWW-Authenticate} is valid when the server uses a non-HTTP-Auth mechanism
+   * (token, API key, etc.). Jetty's default would throw; {@code CustomWwwAuthenticationProtocolHandler}
+   * returns the 401 like JMeter HttpClient4.
+   */
+  @Test
+  public void shouldReturn401WhenServerOmitsWwwAuthenticateHeader() throws Exception {
+    buildStartedServer();
+    HTTPSampleResult result = sampleWithGet(SERVER_PATH_401_NO_WWW_AUTHENTICATE);
+    softly.assertThat(result.getResponseCode()).isEqualTo("401");
+    softly.assertThat(result.isSuccessful()).isFalse();
+    softly.assertThat(result.getResponseDataAsString()).contains("Unauthorized");
+  }
+
+  /**
+   * Same as {@link #shouldReturn401WhenServerOmitsWwwAuthenticateHeader()} with Auth Manager
+   * configured: without a challenge header there is nothing to match, so the 401 is returned.
+   */
+  @Test
+  public void shouldReturn401WithoutWwwAuthenticateEvenWhenAuthManagerConfigured() throws Exception {
+    buildStartedServer();
+    configureAuthManager(Mechanism.BASIC);
+    HTTPSampleResult result = sampleWithGet(SERVER_PATH_401_NO_WWW_AUTHENTICATE);
+    softly.assertThat(result.getResponseCode()).isEqualTo("401");
+    softly.assertThat(result.isSuccessful()).isFalse();
   }
 
   @Test(expected = UnsupportedOperationException.class)

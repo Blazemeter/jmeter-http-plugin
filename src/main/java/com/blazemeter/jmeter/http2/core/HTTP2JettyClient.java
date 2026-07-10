@@ -2,6 +2,7 @@ package com.blazemeter.jmeter.http2.core;
 
 import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
 
+import com.blazemeter.jmeter.http2.core.jetty.CustomWwwAuthenticationProtocolHandler;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http1.CustomHttpClientConnectionFactory;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http2.CustomClientConnectionFactoryOverHTTP2;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http3.CustomClientConnectionFactoryOverHTTP3;
@@ -278,6 +279,11 @@ public class HTTP2JettyClient {
     ClientConnectionFactory.Info http11 = CustomHttpClientConnectionFactory.CUSTOM_HTTP11;
 
     HTTP2Client http2Client = new HTTP2Client(clientConnector);
+    // HTTP2Client defaults to 8 KiB; HttpClient defaults to -1 (no local HPACK cap). Match
+    // HttpClient here so parsers are not created with 8192. On start(), Jetty configure()
+    // re-syncs from HttpClient.getMaxResponseHeadersSize(), so this stays dynamic if callers
+    // change HttpClient before start().
+    http2Client.setMaxResponseHeadersSize(-1);
     enableFrameLoggingIfConfigured(http2Client);
 
     // Add session listener to log SETTINGS frames received from server (for debugging Issue #12071)
@@ -512,6 +518,7 @@ public class HTTP2JettyClient {
 
     ClientConnector h2cUpgradeConnector = createClientConnector(name + "-h2c-upgrade");
     HTTP2Client http2cUpgradeClient = new HTTP2Client(h2cUpgradeConnector);
+    http2cUpgradeClient.setMaxResponseHeadersSize(-1);
     http2cUpgradeClient.setUseALPN(false);
     if (disableServerPush) {
       http2cUpgradeClient.setMaxConcurrentPushedStreams(0);
@@ -530,6 +537,7 @@ public class HTTP2JettyClient {
 
     ClientConnector h2cConnector = createClientConnector(name + "-h2c");
     HTTP2Client http2cClient = new HTTP2Client(h2cConnector);
+    http2cClient.setMaxResponseHeadersSize(-1);
     http2cClient.setUseALPN(false);
     if (disableServerPush) {
       http2cClient.setMaxConcurrentPushedStreams(0);
@@ -1048,6 +1056,7 @@ public class HTTP2JettyClient {
       lowLevelDebug("Starting HttpClient: name={}, http1UpgradeRequired={}",
           httpClient.getName(), http1UpgradeRequired);
       httpClient.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClient);
       lowLevelDebug("HttpClient started successfully");
     } else {
       lowLevelDebug("HttpClient already started");
@@ -1055,22 +1064,26 @@ public class HTTP2JettyClient {
     if (httpClientNoH3 != httpClient && !httpClientNoH3.isStarted()) {
       lowLevelDebug("Starting HttpClient (no HTTP/3): name={}", httpClientNoH3.getName());
       httpClientNoH3.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientNoH3);
       lowLevelDebug("HttpClient (no HTTP/3) started successfully");
     }
     if (!httpClientHttp1Only.isStarted()) {
       lowLevelDebug("Starting HttpClient (HTTP/1.1 only): name={}", httpClientHttp1Only.getName());
       httpClientHttp1Only.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientHttp1Only);
       lowLevelDebug("HttpClient (HTTP/1.1 only) started successfully");
     }
     if (!httpClientH2cPrior.isStarted()) {
       lowLevelDebug("Starting HttpClient (H2C prior knowledge): name={}",
           httpClientH2cPrior.getName());
       httpClientH2cPrior.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientH2cPrior);
       lowLevelDebug("HttpClient (H2C prior knowledge) started successfully");
     }
     if (!httpClientH2cUpgrade.isStarted()) {
       lowLevelDebug("Starting HttpClient (H2C upgrade): name={}", httpClientH2cUpgrade.getName());
       httpClientH2cUpgrade.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientH2cUpgrade);
       lowLevelDebug("HttpClient (H2C upgrade) started successfully");
     }
   }
@@ -1106,6 +1119,7 @@ public class HTTP2JettyClient {
     // Start the client
     if (!http11Client.isStarted()) {
       http11Client.start();
+      CustomWwwAuthenticationProtocolHandler.install(http11Client);
       lowLevelDebug("HTTP/1.1-only fallback client started");
     }
 
@@ -1607,7 +1621,9 @@ public class HTTP2JettyClient {
       LOG.error("isProtocolError(cause): {}", isProtocolErrorCause);
       LOG.error("isProtocolError(exception): {}", isProtocolErrorException);
 
-      if ((isProtocolErrorCause || isProtocolErrorException) && protocolErrorFallbackEnabled) {
+      if ((isProtocolErrorCause || isProtocolErrorException) && protocolErrorFallbackEnabled
+          && !HpackFailureDetector.indicatesHpackFailure(e)
+          && !HpackFailureDetector.indicatesHpackFailure(cause)) {
         LOG.warn("HTTP/2 protocol_error detected in sampleFromListener()! "
             + "Attempting fallback to HTTP/1.1");
         LOG.warn("Error: {}", cause != null ? cause.getMessage() : e.getMessage());
@@ -3795,7 +3811,8 @@ public class HTTP2JettyClient {
     if (!refresh && cached instanceof String) {
       return (String) cached;
     }
-    String serialized = buildHeadersString(request.getHeaders());
+    String serialized = buildHeadersString(
+        JmeterRequestHeadersSupport.headersForSampleResult(request));
     request.attribute(ATTR_REQUEST_HEADERS_SERIALIZED, serialized);
     return serialized;
   }
