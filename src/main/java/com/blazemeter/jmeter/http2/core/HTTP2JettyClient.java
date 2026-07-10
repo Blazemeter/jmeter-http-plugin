@@ -3,7 +3,6 @@ package com.blazemeter.jmeter.http2.core;
 import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
 
 import com.blazemeter.jmeter.http2.core.jetty.CustomWwwAuthenticationProtocolHandler;
-import com.blazemeter.jmeter.http2.core.jetty.custom.http1.CustomHttpClientConnectionFactory;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http2.CustomClientConnectionFactoryOverHTTP2;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http3.CustomClientConnectionFactoryOverHTTP3;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
@@ -89,6 +88,7 @@ import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.client.Response;
 import org.eclipse.jetty.client.RetryableRequestException;
 import org.eclipse.jetty.client.StringRequestContent;
+import org.eclipse.jetty.client.transport.HttpClientConnectionFactory;
 import org.eclipse.jetty.client.transport.HttpClientTransportDynamic;
 import org.eclipse.jetty.compression.brotli.BrotliCompression;
 import org.eclipse.jetty.compression.client.CompressionContentDecoderFactory;
@@ -276,7 +276,7 @@ public class HTTP2JettyClient {
       lowLevelDebug("Could not set SSL protocol explicitly", e);
     }
 
-    ClientConnectionFactory.Info http11 = CustomHttpClientConnectionFactory.CUSTOM_HTTP11;
+    ClientConnectionFactory.Info http11 = HttpClientConnectionFactory.HTTP11;
 
     HTTP2Client http2Client = new HTTP2Client(clientConnector);
     // HTTP2Client defaults to 8 KiB; HttpClient defaults to -1 (no local HPACK cap). Match
@@ -1101,7 +1101,7 @@ public class HTTP2JettyClient {
     ClientConnector clientConnector = createClientConnector(name + "-http11-fallback");
 
     // Create transport with ONLY HTTP/1.1 (no HTTP/2)
-    ClientConnectionFactory.Info http11 = CustomHttpClientConnectionFactory.CUSTOM_HTTP11;
+    ClientConnectionFactory.Info http11 = HttpClientConnectionFactory.HTTP11;
     HttpClientTransport transport = new HttpClientTransportDynamic(clientConnector, http11);
     lowLevelDebug("HttpClientTransportDynamic configured with HTTP/1.1 only (fallback mode)");
 
@@ -1144,15 +1144,14 @@ public class HTTP2JettyClient {
         .method(result.getHTTPMethod())
         .timeout(requestTimeout, TimeUnit.MILLISECONDS)
         .followRedirects(sampler.getAutoRedirects());
-    http11Request.attribute(JmeterHttpClientAttributes.USE_KEEPALIVE, sampler.getUseKeepAlive());
     if (sampler.getHeaderManager() != null) {
       setHeaders(http11Request, url, sampler.getHeaderManager());
     }
     ensureHostHeader(http11Request, url);
     ensureEmptyUserAgentHeader(http11Request);
-    reapplyConnectionKeepAliveHeader(http11Request);
     configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
     setBody(http11Request, sampler, result, false);
+    JmeterRequestHeadersSupport.prepareFromSampler(http11Request, sampler.getUseKeepAlive());
 
     lowLevelDebug("Sending HTTP/1.1 fallback request");
     ContentResponse response = http11Request.send();
@@ -1205,11 +1204,7 @@ public class HTTP2JettyClient {
         .method(originalRequest.getMethod())
         .timeout(requestTimeout, TimeUnit.MILLISECONDS)
         .followRedirects(originalRequest.isFollowRedirects());
-    Object useKeepAlive =
-        originalRequest.getAttributes().get(JmeterHttpClientAttributes.USE_KEEPALIVE);
-    if (useKeepAlive != null) {
-      http11Request.attribute(JmeterHttpClientAttributes.USE_KEEPALIVE, useKeepAlive);
-    }
+    JmeterRequestHeadersSupport.copySamplerHeaderState(originalRequest, http11Request);
     http11Request.attribute(JmeterHttpClientAttributes.H2C_FALLBACK_ATTEMPTED, Boolean.TRUE);
     if (originalRequest.getHeaders() != null) {
       HttpFields originalHeaders = originalRequest.getHeaders();
@@ -1227,7 +1222,11 @@ public class HTTP2JettyClient {
     }
     ensureHostHeader(http11Request, uri);
     ensureEmptyUserAgentHeader(http11Request);
-    reapplyConnectionKeepAliveHeader(http11Request);
+    Object useKeepAlive =
+        http11Request.getAttributes().get(JmeterHttpClientAttributes.USE_KEEPALIVE);
+    if (useKeepAlive instanceof Boolean) {
+      JmeterRequestHeadersSupport.prepareFromSampler(http11Request, (Boolean) useKeepAlive);
+    }
     configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
     if (originalRequest.getBody() != null) {
       http11Request.body(originalRequest.getBody());
@@ -1433,8 +1432,7 @@ public class HTTP2JettyClient {
     result.sampleStart();
 
     setBody(request, sampler, result, areFollowingRedirect);
-    setConnectionHeader(request, sampler, url);
-    reapplyConnectionKeepAliveHeader(request);
+    JmeterRequestHeadersSupport.prepareFromSampler(request, sampler.getUseKeepAlive());
     initializeSentBytes(result, request);
 
   }
@@ -1464,6 +1462,10 @@ public class HTTP2JettyClient {
         ? contentResponse.getRequest()
         : request;
     result.setRequestHeaders(getSerializedRequestHeaders(effectiveRequest, true));
+    long headerBytes = estimateRequestHeaderBytes(effectiveRequest);
+    if (headerBytes > result.getSentBytes()) {
+      result.setSentBytes(headerBytes);
+    }
     setResultContentResponse(result, contentResponse);
     saveCookiesInCookieManager(contentResponse, request.getURI().toURL(),
         sampler.getCookieManager());
@@ -1486,6 +1488,7 @@ public class HTTP2JettyClient {
     lowLevelDebug("Request built: URI={}, method={}", request.getURI(), request.getMethod());
     samplePrepareRequest(request, sampler, result, context.client);
     listener.setRequest(request);
+    listener.setFallbackHttp1Client(httpClientHttp1Only);
     lowLevelDebug("Request prepared, ready to send");
     return request;
 
@@ -1527,6 +1530,7 @@ public class HTTP2JettyClient {
     HTTP2FutureResponseListener listener = new HTTP2FutureResponseListener(maxBufferSize);
     lowLevelDebug("=== HTTP2FutureResponseListener created successfully ===");
     listener.setRequest(request);
+    listener.setFallbackHttp1Client(httpClientHttp1Only);
     lowLevelDebug("=== About to call send() ===");
     ContentResponse contentResponse;
     try {
@@ -1677,7 +1681,6 @@ public class HTTP2JettyClient {
     if (shouldUseHappyEyeballs(request)) {
       return sendWithHappyEyeballs(request, listener);
     }
-    reapplyConnectionKeepAliveHeader(request);
     request.send(listener);
     lowLevelDebug("Request sent, waiting for response...");
     try {
@@ -3235,55 +3238,6 @@ public class HTTP2JettyClient {
     }
   }
 
-  /**
-   * Matches {@code HTTPHC4Impl#setupRequest}: explicit {@code Connection} header for HTTP/1.1.
-   */
-  private void setConnectionHeader(Request request, HTTP2Sampler sampler, URL url) {
-    request.attribute(JmeterHttpClientAttributes.USE_KEEPALIVE, sampler.getUseKeepAlive());
-    if (!shouldSendConnectionHeader(request, url)) {
-      return;
-    }
-    HttpFields headers = request.getHeaders();
-    if (!(headers instanceof HttpFields.Mutable)) {
-      return;
-    }
-    HttpFields.Mutable mutableHeaders = (HttpFields.Mutable) headers;
-    if (mutableHeaders.contains(HttpHeader.CONNECTION)) {
-      return;
-    }
-    if (sampler.getUseKeepAlive()) {
-      mutableHeaders.put(HTTPConstants.HEADER_CONNECTION, HTTPConstants.KEEP_ALIVE);
-    } else {
-      mutableHeaders.put(HTTPConstants.HEADER_CONNECTION, HTTPConstants.CONNECTION_CLOSE);
-    }
-  }
-
-  private void reapplyConnectionKeepAliveHeader(Request request) {
-    Object useKeepAlive = request.getAttributes().get(JmeterHttpClientAttributes.USE_KEEPALIVE);
-    if (!Boolean.TRUE.equals(useKeepAlive)) {
-      return;
-    }
-    try {
-      if (!shouldSendConnectionHeader(request, request.getURI().toURL())) {
-        return;
-      }
-    } catch (MalformedURLException e) {
-      return;
-    }
-    HttpFields headers = request.getHeaders();
-    if (headers instanceof HttpFields.Mutable) {
-      ((HttpFields.Mutable) headers).put(HTTPConstants.HEADER_CONNECTION, HTTPConstants.KEEP_ALIVE);
-    }
-  }
-
-  private boolean shouldSendConnectionHeader(Request request, URL url) {
-    if (request != null && request.getVersion() == HttpVersion.HTTP_2) {
-      return false;
-    }
-    HttpFields headers = request.getHeaders();
-    return headers == null || !headers.contains(HttpHeader.CONNECTION);
-  }
-
   private void ensureHostHeader(Request request, URL url) {
     if (request == null || url == null) {
       return;
@@ -4036,7 +3990,8 @@ public class HTTP2JettyClient {
     }
 
     result.setResponseCode(String.valueOf(contentResponse.getStatus()));
-    String responseMessage = resolveJmeterResponseMessage(contentResponse);
+    String responseMessage = contentResponse.getReason() != null ? contentResponse.getReason()
+        : HttpStatus.getMessage(contentResponse.getStatus());
     result.setResponseMessage(responseMessage);
     result.setSuccessful(
         contentResponse.getStatus() >= 200 && contentResponse.getStatus() <= 399);
@@ -4064,15 +4019,6 @@ public class HTTP2JettyClient {
     HttpFields headers = JmeterCompressionHeadersSupport.headersForSampleResult(contentResponse);
     return contentResponse.getVersion() + " " + contentResponse.getStatus() + " " + message + "\n"
         + buildHeadersString(headers);
-  }
-
-  private String resolveJmeterResponseMessage(ContentResponse contentResponse) {
-    int status = contentResponse.getStatus();
-    String reason = contentResponse.getReason();
-    if (reason != null && !reason.isEmpty()) {
-      return reason;
-    }
-    return HttpStatus.getMessage(status);
   }
 
   private String extractRedirectLocation(ContentResponse contentResponse) {

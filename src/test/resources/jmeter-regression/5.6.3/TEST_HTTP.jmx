@@ -78,7 +78,6 @@ mirrorServer.start();</stringProp>
           <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="1492901334">GET /test HTTP/1.1</stringProp>
-              <stringProp name="894172713">Connection: keep-alive</stringProp>
               <stringProp name="2117109222">Host: localhost:8081</stringProp>
               <stringProp name="1052466409">User-Agent: </stringProp>
             </collectionProp>
@@ -88,6 +87,16 @@ mirrorServer.start();</stringProp>
             <stringProp name="Assertion.custom_message"></stringProp>
           </ResponseAssertion>
           <hashTree/>
+<ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="RA_KeepAlive_SampleHeaders" enabled="true">
+  <collectionProp name="Asserion.test_strings">
+    <stringProp name="894172713">Connection: keep-alive</stringProp>
+  </collectionProp>
+  <stringProp name="Assertion.test_field">Assertion.request_headers</stringProp>
+  <boolProp name="Assertion.assume_success">false</boolProp>
+  <intProp name="Assertion.test_type">16</intProp>
+  <stringProp name="Assertion.custom_message"></stringProp>
+</ResponseAssertion>
+<hashTree/>
           <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="RA_NoContentLength" enabled="true">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="-88801152">Content-Length:</stringProp>
@@ -142,7 +151,6 @@ mirrorServer.start();</stringProp>
           <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="70454">GET</stringProp>
-              <stringProp name="894172713">Connection: keep-alive</stringProp>
               <stringProp name="2117109222">Host: localhost:8081</stringProp>
               <stringProp name="1052466409">User-Agent: </stringProp>
               <stringProp name="827169597">/test?name=value</stringProp>
@@ -153,6 +161,16 @@ mirrorServer.start();</stringProp>
             <stringProp name="Assertion.custom_message"></stringProp>
           </ResponseAssertion>
           <hashTree/>
+<ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="RA_KeepAlive_SampleHeaders" enabled="true">
+  <collectionProp name="Asserion.test_strings">
+    <stringProp name="894172713">Connection: keep-alive</stringProp>
+  </collectionProp>
+  <stringProp name="Assertion.test_field">Assertion.request_headers</stringProp>
+  <boolProp name="Assertion.assume_success">false</boolProp>
+  <intProp name="Assertion.test_type">16</intProp>
+  <stringProp name="Assertion.custom_message"></stringProp>
+</ResponseAssertion>
+<hashTree/>
         </hashTree>
         <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET_WITH_PARAMETERS" enabled="true">
           <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
@@ -195,7 +213,6 @@ mirrorServer.start();</stringProp>
           <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="70454">GET</stringProp>
-              <stringProp name="894172713">Connection: keep-alive</stringProp>
               <stringProp name="2117109222">Host: localhost:8081</stringProp>
               <stringProp name="1052466409">User-Agent: </stringProp>
               <stringProp name="-1326526456">/test?name0=value0&amp;name1=value1</stringProp>
@@ -206,6 +223,16 @@ mirrorServer.start();</stringProp>
             <stringProp name="Assertion.custom_message"></stringProp>
           </ResponseAssertion>
           <hashTree/>
+<ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="RA_KeepAlive_SampleHeaders" enabled="true">
+  <collectionProp name="Asserion.test_strings">
+    <stringProp name="894172713">Connection: keep-alive</stringProp>
+  </collectionProp>
+  <stringProp name="Assertion.test_field">Assertion.request_headers</stringProp>
+  <boolProp name="Assertion.assume_success">false</boolProp>
+  <intProp name="Assertion.test_type">16</intProp>
+  <stringProp name="Assertion.custom_message"></stringProp>
+</ResponseAssertion>
+<hashTree/>
         </hashTree>
         <IfController guiclass="IfControllerPanel" testclass="IfController" testname="If_not_java_impl" enabled="true">
           <stringProp name="IfController.condition">${__jexl3(&quot;${__P(jmeter.httpsampler,)}&quot; != &quot;Java&quot;,)}</stringProp>
@@ -254,7 +281,6 @@ mirrorServer.start();</stringProp>
             <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
               <collectionProp name="Asserion.test_strings">
                 <stringProp name="1492901334">GET /test HTTP/1.1</stringProp>
-                <stringProp name="894172713">Connection: keep-alive</stringProp>
                 <stringProp name="2117109222">Host: localhost:8081</stringProp>
                 <stringProp name="1052466409">User-Agent: </stringProp>
                 <stringProp name="1663251538">Get with body</stringProp>
@@ -265,6 +291,16 @@ mirrorServer.start();</stringProp>
               <stringProp name="Assertion.custom_message"></stringProp>
             </ResponseAssertion>
             <hashTree/>
+<ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="RA_KeepAlive_SampleHeaders" enabled="true">
+  <collectionProp name="Asserion.test_strings">
+    <stringProp name="894172713">Connection: keep-alive</stringProp>
+  </collectionProp>
+  <stringProp name="Assertion.test_field">Assertion.request_headers</stringProp>
+  <boolProp name="Assertion.assume_success">false</boolProp>
+  <intProp name="Assertion.test_type">16</intProp>
+  <stringProp name="Assertion.custom_message"></stringProp>
+</ResponseAssertion>
+<hashTree/>
           </hashTree>
         </hashTree>
         <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP Request Defaults" enabled="true">
@@ -774,7 +810,6 @@ mirrorServer.start();</stringProp>
           <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="-530323176">POST /test?name0=value0 HTTP/1.1</stringProp>
-              <stringProp name="894172713">Connection: keep-alive</stringProp>
               <stringProp name="-1680100360">Accept-Encoding: gzip</stringProp>
               <stringProp name="224767425">Content-Length: 12</stringProp>
               <stringProp name="2117109222">Host: localhost:8081</stringProp>
@@ -786,6 +821,16 @@ mirrorServer.start();</stringProp>
             <stringProp name="Assertion.custom_message"></stringProp>
           </ResponseAssertion>
           <hashTree/>
+<ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="RA_KeepAlive_SampleHeaders" enabled="true">
+  <collectionProp name="Asserion.test_strings">
+    <stringProp name="894172713">Connection: keep-alive</stringProp>
+  </collectionProp>
+  <stringProp name="Assertion.test_field">Assertion.request_headers</stringProp>
+  <boolProp name="Assertion.assume_success">false</boolProp>
+  <intProp name="Assertion.test_type">16</intProp>
+  <stringProp name="Assertion.custom_message"></stringProp>
+</ResponseAssertion>
+<hashTree/>
         </hashTree>
         <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="HR-POST_WITH_PARAMETERS_MULTIPART" enabled="true">
           <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
@@ -835,7 +880,6 @@ mirrorServer.start();</stringProp>
           <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="-530323176">POST /test?name0=value0 HTTP/1.1</stringProp>
-              <stringProp name="894172713">Connection: keep-alive</stringProp>
               <stringProp name="-1680100360">Accept-Encoding: gzip</stringProp>
               <stringProp name="2117109222">Host: localhost:8081</stringProp>
               <stringProp name="1052466409">User-Agent: </stringProp>
@@ -853,6 +897,16 @@ mirrorServer.start();</stringProp>
             <stringProp name="Assertion.custom_message"></stringProp>
           </ResponseAssertion>
           <hashTree/>
+<ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="RA_KeepAlive_SampleHeaders" enabled="true">
+  <collectionProp name="Asserion.test_strings">
+    <stringProp name="894172713">Connection: keep-alive</stringProp>
+  </collectionProp>
+  <stringProp name="Assertion.test_field">Assertion.request_headers</stringProp>
+  <boolProp name="Assertion.assume_success">false</boolProp>
+  <intProp name="Assertion.test_type">16</intProp>
+  <stringProp name="Assertion.custom_message"></stringProp>
+</ResponseAssertion>
+<hashTree/>
         </hashTree>
         <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="HR-POST_WITH_PARAMETERS_MULTIPART_UTF-8" enabled="true">
           <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
@@ -910,7 +964,6 @@ mirrorServer.start();</stringProp>
           <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="-530323176">POST /test?name0=value0 HTTP/1.1</stringProp>
-              <stringProp name="894172713">Connection: keep-alive</stringProp>
               <stringProp name="-1680100360">Accept-Encoding: gzip</stringProp>
               <stringProp name="2117109222">Host: localhost:8081</stringProp>
               <stringProp name="1052466409">User-Agent: </stringProp>
@@ -927,6 +980,16 @@ mirrorServer.start();</stringProp>
             <stringProp name="Assertion.custom_message"></stringProp>
           </ResponseAssertion>
           <hashTree/>
+<ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="RA_KeepAlive_SampleHeaders" enabled="true">
+  <collectionProp name="Asserion.test_strings">
+    <stringProp name="894172713">Connection: keep-alive</stringProp>
+  </collectionProp>
+  <stringProp name="Assertion.test_field">Assertion.request_headers</stringProp>
+  <boolProp name="Assertion.assume_success">false</boolProp>
+  <intProp name="Assertion.test_type">16</intProp>
+  <stringProp name="Assertion.custom_message"></stringProp>
+</ResponseAssertion>
+<hashTree/>
           <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="JSR223-Assertion-CheckCorrectEncodingForParam" enabled="true">
             <stringProp name="TestPlan.comments">Workaround as Mirror Server corrupts encoding</stringProp>
             <stringProp name="cacheKey">true</stringProp>
@@ -989,7 +1052,6 @@ if(prev.getSamplerData().indexOf(textToCheck) &lt; 0) {
           <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="-530323176">POST /test?name0=value0 HTTP/1.1</stringProp>
-              <stringProp name="894172713">Connection: keep-alive</stringProp>
               <stringProp name="-1680100360">Accept-Encoding: gzip</stringProp>
               <stringProp name="224767427">Content-Length: 14</stringProp>
               <stringProp name="2117109222">Host: localhost:8081</stringProp>
@@ -1002,6 +1064,16 @@ if(prev.getSamplerData().indexOf(textToCheck) &lt; 0) {
             <stringProp name="Assertion.custom_message"></stringProp>
           </ResponseAssertion>
           <hashTree/>
+<ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="RA_KeepAlive_SampleHeaders" enabled="true">
+  <collectionProp name="Asserion.test_strings">
+    <stringProp name="894172713">Connection: keep-alive</stringProp>
+  </collectionProp>
+  <stringProp name="Assertion.test_field">Assertion.request_headers</stringProp>
+  <boolProp name="Assertion.assume_success">false</boolProp>
+  <intProp name="Assertion.test_type">16</intProp>
+  <stringProp name="Assertion.custom_message"></stringProp>
+</ResponseAssertion>
+<hashTree/>
           <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="-1049865380">nv_contentType</stringProp>
@@ -1065,7 +1137,6 @@ if(prev.getSamplerData().indexOf(textToCheck) &lt; 0) {
           <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Response Assertion" enabled="true">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="-530323176">POST /test?name0=value0 HTTP/1.1</stringProp>
-              <stringProp name="894172713">Connection: keep-alive</stringProp>
               <stringProp name="-1680100360">Accept-Encoding: gzip</stringProp>
               <stringProp name="2117109222">Host: localhost:8081</stringProp>
               <stringProp name="1052466409">User-Agent: </stringProp>
@@ -1082,6 +1153,16 @@ if(prev.getSamplerData().indexOf(textToCheck) &lt; 0) {
             <stringProp name="Assertion.custom_message"></stringProp>
           </ResponseAssertion>
           <hashTree/>
+<ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="RA_KeepAlive_SampleHeaders" enabled="true">
+  <collectionProp name="Asserion.test_strings">
+    <stringProp name="894172713">Connection: keep-alive</stringProp>
+  </collectionProp>
+  <stringProp name="Assertion.test_field">Assertion.request_headers</stringProp>
+  <boolProp name="Assertion.assume_success">false</boolProp>
+  <intProp name="Assertion.test_type">16</intProp>
+  <stringProp name="Assertion.custom_message"></stringProp>
+</ResponseAssertion>
+<hashTree/>
         </hashTree>
         <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="HR-POST_MULTIPART_WITH_FILE" enabled="true">
           <elementProp name="HTTPsampler.Files" elementType="HTTPFileArgs">

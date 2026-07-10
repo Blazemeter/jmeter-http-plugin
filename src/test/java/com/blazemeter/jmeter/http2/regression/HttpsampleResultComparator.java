@@ -148,14 +148,33 @@ public final class HttpsampleResultComparator {
     if (normalized.contains("Connection refused")) {
       return "connection-refused";
     }
+    // Jetty often invents the default reason phrase when the status line has none;
+    // HttpClient4 may keep an empty response message for the same redirect.
+    if (isDefaultHttpReasonPhrase(normalized)) {
+      return "";
+    }
     return normalized;
+  }
+
+  private static boolean isDefaultHttpReasonPhrase(String message) {
+    return "Found".equals(message)
+        || "Moved Permanently".equals(message)
+        || "Moved Temporarily".equals(message)
+        || "See Other".equals(message)
+        || "Temporary Redirect".equals(message)
+        || "Permanent Redirect".equals(message)
+        || "OK".equals(message);
   }
 
   private static String normalizeBody(String body) {
     if (body == null) {
       return "";
     }
-    return body.replace("\r\n", "\n").trim();
+    // HC4 may echo explicit Connection: keep-alive; Jetty omits it on HTTP/1.1 wire.
+    // Keep-alive parity is asserted on sample request headers, not mirror body.
+    String normalized = body.replace("\r\n", "\n");
+    normalized = normalized.replaceAll("(?im)^Connection:\\s*keep-alive\\s*\\n?", "");
+    return normalized.trim();
   }
 
   private static Map<String, String> normalizeHeaders(String raw) {

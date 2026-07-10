@@ -14,8 +14,6 @@ import org.eclipse.jetty.http.HttpVersion;
  */
 final class JmeterRequestHeadersSupport {
 
-  static final String ATTR_USE_KEEPALIVE = "bzm.useKeepAlive";
-
   private JmeterRequestHeadersSupport() {
   }
 
@@ -26,7 +24,7 @@ final class JmeterRequestHeadersSupport {
     if (request == null) {
       return;
     }
-    request.attribute(ATTR_USE_KEEPALIVE, useKeepAlive);
+    request.attribute(JmeterHttpClientAttributes.USE_KEEPALIVE, useKeepAlive);
     applyConnectionHeader(request, useKeepAlive);
     // TODO: HC4 sends explicit empty User-Agent when none is configured (disableDefaultUserAgent).
     // prepareEmptyUserAgentHeader(request);
@@ -39,9 +37,9 @@ final class JmeterRequestHeadersSupport {
     if (from == null || to == null) {
       return;
     }
-    Object useKeepAlive = from.getAttributes().get(ATTR_USE_KEEPALIVE);
+    Object useKeepAlive = from.getAttributes().get(JmeterHttpClientAttributes.USE_KEEPALIVE);
     if (useKeepAlive != null) {
-      to.attribute(ATTR_USE_KEEPALIVE, useKeepAlive);
+      to.attribute(JmeterHttpClientAttributes.USE_KEEPALIVE, useKeepAlive);
     }
   }
 
@@ -75,7 +73,7 @@ final class JmeterRequestHeadersSupport {
 
   private static void restoreConnectionHeaderForSample(
       Request request, HttpFields.Mutable headers) {
-    Object useKeepAlive = request.getAttributes().get(ATTR_USE_KEEPALIVE);
+    Object useKeepAlive = request.getAttributes().get(JmeterHttpClientAttributes.USE_KEEPALIVE);
     if (useKeepAlive == null || !shouldSendConnectionHeader(request)) {
       return;
     }

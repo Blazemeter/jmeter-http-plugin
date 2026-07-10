@@ -482,6 +482,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
       Request http11Request = fallbackHttp1Client.newRequest(request.getURI())
           .method(request.getMethod())
           .followRedirects(request.isFollowRedirects());
+      JmeterRequestHeadersSupport.copySamplerHeaderState(request, http11Request);
       if (request.getHeaders() != null) {
         HttpFields originalHeaders = request.getHeaders();
         HttpFields requestHeaders = http11Request.getHeaders();
@@ -504,12 +505,19 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
           }
         }
       }
+      Object useKeepAlive =
+          http11Request.getAttributes().get(JmeterHttpClientAttributes.USE_KEEPALIVE);
+      if (useKeepAlive instanceof Boolean) {
+        JmeterRequestHeadersSupport.prepareFromSampler(http11Request, (Boolean) useKeepAlive);
+      }
       if (request.getBody() != null) {
         http11Request.body(request.getBody());
       }
       SslClientCertAliasSupport.copyFromRequest(request, http11Request);
       lowLevelDebug("Retrying request with HTTP/1.1 in listener fallback: {}", request.getURI());
-      return http11Request.send();
+      ContentResponse response = http11Request.send();
+      this.request = http11Request;
+      return response;
     } catch (Exception e) {
       LOG.error("HTTP/1.1 fallback in listener failed", e);
       return null;

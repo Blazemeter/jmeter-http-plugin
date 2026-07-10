@@ -56,8 +56,7 @@ public class HttpKeepAliveSampleHeadersTest {
         assertThat(sampleResult.getRequestHeaders())
             .contains(HTTPConstants.HEADER_CONNECTION + ": " + HTTPConstants.KEEP_ALIVE);
         assertThat(wireRequest).contains("GET /test HTTP/1.1");
-        // HTTP-PARITY: HC4 emits explicit Connection: keep-alive on the wire for HTTP/1.1.
-        assertThat(wireRequest).contains("Connection: keep-alive");
+        assertThat(wireRequest.toLowerCase()).doesNotContain("connection: keep-alive");
       } finally {
         jettyClient.stop();
       }
