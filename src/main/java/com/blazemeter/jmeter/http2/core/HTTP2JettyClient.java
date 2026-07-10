@@ -1148,7 +1148,6 @@ public class HTTP2JettyClient {
       setHeaders(http11Request, url, sampler.getHeaderManager());
     }
     ensureHostHeader(http11Request, url);
-    ensureEmptyUserAgentHeader(http11Request);
     configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
     setBody(http11Request, sampler, result, false);
     JmeterRequestHeadersSupport.prepareFromSampler(http11Request, sampler.getUseKeepAlive());
@@ -1221,7 +1220,6 @@ public class HTTP2JettyClient {
       }
     }
     ensureHostHeader(http11Request, uri);
-    ensureEmptyUserAgentHeader(http11Request);
     Object useKeepAlive =
         http11Request.getAttributes().get(JmeterHttpClientAttributes.USE_KEEPALIVE);
     if (useKeepAlive instanceof Boolean) {
@@ -1396,7 +1394,6 @@ public class HTTP2JettyClient {
     }
     setHeaders(request, url, sampler.getHeaderManager());
     ensureHostHeader(request, url);
-    ensureEmptyUserAgentHeader(request);
     addPreemptiveAuthorizationHeader(request, url, sampler.getAuthManager());
     lowLevelDebug("Headers set, request URI: {}", request.getURI());
 
@@ -3277,21 +3274,6 @@ public class HTTP2JettyClient {
     boolean includePort = port > 0 && port != defaultPort;
     String hostValue = includePort ? host + ":" + port : host;
     mutableHeaders.put(HttpHeader.HOST, hostValue);
-  }
-
-  /**
-   * Matches {@code HTTPHC4Impl}: sends an explicit empty {@code User-Agent} header when none
-   * is configured, instead of omitting the header entirely.
-   */
-  private void ensureEmptyUserAgentHeader(Request request) {
-    HttpFields headers = request.getHeaders();
-    if (!(headers instanceof HttpFields.Mutable)) {
-      return;
-    }
-    HttpFields.Mutable mutableHeaders = (HttpFields.Mutable) headers;
-    if (!mutableHeaders.contains(HttpHeader.USER_AGENT)) {
-      mutableHeaders.put(HttpHeader.USER_AGENT, "");
-    }
   }
 
   private void addPreemptiveAuthorizationHeader(Request request, URL url,

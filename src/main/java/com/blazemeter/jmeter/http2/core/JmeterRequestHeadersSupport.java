@@ -1,6 +1,8 @@
 package com.blazemeter.jmeter.http2.core;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
+import org.apache.jmeter.util.JMeterUtils;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpHeader;
@@ -14,6 +16,11 @@ import org.eclipse.jetty.http.HttpVersion;
  */
 final class JmeterRequestHeadersSupport {
 
+  static final String DEFAULT_USER_AGENT_PROPERTY =
+      "httpclient4.default_user_agent_disabled";
+
+  private static final String DEFAULT_USER_AGENT = buildDefaultUserAgent();
+
   private JmeterRequestHeadersSupport() {
   }
 
@@ -26,8 +33,7 @@ final class JmeterRequestHeadersSupport {
     }
     request.attribute(JmeterHttpClientAttributes.USE_KEEPALIVE, useKeepAlive);
     applyConnectionHeader(request, useKeepAlive);
-    // TODO: HC4 sends explicit empty User-Agent when none is configured (disableDefaultUserAgent).
-    // prepareEmptyUserAgentHeader(request);
+    applyDefaultUserAgentHeader(request);
   }
 
   /**
@@ -52,7 +58,6 @@ final class JmeterRequestHeadersSupport {
     }
     HttpFields.Mutable merged = HttpFields.build(request.getHeaders());
     restoreConnectionHeaderForSample(request, merged);
-    // restoreEmptyUserAgentForSample(request, merged);
     return merged;
   }
 
@@ -69,6 +74,38 @@ final class JmeterRequestHeadersSupport {
     } else {
       mutableHeaders.put(HTTPConstants.HEADER_CONNECTION, HTTPConstants.CONNECTION_CLOSE);
     }
+  }
+
+  /**
+   * Matches {@code HTTPHC4Impl}: when no {@code User-Agent} is configured, send a plugin default
+   * unless {@code httpclient4.default_user_agent_disabled=true}.
+   */
+  private static void applyDefaultUserAgentHeader(Request request) {
+    if (isDefaultUserAgentDisabled()) {
+      return;
+    }
+    HttpFields.Mutable mutableHeaders = mutableHeaders(request);
+    if (mutableHeaders == null || mutableHeaders.contains(HttpHeader.USER_AGENT)) {
+      return;
+    }
+    mutableHeaders.put(HttpHeader.USER_AGENT, DEFAULT_USER_AGENT);
+  }
+
+  static boolean isDefaultUserAgentDisabled() {
+    return JMeterUtils.getPropDefault(DEFAULT_USER_AGENT_PROPERTY, false);
+  }
+
+  static String defaultUserAgent() {
+    return DEFAULT_USER_AGENT;
+  }
+
+  private static String buildDefaultUserAgent() {
+    Package pkg = JmeterRequestHeadersSupport.class.getPackage();
+    String version = pkg != null ? pkg.getImplementationVersion() : null;
+    if (StringUtils.isBlank(version)) {
+      return "BlazeMeter HTTP";
+    }
+    return "BlazeMeter HTTP/" + version;
   }
 
   private static void restoreConnectionHeaderForSample(

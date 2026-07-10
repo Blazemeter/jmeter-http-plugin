@@ -4,17 +4,28 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 
+import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import java.util.HashMap;
 import java.util.Map;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
+import org.apache.jmeter.util.JMeterUtils;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpVersion;
+import org.junit.After;
 import org.junit.Test;
 import org.mockito.Mockito;
 
-public class JmeterRequestHeadersSupportTest {
+public class JmeterRequestHeadersSupportTest extends HTTP2TestBase {
+
+  private static final String UA_DISABLED_PROP =
+      JmeterRequestHeadersSupport.DEFAULT_USER_AGENT_PROPERTY;
+
+  @After
+  public void clearUserAgentProperty() {
+    JMeterUtils.getJMeterProperties().remove(UA_DISABLED_PROP);
+  }
 
   private static Request mockRequest(HttpFields.Mutable headers) {
     Map<String, Object> attributes = new HashMap<>();
@@ -73,5 +84,51 @@ public class JmeterRequestHeadersSupportTest {
     JmeterRequestHeadersSupport.prepareFromSampler(request, true);
 
     assertThat(headers.get(HttpHeader.CONNECTION)).isEqualTo("Upgrade");
+  }
+
+  @Test
+  public void prepareFromSamplerAddsDefaultUserAgentWhenMissing() {
+    HttpFields.Mutable headers = HttpFields.build();
+    Request request = mockRequest(headers);
+
+    JmeterRequestHeadersSupport.prepareFromSampler(request, true);
+
+    assertThat(headers.get(HttpHeader.USER_AGENT))
+        .isEqualTo(JmeterRequestHeadersSupport.defaultUserAgent());
+    assertThat(headers.get(HttpHeader.USER_AGENT)).startsWith("BlazeMeter HTTP");
+  }
+
+  @Test
+  public void prepareFromSamplerDoesNotOverrideConfiguredUserAgent() {
+    HttpFields.Mutable headers = HttpFields.build()
+        .add(HttpHeader.USER_AGENT, "CustomAgent/1.0");
+    Request request = mockRequest(headers);
+
+    JmeterRequestHeadersSupport.prepareFromSampler(request, true);
+
+    assertThat(headers.get(HttpHeader.USER_AGENT)).isEqualTo("CustomAgent/1.0");
+  }
+
+  @Test
+  public void prepareFromSamplerKeepsEmptyUserAgentFromHeaderManager() {
+    HttpFields.Mutable headers = HttpFields.build()
+        .add(HttpHeader.USER_AGENT, "");
+    Request request = mockRequest(headers);
+
+    JmeterRequestHeadersSupport.prepareFromSampler(request, true);
+
+    assertThat(headers.contains(HttpHeader.USER_AGENT)).isTrue();
+    assertThat(headers.get(HttpHeader.USER_AGENT)).isEmpty();
+  }
+
+  @Test
+  public void prepareFromSamplerOmitsDefaultUserAgentWhenPropertyDisabled() {
+    JMeterUtils.setProperty(UA_DISABLED_PROP, "true");
+    HttpFields.Mutable headers = HttpFields.build();
+    Request request = mockRequest(headers);
+
+    JmeterRequestHeadersSupport.prepareFromSampler(request, true);
+
+    assertThat(headers.contains(HttpHeader.USER_AGENT)).isFalse();
   }
 }
