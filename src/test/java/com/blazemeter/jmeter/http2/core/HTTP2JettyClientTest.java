@@ -187,6 +187,47 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     assertThat(result.getResponseDataAsString()).isEqualTo(SERVER_RESPONSE);
   }
 
+  @Test
+  public void shouldSucceedWhenHeadMethodIsSent() throws Exception {
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.HEAD);
+    HTTPSampleResult result = sample(SERVER_PATH_200, HTTPConstants.HEAD);
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    softly.assertThat(result.getHTTPMethod()).isEqualTo(HTTPConstants.HEAD);
+    // HEAD responses must not carry a body.
+    softly.assertThat(result.getResponseDataAsString()).isEmpty();
+  }
+
+  @Test
+  public void shouldNotSendBodyWhenHeadMethodWithArguments() throws Exception {
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.HEAD);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+    HTTPSampleResult result = sample(SERVER_PATH_200, HTTPConstants.HEAD);
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    softly.assertThat(result.getResponseDataAsString()).isEmpty();
+    // HEAD is not a body method; arguments must not become a request entity.
+    softly.assertThat(result.getQueryString()).isNullOrEmpty();
+    softly.assertThat(result.getRequestHeaders()).doesNotContain("Content-Length");
+  }
+
+  @Test
+  public void shouldFollowRedirectWhenHeadMethodAndFollowRedirectEnabled() throws Exception {
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.HEAD);
+    sampler.setFollowRedirects(true);
+    HTTPSampleResult result = sample(SERVER_PATH_302, HTTPConstants.HEAD);
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    softly.assertThat(result.getSubResults().length).isGreaterThan(0);
+    softly.assertThat(result.getRedirectLocation())
+        .isEqualTo("https://localhost:" + getActivePort() + SERVER_PATH_200);
+    softly.assertThat(result.getResponseDataAsString()).isEmpty();
+  }
+
   private void buildStartedServer() throws Exception {
     server = new ServerBuilder()
         .withHTTP2()
