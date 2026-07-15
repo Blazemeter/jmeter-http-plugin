@@ -4,6 +4,7 @@ import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
 
 import com.blazemeter.jmeter.http2.core.jetty.CustomWwwAuthenticationProtocolHandler;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http2.CustomClientConnectionFactoryOverHTTP2;
+import com.blazemeter.jmeter.http2.core.jetty.custom.http2.CustomHttpClientTransportOverHTTP2;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http3.CustomClientConnectionFactoryOverHTTP3;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
@@ -100,7 +101,6 @@ import org.eclipse.jetty.http.MetaData;
 import org.eclipse.jetty.http2.HTTP2Session;
 import org.eclipse.jetty.http2.api.Session;
 import org.eclipse.jetty.http2.client.HTTP2Client;
-import org.eclipse.jetty.http2.client.transport.HttpClientTransportOverHTTP2;
 import org.eclipse.jetty.http2.frames.Frame;
 import org.eclipse.jetty.http2.frames.GoAwayFrame;
 import org.eclipse.jetty.http2.frames.HeadersFrame;
@@ -538,7 +538,7 @@ public class HTTP2JettyClient {
     } else {
       http2cClient.setMaxConcurrentPushedStreams(maxConcurrentPushedStreams);
     }
-    HttpClientTransport h2cTransport = new HttpClientTransportOverHTTP2(http2cClient);
+    HttpClientTransport h2cTransport = new CustomHttpClientTransportOverHTTP2(http2cClient);
     configureTransport(h2cTransport);
     this.httpClientH2cPrior = new HttpClient(h2cTransport);
     configureHttpClient(this.httpClientH2cPrior, h2cConnector);

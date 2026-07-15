@@ -7,7 +7,7 @@ import org.eclipse.jetty.client.transport.HttpClientConnectionFactory;
 import org.eclipse.jetty.client.transport.HttpClientTransportDynamic;
 import org.eclipse.jetty.http3.client.HTTP3Client;
 import org.eclipse.jetty.http3.client.HTTP3ClientConnectionFactory;
-import org.eclipse.jetty.http3.client.transport.HttpClientTransportOverHTTP3;
+import org.eclipse.jetty.http3.client.transport.CustomHttp3ClientConfigurer;
 import org.eclipse.jetty.io.ClientConnectionFactory;
 import org.eclipse.jetty.io.EndPoint;
 import org.eclipse.jetty.io.Transport;
@@ -31,14 +31,7 @@ public class CustomClientConnectionFactoryOverHTTP3 extends ContainerLifeCycle
 
   @Override
   public void setHttpClient(HttpClient httpClient) {
-    try {
-      java.lang.reflect.Method configureMethod = HttpClientTransportOverHTTP3.class
-          .getDeclaredMethod("configure", HttpClient.class, HTTP3Client.class);
-      configureMethod.setAccessible(true);
-      configureMethod.invoke(null, httpClient, http3Client);
-    } catch (ReflectiveOperationException e) {
-      throw new IllegalStateException("Unable to configure HTTP/3 transport", e);
-    }
+    CustomHttp3ClientConfigurer.configure(httpClient, http3Client);
   }
 
   @Override
