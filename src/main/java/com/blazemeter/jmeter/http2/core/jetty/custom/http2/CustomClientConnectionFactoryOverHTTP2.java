@@ -10,6 +10,7 @@ import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.transport.HttpClientConnectionFactory;
 import org.eclipse.jetty.client.transport.HttpDestination;
 import org.eclipse.jetty.http2.client.HTTP2Client;
+import org.eclipse.jetty.http2.client.transport.CustomHttp2ClientConfigurer;
 import org.eclipse.jetty.http2.client.transport.internal.HttpConnectionOverHTTP2;
 import org.eclipse.jetty.io.ClientConnectionFactory;
 import org.eclipse.jetty.io.EndPoint;
@@ -31,15 +32,7 @@ public class CustomClientConnectionFactoryOverHTTP2 extends ContainerLifeCycle
 
   @Override
   public void setHttpClient(HttpClient httpClient) {
-    try {
-      java.lang.reflect.Method configureMethod = org.eclipse.jetty.http2.client.transport
-          .HttpClientTransportOverHTTP2.class.getDeclaredMethod(
-              "configure", HttpClient.class, HTTP2Client.class);
-      configureMethod.setAccessible(true);
-      configureMethod.invoke(null, httpClient, http2Client);
-    } catch (ReflectiveOperationException e) {
-      throw new IllegalStateException("Unable to configure HTTP/2 transport", e);
-    }
+    CustomHttp2ClientConfigurer.configure(httpClient, http2Client);
   }
 
   @Override

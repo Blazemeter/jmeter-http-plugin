@@ -24,6 +24,16 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Keep in sync when upgrading Jetty; only the normalize hooks differ from upstream.
  *
+ * <p>Deliberately placed in this Jetty package, not a {@code com.blazemeter} package: the
+ * {@link HpackDecoder#getHpackContext() context} it inherits is {@code private}, so this class
+ * must build its own {@link HpackContext}, and that constructor is package-private in Jetty
+ * (verified for both 12.1.7 and 12.1.11 via {@code javap}). Every other member this class uses
+ * from {@code HpackContext}, {@code MetaDataBuilder} and {@code HpackDecoder} is {@code public};
+ * only the {@code HpackContext(int)} constructor forces the package match.
+ *
+ * <p>Keep in sync when upgrading Jetty: if {@code HpackContext(int)} is ever made public, this
+ * class could move to a {@code com.blazemeter} package instead of overriding every accessor.
+ *
  * <p>This is not thread safe and may only be called by 1 thread at a time.
  */
 public class CustomHpackDecoder extends HpackDecoder {

@@ -7,6 +7,7 @@ import org.eclipse.jetty.http2.FlowControlStrategy;
 import org.eclipse.jetty.http2.HTTP2Connection;
 import org.eclipse.jetty.http2.HTTP2Session;
 import org.eclipse.jetty.http2.api.Session;
+import org.eclipse.jetty.http2.client.CustomHttp2SessionContainerAccessor;
 import org.eclipse.jetty.http2.client.HTTP2Client;
 import org.eclipse.jetty.http2.client.internal.HTTP2ClientSession;
 import org.eclipse.jetty.http2.frames.Frame;
@@ -62,15 +63,7 @@ public class CustomHTTP2ClientConnectionFactory implements ClientConnectionFacto
     HTTP2ClientConnection connection =
         new HTTP2ClientConnection(client, endPoint, session, sessionPromise, listener);
     context.put(HTTP2Connection.class.getName(), connection);
-    try {
-      java.lang.reflect.Method getSessionContainer =
-          HTTP2Client.class.getDeclaredMethod("getSessionContainer");
-      getSessionContainer.setAccessible(true);
-      connection.addEventListener(
-          (java.util.EventListener) getSessionContainer.invoke(client));
-    } catch (ReflectiveOperationException e) {
-      throw new IllegalStateException("Unable to access HTTP2Client session container", e);
-    }
+    connection.addEventListener(CustomHttp2SessionContainerAccessor.getSessionContainer(client));
     client.getEventListeners().forEach(session::addEventListener);
     parser.init(connection);
 
