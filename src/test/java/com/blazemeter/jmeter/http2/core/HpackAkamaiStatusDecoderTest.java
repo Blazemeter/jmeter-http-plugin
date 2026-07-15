@@ -2,6 +2,7 @@ package com.blazemeter.jmeter.http2.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -104,6 +105,42 @@ public class HpackAkamaiStatusDecoderTest {
     assertThat(metadata).isInstanceOf(MetaData.Response.class);
     assertThat(((MetaData.Response) metadata).getStatus()).isEqualTo(200);
     assertThat(metadata.getHttpFields().get("warning")).isEqualTo(AKAMAI_STATUS_WITH_REASON);
+  }
+
+  @Test
+  public void realOversizedBlockSessionExceptionIsDetectedAsHpackFailure() {
+    ByteBuffer block = literalStatusHeader("200", false);
+    // Buffer is 5 bytes (0x08, len=3, '2','0','0'); cap below that to trip the
+    // whole-block guard at the top of CustomHpackDecoder.decode().
+    CustomHpackDecoder decoder = new CustomHpackDecoder(4, System::nanoTime);
+
+    Throwable thrown = catchThrowable(() -> decoder.decode(block));
+
+    assertThat(thrown)
+        .isInstanceOf(HpackException.SessionException.class)
+        .hasMessageContaining("Header fields size too large");
+    assertThat(HpackFailureDetector.indicatesHpackFailure(thrown))
+        .as("HpackFailureDetector must recognize CustomHpackDecoder's own SessionException")
+        .isTrue();
+  }
+
+  @Test
+  public void realOversizedFieldSessionExceptionIsDetectedAsHpackFailure() {
+    // Encoded block is only 12 bytes (0x08, len=10, 10 value bytes), but the decoded
+    // ":status" field accounts for 7 (name) + 10 (value) + 32 (overhead) = 49 logical bytes,
+    // so maxHeaderSize=20 clears the whole-block guard yet still trips MetaDataBuilder.emit().
+    ByteBuffer block = literalStatusHeader("2000000000", false);
+    CustomHpackDecoder decoder = new CustomHpackDecoder(20, System::nanoTime);
+
+    Throwable thrown = catchThrowable(() -> decoder.decode(block));
+
+    assertThat(thrown)
+        .isInstanceOf(HpackException.SessionException.class)
+        .hasMessageContaining("Header size")
+        .hasMessageContaining("49 > 20");
+    assertThat(HpackFailureDetector.indicatesHpackFailure(thrown))
+        .as("HpackFailureDetector must recognize CustomHpackDecoder's own SessionException")
+        .isTrue();
   }
 
   private static ByteBuffer literalStatusHeader(String value, boolean indexed) {
