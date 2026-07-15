@@ -35,9 +35,9 @@
     <jmeter.regression.tests>TEST_HTTP,ResponseDecompression,TestHeaderManager,TestCookieManager</jmeter.regression.tests>
     <jmeter.regression.tier4.tests>HTMLParserTestFile_2,TEST_HTTPS,Http4ImplDigestAuth,Http4ImplPreemptiveBasicAuth</jmeter.regression.tier4.tests>
     <jmeter.regression.flaky.tests>TestKeepAlive,TestRedirectionPolicies</jmeter.regression.flaky.tests>
-    <jetty.version>12.1.7</jetty.version>
-    <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.7 -->
-    <brotli4j.version>1.20.0</brotli4j.version>
+    <jetty.version>12.1.11</jetty.version>
+    <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.11 -->
+    <brotli4j.version>1.23.0</brotli4j.version>
     <checkstyle.skip>false</checkstyle.skip>
   </properties>
   <dependencies>
