@@ -8,7 +8,6 @@ import static org.junit.Assume.assumeTrue;
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.sampler.JmxBlazeMeterHttpMigrator;
 import java.io.File;
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -86,7 +85,7 @@ public class JmeterHttpRegressionIntegrationTest extends HTTP2TestBase {
     workRoot = Path.of("target", "jmeter-regression-work");
     Files.createDirectories(workRoot);
     runner = new JmeterRegressionRunner(distribution, workRoot);
-    pluginJar = resolvePluginJar();
+    pluginJar = JmeterRegressionSupport.resolvePluginJar();
   }
 
   @AfterClass
@@ -173,22 +172,5 @@ public class JmeterHttpRegressionIntegrationTest extends HTTP2TestBase {
             JmeterRegressionSupport.toleratesExternalServiceDrift(baseName));
     assertTrue("Sample mismatch for " + testName + " [" + protocolProfile.getId() + "]: "
         + comparison.formattedDiff(), comparison.isEqual());
-  }
-
-  private static File resolvePluginJar() throws IOException {
-    Path targetJar = Path.of("target", "jmeter-bzm-http2-3.0.2-SNAPSHOT.jar");
-    if (Files.isRegularFile(targetJar)) {
-      return targetJar.toFile();
-    }
-    try (var stream = Files.list(Path.of("target"))) {
-      return stream
-          .filter(p -> p.getFileName().toString().startsWith("jmeter-bzm-http2")
-              && p.getFileName().toString().endsWith(".jar")
-              && !p.getFileName().toString().contains("original"))
-          .map(Path::toFile)
-          .findFirst()
-          .orElseThrow(() -> new IOException(
-              "Plugin jar not found under target/. Run mvn package first."));
-    }
   }
 }

@@ -103,13 +103,13 @@ public final class JmeterRegressionRunner {
     return jtl.isFile() ? jtl : null;
   }
 
-  private static String resolveJavaExecutable() {
+  static String resolveJavaExecutable() {
     String javaHome = System.getProperty("java.home");
     Path javaBin = Path.of(javaHome, "bin", isWindows() ? "java.exe" : "java");
     return javaBin.toString();
   }
 
-  private static boolean isWindows() {
+  static boolean isWindows() {
     return System.getProperty("os.name", "").toLowerCase().contains("win");
   }
 

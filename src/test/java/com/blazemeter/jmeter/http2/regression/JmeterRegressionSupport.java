@@ -170,6 +170,20 @@ public final class JmeterRegressionSupport {
     Files.deleteIfExists(path);
   }
 
+  /** Locates the plugin jar built by {@code mvn package} under {@code target/}. */
+  public static File resolvePluginJar() throws IOException {
+    try (var stream = Files.list(Path.of("target"))) {
+      return stream
+          .filter(p -> p.getFileName().toString().startsWith("jmeter-bzm-http2")
+              && p.getFileName().toString().endsWith(".jar")
+              && !p.getFileName().toString().contains("original"))
+          .map(Path::toFile)
+          .findFirst()
+          .orElseThrow(() -> new IOException(
+              "Plugin jar not found under target/. Run mvn package first."));
+    }
+  }
+
   public static String testBaseName(String testName) {
     if (testName.endsWith(".jmx")) {
       return testName.substring(0, testName.length() - 4);
