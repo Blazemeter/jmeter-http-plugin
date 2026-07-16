@@ -220,6 +220,10 @@ public class HTTP2JettyClient {
   private CompressionContentDecoderFactory brotliDecoderFactory;
   private CompressionContentDecoderFactory zstdDecoderFactory;
   private ContentDecoder.Factory gzipDecoderFactory;
+  // Jetty's compression module ships gzip/brotli/zstd decoders but no deflate one, so
+  // DeflateContentDecoderFactory is our own Inflater-based implementation (not a Jetty class).
+  // Kept initialized for the disableDeflateDecoder diagnostic toggle, but no longer registered
+  // per-request; see the comment in configureContentDecoders() below.
   private DeflateContentDecoderFactory deflateDecoderFactory;
   private boolean decoderFactoriesInitialized = false;
   private int quicMaxIdleTimeout = 30000;
@@ -2236,7 +2240,13 @@ public class HTTP2JettyClient {
     } else if (addGzip && disableGzipDecoder) {
       lowLevelDebug("Gzip decoder disabled by blazemeter.http.disableGzipDecoder");
     }
-    // Deflate is decoded in getDecodedContent() to match HttpClient4 (zlib/raw).
+    // Not registering deflateDecoderFactory here on purpose. It decodes per-chunk as bytes
+    // arrive off the wire, so if the first bytes don't inflate as zlib-wrapped (RFC 1950) there's
+    // no clean way to rewind and retry as raw/headerless deflate (RFC 1951) - some servers send
+    // "Content-Encoding: deflate" as raw deflate despite the RFC implying zlib. getDecodedContent()
+    // below instead decodes the fully buffered response body, where retrying with a fresh
+    // Inflater is trivial, so all deflate decoding is funneled through decodeDeflate() there to
+    // match HttpClient4 (which also tries zlib first, then raw).
     if (addDeflate && disableDeflateDecoder) {
       lowLevelDebug("Deflate decoder disabled by blazemeter.http.disableDeflateDecoder");
     }
@@ -4101,6 +4111,9 @@ public class HTTP2JettyClient {
     // should have handled it and re-decoding only adds CPU/alloc pressure.
     boolean skipRedundantManualDecode = Boolean.parseBoolean(
         System.getProperty(PROP_SKIP_REDUNDANT_MANUAL_DECODE, "true"));
+    // deflate is excluded from this fast path: it is never registered as a per-request Jetty
+    // decoder (see configureContentDecoders() above), so it must always go through decodeDeflate()
+    // below, which is the only place that tries both deflate variants.
     if (skipRedundantManualDecode
         && !"deflate".equals(encodingToken)
         && requestAdvertisedEncoding(contentResponse.getRequest(), encodingToken)) {
@@ -4174,6 +4187,11 @@ public class HTTP2JettyClient {
     }
   }
 
+  /**
+   * "Content-Encoding: deflate" is ambiguous in practice: the RFC implies zlib-wrapped deflate
+   * (RFC 1950), but plenty of real servers send raw/headerless deflate (RFC 1951) under the same
+   * header. Try zlib first, then raw, before giving up - matching HttpClient4's behavior.
+   */
   private byte[] decodeDeflate(byte[] content, String contentEncoding) {
     byte[] zlibDecoded = tryInflateDeflate(content, false);
     if (zlibDecoded != null) {
