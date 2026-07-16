@@ -3789,6 +3789,11 @@ public class HTTP2JettyClient {
     } else {
       String ret = HttpFields.build(headers).remove(HTTPConstants.HEADER_COOKIE).toString()
           .replace("\r\n", "\n");
+      // When Cookie was the only header, removing it leaves an empty string; ret.length() - 1
+      // would then be -1, which substring() rejects.
+      if (ret.isEmpty()) {
+        return "";
+      }
       return ret.substring(0,
           ret.length() - 1); // removing final separator not included in jmeter headers
     }
