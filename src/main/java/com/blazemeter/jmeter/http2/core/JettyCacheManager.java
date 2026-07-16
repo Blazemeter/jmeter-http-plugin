@@ -17,11 +17,12 @@ import org.apache.http.client.methods.HttpTrace;
 import org.apache.http.message.BasicHeader;
 import org.apache.http.message.BasicHttpResponse;
 import org.apache.jmeter.protocol.http.control.CacheManager;
+import org.apache.jmeter.protocol.http.sampler.HTTPHC4Impl;
 import org.apache.jmeter.protocol.http.sampler.HTTPHC4Impl.HttpDelete;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
+import org.apache.jmeter.protocol.http.sampler.HTTPSamplerBase;
 import org.apache.jmeter.protocol.http.sampler.HttpWebdav;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
-import org.apache.jmeter.util.JMeterUtils;
 import org.eclipse.jetty.client.ContentResponse;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.http.HttpFields;
@@ -94,35 +95,29 @@ public class JettyCacheManager {
   }
 
   public HTTPSampleResult buildCachedSampleResult(HTTPSampleResult res) {
-    CachedResourceMode cachedResourceMode = CachedResourceMode.valueOf(
-        JMeterUtils.getPropDefault("cache_manager.cached_resource_mode",
-            CachedResourceMode.RETURN_NO_SAMPLE.toString()));
-    switch (cachedResourceMode) {
-      case RETURN_NO_SAMPLE:
-        return null;
-      case RETURN_200_CACHE:
-        res.sampleEnd();
-        res.setResponseCodeOK();
-        res.setResponseMessage(
-            JMeterUtils.getPropDefault("RETURN_200_CACHE.message", "(ex cache)"));
-        res.setSuccessful(true);
-        return res;
-      case RETURN_CUSTOM_STATUS:
-        res.sampleEnd();
-        res.setResponseCode(JMeterUtils.getProperty("RETURN_CUSTOM_STATUS.code"));
-        res.setResponseMessage(
-            JMeterUtils.getPropDefault("RETURN_CUSTOM_STATUS.message", "(ex cache)"));
-        res.setSuccessful(true);
-        return res;
-      default:
-        throw new IllegalStateException("Unknown CACHED_RESOURCE_MODE");
+    // Match HttpClient4: HTTPAbstractImpl snapshots cache_manager.cached_resource_mode once.
+    return CachedResourceResultBridge.forCachedResource(res);
+  }
+
+  private static final class CachedResourceResultBridge extends HTTPHC4Impl {
+    private static final CachedResourceResultBridge INSTANCE =
+        new CachedResourceResultBridge(new BridgeSampler());
+
+    private CachedResourceResultBridge(HTTPSamplerBase sampler) {
+      super(sampler);
+    }
+
+    private static HTTPSampleResult forCachedResource(HTTPSampleResult res) {
+      return INSTANCE.updateSampleResultForResourceInCache(res);
     }
   }
 
-  private enum CachedResourceMode {
-    RETURN_200_CACHE,
-    RETURN_NO_SAMPLE,
-    RETURN_CUSTOM_STATUS
+  private static final class BridgeSampler extends HTTPSamplerBase {
+    @Override
+    protected HTTPSampleResult sample(URL url, String method, boolean areFollowingRedirect,
+        int depth) {
+      throw new UnsupportedOperationException("cache bridge");
+    }
   }
 
   public void saveDetails(ContentResponse contentResponse, HTTPSampleResult result) {
