@@ -1421,6 +1421,16 @@ public class HTTP2JettyClient {
     CookieManager cookieManager = sampler.getCookieManager();
     if (cookieManager != null) {
       result.setCookies(buildCookies(request, url, cookieManager));
+    } else {
+      // HttpClient4 reports whatever Cookie header actually went out, even when it wasn't
+      // built by a CookieManager (e.g. set directly via HeaderManager).
+      HttpFields headers = request.getHeaders();
+      if (headers != null) {
+        String cookieHeader = headers.get(HttpHeader.COOKIE);
+        if (cookieHeader != null && !cookieHeader.isEmpty()) {
+          result.setCookies(cookieHeader);
+        }
+      }
     }
 
     if (!sampler.getProxyHost().isEmpty()) {
