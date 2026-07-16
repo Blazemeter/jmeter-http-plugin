@@ -21,6 +21,7 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -146,6 +147,7 @@ public class HTTP2JettyClient {
   private static final String DEFAULT_FILE_MIME_TYPE = "application/octet-stream";
   private static final String ALT_SVC_HEADER = "alt-svc";
   private static final String ATTR_HTTP3_ATTEMPTED = "bzm.http3.attempted";
+  private static final String ATTR_H2C_FALLBACK_ATTEMPTED = "bzm.h2cFallbackAttempted";
   private static final String ATTR_ORIGIN_KEY = "bzm.http3.origin";
   private static final String ATTR_REQUEST_HEADERS_SERIALIZED = "bzm.request.headers.serialized";
   private static final String PROP_SKIP_REDUNDANT_MANUAL_DECODE =
@@ -1186,56 +1188,143 @@ public class HTTP2JettyClient {
     lowLevelDebug("Retrying request with HTTP/1.1 only: method={}, URI={}",
         originalRequest.getMethod(), uri);
 
-    clearContentDecoders(httpClientHttp1Only);
-
     try {
-      // Rebuild the request with the shared HTTP/1.1-only client
-      Request http11Request = httpClientHttp1Only.newRequest(uri)
-          .method(originalRequest.getMethod())
-          .timeout(requestTimeout, TimeUnit.MILLISECONDS)
-          .followRedirects(originalRequest.isFollowRedirects());
-
-      // Copy headers from original request
-      if (originalRequest.getHeaders() != null) {
-        HttpFields originalHeaders = originalRequest.getHeaders();
-        HttpFields requestHeaders = http11Request.getHeaders();
-        if (requestHeaders instanceof HttpFields.Mutable) {
-          HttpFields.Mutable newHeaders = (HttpFields.Mutable) requestHeaders;
-          originalHeaders.forEach(field -> {
-            // Skip HTTP/2 pseudo-headers (they don't exist in HTTP/1.1)
-            String name = field.getName();
-            if (!name.startsWith(":")) {
-              newHeaders.put(name, field.getValue());
-            }
-          });
-        }
-        // Note: In Jetty 12, Request headers are typically mutable.
-        // If they're not mutable, the headers from the original request
-        // will be lost, but this is an edge case.
-      }
-      ensureHostHeader(http11Request, uri);
-      JmeterRequestHeadersSupport.copySamplerHeaderState(originalRequest, http11Request);
-
-      configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
-
-      // Copy body if present
-      if (originalRequest.getBody() != null) {
-        http11Request.body(originalRequest.getBody());
-      }
-      SslClientCertAliasSupport.copyFromRequest(originalRequest, http11Request);
-
-      // Send request and wait for response
+      Request http11Request = buildHttp11FallbackRequest(originalRequest);
       lowLevelDebug("Sending HTTP/1.1 fallback request");
       ContentResponse response = http11Request.send();
-
       lowLevelDebug("HTTP/1.1 fallback request succeeded: status={}, version={}",
           response.getStatus(), response.getVersion());
-
       return response;
     } catch (Exception e) {
       LOG.error("HTTP/1.1 fallback also failed for URI: {}", uri, e);
       throw new ExecutionException("HTTP/1.1 fallback failed", e);
     }
+  }
+
+  private Request buildHttp11FallbackRequest(Request originalRequest) {
+    URI uri = originalRequest.getURI();
+    clearContentDecoders(httpClientHttp1Only);
+    Request http11Request = httpClientHttp1Only.newRequest(uri)
+        .method(originalRequest.getMethod())
+        .timeout(requestTimeout, TimeUnit.MILLISECONDS)
+        .followRedirects(originalRequest.isFollowRedirects());
+    JmeterRequestHeadersSupport.copySamplerHeaderState(originalRequest, http11Request);
+    http11Request.attribute(ATTR_H2C_FALLBACK_ATTEMPTED, Boolean.TRUE);
+    if (originalRequest.getHeaders() != null) {
+      HttpFields originalHeaders = originalRequest.getHeaders();
+      HttpFields requestHeaders = http11Request.getHeaders();
+      if (requestHeaders instanceof HttpFields.Mutable) {
+        HttpFields.Mutable newHeaders = (HttpFields.Mutable) requestHeaders;
+        originalHeaders.forEach(field -> {
+          // Skip HTTP/2 pseudo-headers and h2c upgrade headers - neither exists in HTTP/1.1,
+          // and re-sending them would trigger another (futile) upgrade attempt on this retry.
+          String name = field.getName();
+          if (name.startsWith(":") || isH2cUpgradeHeader(name, field.getValue())) {
+            return;
+          }
+          newHeaders.put(name, field.getValue());
+        });
+      }
+    }
+    ensureHostHeader(http11Request, uri);
+    Object useKeepAlive =
+        http11Request.getAttributes().get(JmeterRequestHeadersSupport.ATTR_USE_KEEPALIVE);
+    if (useKeepAlive instanceof Boolean) {
+      JmeterRequestHeadersSupport.prepareFromSampler(http11Request, (Boolean) useKeepAlive);
+    }
+    configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
+    if (originalRequest.getBody() != null) {
+      http11Request.body(originalRequest.getBody());
+    }
+    SslClientCertAliasSupport.copyFromRequest(originalRequest, http11Request);
+    return http11Request;
+  }
+
+  private static boolean isH2cUpgradeHeader(String name, String value) {
+    if (HttpHeader.UPGRADE.is(name) || HttpHeader.HTTP2_SETTINGS.is(name)) {
+      return true;
+    }
+    if (HttpHeader.CONNECTION.is(name) && value != null) {
+      String lower = value.toLowerCase(Locale.ROOT);
+      return lower.contains("upgrade") || lower.contains("http2-settings");
+    }
+    return false;
+  }
+
+  /** True if {@code request} carried an {@code Upgrade: h2c} header or attribute. */
+  private boolean wasH2cUpgradeAttempt(Request request) {
+    if (request == null) {
+      return false;
+    }
+    Object protocol = request.getAttributes().get(HttpUpgrader.PROTOCOL_ATTRIBUTE);
+    if ("h2c".equals(protocol)) {
+      return true;
+    }
+    HttpFields headers = request.getHeaders();
+    if (headers == null) {
+      return false;
+    }
+    String upgrade = headers.get(HttpHeader.UPGRADE);
+    return upgrade != null && upgrade.toLowerCase(Locale.ROOT).contains("h2c");
+  }
+
+  /**
+   * The server answered (no timeout/error) but never actually negotiated HTTP/2 despite our
+   * {@code Upgrade: h2c} attempt - e.g. it silently ignored the header, as a compliant HTTP/1.1
+   * server that doesn't support h2c is allowed to do. Retry once with a plain HTTP/1.1 request.
+   */
+  private boolean shouldRetryAfterFailedH2cUpgrade(Request request, ContentResponse response) {
+    if (!enableHttp1 || !http1UpgradeRequired || request == null || response == null) {
+      return false;
+    }
+    URI uri = request.getURI();
+    if (uri == null || !"http".equalsIgnoreCase(uri.getScheme())) {
+      return false;
+    }
+    if (Boolean.TRUE.equals(
+        request.getAttributes().get(ATTR_H2C_FALLBACK_ATTEMPTED))) {
+      return false;
+    }
+    if (!wasH2cUpgradeAttempt(request)) {
+      return false;
+    }
+    return response.getVersion() != HttpVersion.HTTP_2;
+  }
+
+  private void markCleartextHttp1Only(URI uri) {
+    if (!enableHttp1 || !http1OnlyCacheEnabled || http1OnlyCooldownMs <= 0 || uri == null) {
+      return;
+    }
+    if (!"http".equalsIgnoreCase(uri.getScheme())) {
+      return;
+    }
+    markHttp1OnlyOrigin(originKey(uri));
+  }
+
+  /**
+   * Retries a request that timed out or failed while attempting an h2c upgrade, as plain
+   * HTTP/1.1. Returns {@code null} (instead of throwing) when the failure isn't h2c-related, or
+   * when a fallback was already attempted for this request, so callers can fall through to their
+   * existing (non-h2c) handling.
+   */
+  private ContentResponse tryCleartextHttp11FallbackAfterH2cFailure(
+      Request request, HTTP2FutureResponseListener listener)
+      throws InterruptedException, TimeoutException, ExecutionException {
+    if (!enableHttp1 || request == null) {
+      return null;
+    }
+    URI uri = request.getURI();
+    if (uri == null || !"http".equalsIgnoreCase(uri.getScheme())
+        || !wasH2cUpgradeAttempt(request)) {
+      return null;
+    }
+    if (Boolean.TRUE.equals(
+        request.getAttributes().get(ATTR_H2C_FALLBACK_ATTEMPTED))) {
+      return null;
+    }
+    lowLevelDebug("Falling back to HTTP/1.1 after failed H2C upgrade for {}", uri);
+    markCleartextHttp1Only(uri);
+    return sendWithHTTP11Only(request, listener);
   }
 
   private ContentResponse sendWithH2cPriorKnowledge(Request originalRequest)
@@ -1437,9 +1526,9 @@ public class HTTP2JettyClient {
       }
       throw e;
     } catch (ExecutionException e) {
-      if (protocolErrorFallbackEnabled && enableHttp1
-          && ProtocolErrorException.isProtocolError(e)) {
-        LOG.warn("Protocol error during send(), retrying with HTTP/1.1 only");
+      Throwable cause = e.getCause();
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+        LOG.warn("Transport failure during send(), retrying with HTTP/1.1 only");
         return retryWithHTTP11Only(sampler, result);
       }
       throw e;
@@ -1583,6 +1672,14 @@ public class HTTP2JettyClient {
     } catch (TimeoutException e) {
       if (http1UpgradeRequired && "http".equalsIgnoreCase(uri.getScheme())) {
         try {
+          ContentResponse fallback = tryCleartextHttp11FallbackAfterH2cFailure(request, listener);
+          if (fallback != null) {
+            return fallback;
+          }
+        } catch (Exception fallbackException) {
+          LOG.error("HTTP/1.1 fallback after H2C timeout failed", fallbackException);
+        }
+        try {
           LOG.warn("H2C upgrade timed out; retrying with prior knowledge");
           return sendWithH2cPriorKnowledge(request);
         } catch (Exception retryException) {
@@ -1616,10 +1713,8 @@ public class HTTP2JettyClient {
           throw e;
         }
       }
-      if ((cause instanceof ProtocolErrorException
-          || ProtocolErrorException.isProtocolError(cause))
-          && protocolErrorFallbackEnabled) {
-        LOG.warn("HTTP/2 protocol_error detected in send()! Attempting fallback to HTTP/1.1");
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+        LOG.warn("Transport failure detected in send()! Attempting fallback to HTTP/1.1");
         LOG.warn("Error details: message='{}', exception={}",
             cause != null ? cause.getMessage() : e.getMessage(),
             cause != null ? cause.getClass().getName() : "unknown");
@@ -1836,6 +1931,17 @@ public class HTTP2JettyClient {
             response.getStatus(), response.getVersion(), elapsed, contentLength);
         int headerCount = response.getHeaders() != null ? response.getHeaders().size() : 0;
         lowLevelDebug("Response headers: {}", headerCount);
+        if (originalRequest != null
+            && shouldRetryAfterFailedH2cUpgrade(originalRequest, response)) {
+          lowLevelDebug("H2C upgrade did not negotiate HTTP/2; retrying with HTTP/1.1 for {}",
+              originalRequest.getURI());
+          markCleartextHttp1Only(originalRequest.getURI());
+          ContentResponse fallbackResponse = sendWithHTTP11Only(originalRequest, listener);
+          updateHttp1OnlyCache(originalRequest, fallbackResponse);
+          updateH2cCache(originalRequest, fallbackResponse);
+          updateAltSvcCache(originalRequest, fallbackResponse.getHeaders());
+          return fallbackResponse;
+        }
         if (originalRequest != null && response.getVersion() == HttpVersion.HTTP_3) {
           recordHttp3Success(originalRequest.getURI());
         }
@@ -1850,6 +1956,21 @@ public class HTTP2JettyClient {
       long endGet = System.currentTimeMillis();
       long elapsed = endGet - getStart;
       LOG.error("Request timeout after {}ms: {}", elapsed, e.getMessage());
+      if (originalRequest != null) {
+        try {
+          ContentResponse fallback =
+              tryCleartextHttp11FallbackAfterH2cFailure(originalRequest, listener);
+          if (fallback != null) {
+            updateHttp1OnlyCache(originalRequest, fallback);
+            updateH2cCache(originalRequest, fallback);
+            updateAltSvcCache(originalRequest, fallback.getHeaders());
+            return fallback;
+          }
+        } catch (Exception fallbackException) {
+          LOG.error("HTTP/1.1 fallback after H2C timeout in getContent() failed",
+              fallbackException);
+        }
+      }
       throw new TimeoutException("The request took more than " + elapsed
           + " milliseconds to complete");
     } catch (ExecutionException e) {
@@ -1881,10 +2002,8 @@ public class HTTP2JettyClient {
           }
         }
       }
-      if ((cause instanceof ProtocolErrorException
-          || ProtocolErrorException.isProtocolError(cause))
-          && protocolErrorFallbackEnabled) {
-        LOG.warn("HTTP/2 protocol_error detected in getContent()! "
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+        LOG.warn("Transport failure detected in getContent()! "
             + "Attempting fallback to HTTP/1.1");
         LOG.warn("Error details: message='{}', exception={}",
             cause != null ? cause.getMessage() : e.getMessage(),
@@ -2132,6 +2251,10 @@ public class HTTP2JettyClient {
 
   private HttpClient selectHttpClient(URI uri) {
     if (uri != null && "http".equalsIgnoreCase(uri.getScheme())) {
+      if (enableHttp1 && isHttp1Only(uri)) {
+        lowLevelDebug("HTTP/1.1-only cache hit for cleartext origin {}", originKey(uri));
+        return httpClientHttp1Only;
+      }
       if (!enableHttp2 && enableHttp1) {
         return httpClientHttp1Only;
       }
@@ -2379,21 +2502,32 @@ public class HTTP2JettyClient {
       return;
     }
     URI uri = request.getURI();
-    if (uri == null || !"https".equalsIgnoreCase(uri.getScheme())) {
+    if (uri == null) {
       return;
     }
     String origin = originKey(uri);
     HttpVersion version = response.getVersion();
-    if (version == HttpVersion.HTTP_1_1) {
-      Http1OnlyEntry entry = new Http1OnlyEntry();
-      entry.expiresAt = System.currentTimeMillis() + http1OnlyCooldownMs;
-      HTTP1_ONLY_CACHE.put(origin, entry);
-      lowLevelDebug("HTTP/1.1-only cache set for origin {} until {}", origin, entry.expiresAt);
-    } else if (version != null) {
-      if (HTTP1_ONLY_CACHE.remove(origin) != null) {
+    if ("https".equalsIgnoreCase(uri.getScheme())) {
+      if (version == HttpVersion.HTTP_1_1) {
+        markHttp1OnlyOrigin(origin);
+      } else if (version != null && HTTP1_ONLY_CACHE.remove(origin) != null) {
         lowLevelDebug("HTTP/1.1-only cache cleared for origin {}", origin);
       }
+      return;
     }
+    // Cleartext origin that attempted an h2c upgrade but didn't get HTTP/2 back: cache it as
+    // HTTP/1.1-only too, so later requests to the same origin skip the futile upgrade attempt.
+    if ("http".equalsIgnoreCase(uri.getScheme()) && wasH2cUpgradeAttempt(request)
+        && version != HttpVersion.HTTP_2) {
+      markHttp1OnlyOrigin(origin);
+    }
+  }
+
+  private void markHttp1OnlyOrigin(String origin) {
+    Http1OnlyEntry entry = new Http1OnlyEntry();
+    entry.expiresAt = System.currentTimeMillis() + http1OnlyCooldownMs;
+    HTTP1_ONLY_CACHE.put(origin, entry);
+    lowLevelDebug("HTTP/1.1-only cache set for origin {} until {}", origin, entry.expiresAt);
   }
 
   private void updateH2cCache(Request request, Response response) {
@@ -2455,6 +2589,31 @@ public class HTTP2JettyClient {
       current = current.getCause();
     }
     return null;
+  }
+
+  /**
+   * Unifies the two failure modes that warrant an HTTP/1.1 fallback: an explicit HTTP/2
+   * {@code protocol_error}, and a {@link ClosedChannelException} anywhere in the cause chain -
+   * some servers drop the connection outright instead of returning a clean protocol error when
+   * they don't like the request (e.g. a failed h2c upgrade attempt).
+   */
+  private boolean shouldFallbackToHttp11AfterTransportFailure(Throwable cause,
+      Throwable wrapped) {
+    if (!protocolErrorFallbackEnabled || !enableHttp1) {
+      return false;
+    }
+    return ProtocolErrorException.isProtocolError(wrapped)
+        || ProtocolErrorException.isProtocolError(cause)
+        || isClosedChannelFailure(cause != null ? cause : wrapped);
+  }
+
+  private static boolean isClosedChannelFailure(Throwable throwable) {
+    for (Throwable current = throwable; current != null; current = current.getCause()) {
+      if (current instanceof ClosedChannelException) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private ContentResponse retryAfterGoAway(Request originalRequest)
@@ -3018,7 +3177,7 @@ public class HTTP2JettyClient {
     // 1. The connection is already HTTP/2 (negotiated via ALPN)
     // 2. Upgrade headers are for cleartext HTTP, not HTTPS
     // 3. It violates the HTTP/2 protocol (RFC 7540)
-    if (http1UpgradeRequired && !"https".equalsIgnoreCase(url.getProtocol())
+    if (http1UpgradeRequired && enableHttp2 && !"https".equalsIgnoreCase(url.getProtocol())
         && !shouldUseH2cPriorKnowledge(request.getURI())) {
       Mutable headers = ((Mutable) request.getHeaders());
       addHeaderIfMissing(HttpHeader.UPGRADE, "h2c", headers);
@@ -3190,7 +3349,7 @@ public class HTTP2JettyClient {
     // For HTTPS connections, we assume HTTP/2 if ALPN negotiated it
     // For HTTP connections, we check if upgrade headers are present
     boolean isHTTP2 = "https".equalsIgnoreCase(request.getURI().getScheme())
-        || (http1UpgradeRequired && headers.contains(HttpHeader.UPGRADE));
+        || (enableHttp2 && http1UpgradeRequired && headers.contains(HttpHeader.UPGRADE));
 
     if (isHTTP2) {
       // HTTP/2 does not support Connection header except for upgrade (which we handle separately)
