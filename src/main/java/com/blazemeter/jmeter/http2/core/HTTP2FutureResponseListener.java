@@ -506,7 +506,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
         }
       }
       Object useKeepAlive =
-          http11Request.getAttributes().get(JmeterHttpClientAttributes.USE_KEEPALIVE);
+          http11Request.getAttributes().get(JmeterRequestHeadersSupport.ATTR_USE_KEEPALIVE);
       if (useKeepAlive instanceof Boolean) {
         JmeterRequestHeadersSupport.prepareFromSampler(http11Request, (Boolean) useKeepAlive);
       }

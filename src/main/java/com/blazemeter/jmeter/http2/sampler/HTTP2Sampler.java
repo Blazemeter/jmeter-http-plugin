@@ -823,6 +823,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       //': ' is used by JMeter to fill-in requestHeaders, see getConnectionHeaders
       final String userAgentPrefix = USER_AGENT + ": ";
       int valueStart = index + userAgentPrefix.length();
+      // '\n' is used by JMeter to fill-in requestHeaders, see getConnectionHeaders. When
+      // User-Agent is the last header, there's no trailing '\n' and indexOf returns -1; fall
+      // back to the end of the string instead of feeding -1 into substring().
       int lineEnd = res.indexOf('\n', valueStart);
       if (lineEnd < 0) {
         lineEnd = res.length();

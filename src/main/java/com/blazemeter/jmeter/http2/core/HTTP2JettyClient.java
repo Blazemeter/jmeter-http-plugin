@@ -152,6 +152,7 @@ public class HTTP2JettyClient {
   private static final String DEFAULT_FILE_MIME_TYPE = "application/octet-stream";
   private static final String ALT_SVC_HEADER = "alt-svc";
   private static final String ATTR_HTTP3_ATTEMPTED = "bzm.http3.attempted";
+  private static final String ATTR_H2C_FALLBACK_ATTEMPTED = "bzm.h2cFallbackAttempted";
   private static final String ATTR_ORIGIN_KEY = "bzm.http3.origin";
   private static final String ATTR_REQUEST_HEADERS_SERIALIZED = "bzm.request.headers.serialized";
   private static final String PROP_SKIP_REDUNDANT_MANUAL_DECODE =
@@ -1208,13 +1209,15 @@ public class HTTP2JettyClient {
         .timeout(requestTimeout, TimeUnit.MILLISECONDS)
         .followRedirects(originalRequest.isFollowRedirects());
     JmeterRequestHeadersSupport.copySamplerHeaderState(originalRequest, http11Request);
-    http11Request.attribute(JmeterHttpClientAttributes.H2C_FALLBACK_ATTEMPTED, Boolean.TRUE);
+    http11Request.attribute(ATTR_H2C_FALLBACK_ATTEMPTED, Boolean.TRUE);
     if (originalRequest.getHeaders() != null) {
       HttpFields originalHeaders = originalRequest.getHeaders();
       HttpFields requestHeaders = http11Request.getHeaders();
       if (requestHeaders instanceof HttpFields.Mutable) {
         HttpFields.Mutable newHeaders = (HttpFields.Mutable) requestHeaders;
         originalHeaders.forEach(field -> {
+          // Skip HTTP/2 pseudo-headers and h2c upgrade headers - neither exists in HTTP/1.1,
+          // and re-sending them would trigger another (futile) upgrade attempt on this retry.
           String name = field.getName();
           if (name.startsWith(":") || isH2cUpgradeHeader(name, field.getValue())) {
             return;
@@ -1225,7 +1228,7 @@ public class HTTP2JettyClient {
     }
     ensureHostHeader(http11Request, uri);
     Object useKeepAlive =
-        http11Request.getAttributes().get(JmeterHttpClientAttributes.USE_KEEPALIVE);
+        http11Request.getAttributes().get(JmeterRequestHeadersSupport.ATTR_USE_KEEPALIVE);
     if (useKeepAlive instanceof Boolean) {
       JmeterRequestHeadersSupport.prepareFromSampler(http11Request, (Boolean) useKeepAlive);
     }
@@ -1248,6 +1251,7 @@ public class HTTP2JettyClient {
     return false;
   }
 
+  /** True if {@code request} carried an {@code Upgrade: h2c} header or attribute. */
   private boolean wasH2cUpgradeAttempt(Request request) {
     if (request == null) {
       return false;
@@ -1264,6 +1268,11 @@ public class HTTP2JettyClient {
     return upgrade != null && upgrade.toLowerCase(Locale.ROOT).contains("h2c");
   }
 
+  /**
+   * The server answered (no timeout/error) but never actually negotiated HTTP/2 despite our
+   * {@code Upgrade: h2c} attempt - e.g. it silently ignored the header, as a compliant HTTP/1.1
+   * server that doesn't support h2c is allowed to do. Retry once with a plain HTTP/1.1 request.
+   */
   private boolean shouldRetryAfterFailedH2cUpgrade(Request request, ContentResponse response) {
     if (!enableHttp1 || !http1UpgradeRequired || request == null || response == null) {
       return false;
@@ -1273,7 +1282,7 @@ public class HTTP2JettyClient {
       return false;
     }
     if (Boolean.TRUE.equals(
-        request.getAttributes().get(JmeterHttpClientAttributes.H2C_FALLBACK_ATTEMPTED))) {
+        request.getAttributes().get(ATTR_H2C_FALLBACK_ATTEMPTED))) {
       return false;
     }
     if (!wasH2cUpgradeAttempt(request)) {
@@ -1292,6 +1301,12 @@ public class HTTP2JettyClient {
     markHttp1OnlyOrigin(originKey(uri));
   }
 
+  /**
+   * Retries a request that timed out or failed while attempting an h2c upgrade, as plain
+   * HTTP/1.1. Returns {@code null} (instead of throwing) when the failure isn't h2c-related, or
+   * when a fallback was already attempted for this request, so callers can fall through to their
+   * existing (non-h2c) handling.
+   */
   private ContentResponse tryCleartextHttp11FallbackAfterH2cFailure(
       Request request, HTTP2FutureResponseListener listener)
       throws InterruptedException, TimeoutException, ExecutionException {
@@ -1304,7 +1319,7 @@ public class HTTP2JettyClient {
       return null;
     }
     if (Boolean.TRUE.equals(
-        request.getAttributes().get(JmeterHttpClientAttributes.H2C_FALLBACK_ATTEMPTED))) {
+        request.getAttributes().get(ATTR_H2C_FALLBACK_ATTEMPTED))) {
       return null;
     }
     lowLevelDebug("Falling back to HTTP/1.1 after failed H2C upgrade for {}", uri);
@@ -2537,6 +2552,8 @@ public class HTTP2JettyClient {
       }
       return;
     }
+    // Cleartext origin that attempted an h2c upgrade but didn't get HTTP/2 back: cache it as
+    // HTTP/1.1-only too, so later requests to the same origin skip the futile upgrade attempt.
     if ("http".equalsIgnoreCase(uri.getScheme()) && wasH2cUpgradeAttempt(request)
         && version != HttpVersion.HTTP_2) {
       markHttp1OnlyOrigin(origin);
@@ -2611,6 +2628,12 @@ public class HTTP2JettyClient {
     return null;
   }
 
+  /**
+   * Unifies the two failure modes that warrant an HTTP/1.1 fallback: an explicit HTTP/2
+   * {@code protocol_error}, and a {@link ClosedChannelException} anywhere in the cause chain -
+   * some servers drop the connection outright instead of returning a clean protocol error when
+   * they don't like the request (e.g. a failed h2c upgrade attempt).
+   */
   private boolean shouldFallbackToHttp11AfterTransportFailure(Throwable cause,
       Throwable wrapped) {
     if (!protocolErrorFallbackEnabled || !enableHttp1) {
