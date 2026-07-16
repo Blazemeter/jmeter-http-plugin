@@ -37,6 +37,9 @@ public class HttpKeepAliveSampleHeadersTest {
       executor.awaitTermination(5, TimeUnit.SECONDS);
       executor = null;
     }
+    JMeterUtils.getJMeterProperties().remove("blazemeter.http.enableHttp2");
+    JMeterUtils.getJMeterProperties().remove("blazemeter.http.enableHttp3");
+    JMeterUtils.getJMeterProperties().remove("blazemeter.http.profile");
   }
 
   @Test

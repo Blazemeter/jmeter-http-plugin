@@ -1006,6 +1006,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     JMeterUtils.setProperty("cache_manager.cached_resource_mode", "RETURN_CUSTOM_STATUS");
     JMeterUtils.setProperty("RETURN_CUSTOM_STATUS.message", message);
     JMeterUtils.setProperty("RETURN_CUSTOM_STATUS.code", responseCode);
+    JmeterCachedResourceModeSupport.refreshSnapshotFromProperties();
     configureCacheManagerToSampler(true, false);
     HTTPSampleResult firstRequestExpected = buildResult(true, Code.OK,
       hostHeader(), null, null, createURL(SERVER_PATH_200_EMBEDDED), HTTPConstants.GET);
@@ -1036,6 +1037,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String message = "message";
     JMeterUtils.setProperty("cache_manager.cached_resource_mode", "RETURN_200_CACHE");
     JMeterUtils.setProperty("RETURN_200_CACHE.message", message);
+    JmeterCachedResourceModeSupport.refreshSnapshotFromProperties();
     configureCacheManagerToSampler(true, false);
     // First request must connect to the server
     HTTPSampleResult expected = buildResult(true, Code.OK,
