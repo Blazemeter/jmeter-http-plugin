@@ -1170,15 +1170,16 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String dashDash = "--";
     // Set body response for Arguments
     args.forEach(httpArgument -> {
-      Mutable headerParam = HttpFields.build()
-          .add("Content-Disposition", "form-data; name=\"" + httpArgument.getEncodedName() + "\"")
-          .add(HttpHeader.CONTENT_TYPE, "text/plain; charset=utf-8")
-          .add("Content-Transfer-Encoding", "8bit");
+      // Canonical HC4 header casing (not Jetty's HttpFields, which lowercases names) and an
+      // explicit Content-Transfer-Encoding, matching HTTP2JettyClient#formatMultipartPartHeaders.
+      String headerParam = "Content-Disposition: form-data; name=\""
+          + httpArgument.getEncodedName() + "\"" + newLine
+          + "Content-Type: text/plain; charset=utf-8" + newLine
+          + "Content-Transfer-Encoding: 8bit" + newLine;
       try {
-        String headerParamWithBoundary = boundary + newLine + headerParam.toString();
+        String headerParamWithBoundary = boundary + newLine + headerParam;
         output.write(headerParamWithBoundary.getBytes(StandardCharsets.US_ASCII));
-        output.write(newLine.getBytes(StandardCharsets.US_ASCII));
-        output.write(httpArgument.getEncodedValue().getBytes(StandardCharsets.UTF_8));
+        output.write(httpArgument.getValue().getBytes(StandardCharsets.UTF_8));
         output.write(newLine.getBytes(StandardCharsets.US_ASCII));
       } catch (IOException e) {
         e.printStackTrace();
@@ -1188,18 +1189,16 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     // Set body response for Files
     files.forEach(file -> {
       String fileName = Paths.get((file.getPath())).getFileName().toString();
-      Mutable headerFile = HttpFields.build()
-          .add("Content-Disposition", "form-data; name=\"" + file.getParamName()
-              + "\"; " + "filename=\"" + fileName + "\"")
-          .add(HttpHeader.CONTENT_TYPE, file.getMimeType())
-          .add("Content-Transfer-Encoding", "binary");
+      String headerFile = "Content-Disposition: form-data; name=\"" + file.getParamName()
+          + "\"; filename=\"" + fileName + "\"" + newLine
+          + "Content-Type: " + file.getMimeType() + newLine
+          + "Content-Transfer-Encoding: binary" + newLine;
       try {
         String filePath = file.getPath();
         InputStream inputStream = Files.newInputStream(Paths.get(filePath));
         byte[] data = sampler.readResponse(expected, inputStream, 0);
-        String headerFileWithBoundary = boundary + newLine + headerFile.toString();
+        String headerFileWithBoundary = boundary + newLine + headerFile;
         output.write(headerFileWithBoundary.getBytes(StandardCharsets.US_ASCII));
-        output.write(newLine.getBytes(StandardCharsets.US_ASCII));
         output.write(data);
         output.write(newLine.getBytes(StandardCharsets.US_ASCII));
       } catch (IOException e) {

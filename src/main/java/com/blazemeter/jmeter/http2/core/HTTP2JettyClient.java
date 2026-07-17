@@ -1428,6 +1428,8 @@ public class HTTP2JettyClient {
     if (cookieManager != null) {
       result.setCookies(buildCookies(request, url, cookieManager));
     } else {
+      // HttpClient4 reports whatever Cookie header actually went out, even when it wasn't
+      // built by a CookieManager (e.g. set directly via HeaderManager).
       HttpFields headers = request.getHeaders();
       if (headers != null) {
         String cookieHeader = headers.get(HttpHeader.COOKIE);
@@ -1474,6 +1476,10 @@ public class HTTP2JettyClient {
                                    JettyCacheManager cacheManager)
       throws IOException {
     http1UpgradeRequired = contentResponse.getVersion() != HttpVersion.HTTP_2;
+    // When autoRedirects silently follows a redirect chain at the transport layer, contentResponse
+    // carries the LAST request Jetty actually sent - not the original one passed in here. Report
+    // headers/sentBytes for that effective request, matching what HttpClient4 shows for the same
+    // scenario, instead of the pre-redirect request's (possibly different host/method/headers).
     Request effectiveRequest = contentResponse.getRequest() != null
         ? contentResponse.getRequest()
         : request;
@@ -3899,8 +3905,6 @@ public class HTTP2JettyClient {
       String fileName = resolvedFile.getName();
       String mimeTypeFile = extractFileMimeType(hasContentTypeHeader, file);
 
-      // Build headers using HttpFields to match the format expected by tests
-      // The test uses HttpFields.build().toString() which has a specific format
       String partHeaders = formatMultipartPartHeaders(
           "form-data; name=\"" + file.getParamName() + "\"; filename=\"" + fileName + "\"",
           mimeTypeFile, "binary");
