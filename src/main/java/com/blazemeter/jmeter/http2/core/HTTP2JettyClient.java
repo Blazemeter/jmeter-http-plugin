@@ -3677,6 +3677,11 @@ public class HTTP2JettyClient {
     return !contentEncoding.isEmpty() ? Charset.forName(contentEncoding) : defaultCharset;
   }
 
+  /** HttpClient4 writes raw argument values in multipart parts (not URL-encoded). */
+  private static String multipartArgumentValue(HTTPArgument arg) {
+    return arg.getValue();
+  }
+
   private String buildArgumentPartRequestBody(HTTPArgument arg, Charset contentCharset,
                                               String contentEncoding, String boundary)
       throws UnsupportedEncodingException {
@@ -3684,18 +3689,27 @@ public class HTTP2JettyClient {
     String contentType = arg.getContentType() + "; charset=" + contentCharset.name();
     String encoding = StringUtils.isNotBlank(contentEncoding) ? contentEncoding : "8bit";
     return buildPartBody(boundary, disposition, contentType, encoding,
-        arg.getEncodedValue(contentCharset.name()));
+        multipartArgumentValue(arg));
   }
 
   private String buildPartBody(String boundary, String disposition, String contentType,
                                String encoding, String value) {
-    return MULTI_PART_SEPARATOR + boundary + LINE_SEPARATOR +
-        HttpFields.build()
-            .add("Content-Disposition", "form-data; " + disposition)
-            .add(HttpHeader.CONTENT_TYPE.toString(), contentType)
-            .add("Content-Transfer-Encoding", encoding)
-            .toString()
+    return MULTI_PART_SEPARATOR + boundary + LINE_SEPARATOR
+        + formatMultipartPartHeaders("form-data; " + disposition, contentType, encoding)
         + value + LINE_SEPARATOR;
+  }
+
+  /** HC4 canonical header casing; Jetty {@link HttpFields#toString()} lowercases names. */
+  private String formatMultipartPartHeaders(String disposition, String contentType,
+                                            String transferEncoding) {
+    StringBuilder headers = new StringBuilder();
+    headers.append("Content-Disposition: ").append(disposition).append(LINE_SEPARATOR);
+    headers.append("Content-Type: ").append(contentType).append(LINE_SEPARATOR);
+    if (transferEncoding != null && !transferEncoding.isEmpty()) {
+      headers.append("Content-Transfer-Encoding: ").append(transferEncoding)
+          .append(LINE_SEPARATOR);
+    }
+    return headers.toString();
   }
 
   private String buildFilePartRequestBody(HTTPFileArg file, String fileName, String boundary) {
@@ -3746,14 +3760,12 @@ public class HTTP2JettyClient {
         argContentType = argContentType + "; charset="
             + contentCharset.name().toLowerCase(Locale.ROOT);
 
-        Mutable partHeaders = HttpFields.build()
-            .add("Content-Disposition", "form-data; name=\"" + arg.getEncodedName() + "\"")
-            .add(HttpHeader.CONTENT_TYPE, argContentType);
+        String partHeaders = formatMultipartPartHeaders(
+            "form-data; name=\"" + arg.getEncodedName() + "\"", argContentType, "8bit");
 
         output.write(boundaryLine.getBytes(StandardCharsets.US_ASCII));
-        output.write(partHeaders.toString().getBytes(StandardCharsets.US_ASCII));
-        output.write(newLine.getBytes(StandardCharsets.US_ASCII));
-        String argValue = arg.getEncodedValue(contentCharset.name());
+        output.write(partHeaders.getBytes(StandardCharsets.US_ASCII));
+        String argValue = multipartArgumentValue(arg);
         output.write(argValue.getBytes(contentCharset));
         output.write(newLine.getBytes(StandardCharsets.US_ASCII));
       }
@@ -3767,16 +3779,12 @@ public class HTTP2JettyClient {
       String fileName = Paths.get(file.getPath()).getFileName().toString();
       String mimeTypeFile = extractFileMimeType(hasContentTypeHeader, file);
 
-      // Build headers using HttpFields to match the format expected by tests
-      // The test uses HttpFields.build().toString() which has a specific format
-      Mutable partHeaders = HttpFields.build()
-          .add("Content-Disposition",
-              "form-data; name=\"" + file.getParamName() + "\"; filename=\"" + fileName + "\"")
-          .add(HttpHeader.CONTENT_TYPE, mimeTypeFile);
+      String partHeaders = formatMultipartPartHeaders(
+          "form-data; name=\"" + file.getParamName() + "\"; filename=\"" + fileName + "\"",
+          mimeTypeFile, "binary");
 
       output.write(boundaryLine.getBytes(StandardCharsets.US_ASCII));
-      output.write(partHeaders.toString().getBytes(StandardCharsets.US_ASCII));
-      output.write(newLine.getBytes(StandardCharsets.US_ASCII));
+      output.write(partHeaders.getBytes(StandardCharsets.US_ASCII));
 
       // Read and write file content
       try (InputStream fileStream = Files.newInputStream(Paths.get(file.getPath()))) {
