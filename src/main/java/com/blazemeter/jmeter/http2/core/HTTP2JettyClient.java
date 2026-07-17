@@ -157,6 +157,7 @@ public class HTTP2JettyClient {
   private static final String ALT_SVC_HEADER = "alt-svc";
   private static final String ATTR_HTTP3_ATTEMPTED = "bzm.http3.attempted";
   private static final String ATTR_H2C_FALLBACK_ATTEMPTED = "bzm.h2cFallbackAttempted";
+  private static final String ATTR_SKIP_H2C_UPGRADE = "bzm.skipH2cUpgrade";
   private static final String ATTR_ORIGIN_KEY = "bzm.http3.origin";
   private static final String ATTR_REQUEST_HEADERS_SERIALIZED = "bzm.request.headers.serialized";
   private static final String PROP_SKIP_REDUNDANT_MANUAL_DECODE =
@@ -1166,7 +1167,7 @@ public class HTTP2JettyClient {
     configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
 
     // Copy body if present
-    setBody(http11Request, sampler, result);
+    setBody(http11Request, sampler, result, false);
     JmeterRequestHeadersSupport.prepareFromSampler(http11Request, sampler.getUseKeepAlive());
 
     // Send request
@@ -1406,6 +1407,14 @@ public class HTTP2JettyClient {
                                     HTTP2Sampler sampler,
                                     HTTPSampleResult result,
                                     HttpClient client) throws IOException {
+    samplePrepareRequest(request, sampler, result, client, false);
+  }
+
+  private void samplePrepareRequest(Request request,
+                                    HTTP2Sampler sampler,
+                                    HTTPSampleResult result,
+                                    HttpClient client,
+                                    boolean areFollowingRedirect) throws IOException {
 
     URL url = result.getURL();
     lowLevelDebug("Preparing request: URL={}, method={}", url, result.getHTTPMethod());
@@ -1413,6 +1422,12 @@ public class HTTP2JettyClient {
     request.followRedirects(sampler.getAutoRedirects());
     String method = result.getHTTPMethod();
     request.method(method);
+    if (shouldAttachRequestBody(sampler, result, areFollowingRedirect)) {
+      // The h2c Upgrade dance sends this request as plain HTTP/1.1 first; attaching a body
+      // to it works but isn't well-supported across servers, so skip the upgrade attempt
+      // entirely for bodied cleartext requests (see resolveClientForRequest).
+      request.attribute(ATTR_SKIP_H2C_UPGRADE, Boolean.TRUE);
+    }
     setHeaders(request, url, sampler.getHeaderManager());
     ensureHostHeader(request, url);
     addPreemptiveAuthorizationHeader(request, url, sampler.getAuthManager());
@@ -1451,7 +1466,7 @@ public class HTTP2JettyClient {
     }
     result.sampleStart();
 
-    setBody(request, sampler, result);
+    setBody(request, sampler, result, areFollowingRedirect);
     JmeterRequestHeadersSupport.prepareFromSampler(request, sampler.getUseKeepAlive());
     initializeSentBytes(result, request);
 
@@ -1542,7 +1557,7 @@ public class HTTP2JettyClient {
     RequestContext context = buildRequestContext(result, resolveClientForRequest(sampler, result));
     Request request = context.request;
 
-    samplePrepareRequest(request, sampler, result, context.client);
+    samplePrepareRequest(request, sampler, result, context.client, areFollowingRedirect);
 
     JettyCacheManager cacheManager =
         JettyCacheManager.fromCacheManager(sampler.getCacheManager());
@@ -3184,7 +3199,13 @@ public class HTTP2JettyClient {
 
   private HttpClient resolveClientForRequest(HTTP2Sampler sampler, HTTPSampleResult result)
       throws URISyntaxException {
-    return selectHttpClient(result.getURL().toURI());
+    URI uri = result.getURL().toURI();
+    if ("http".equalsIgnoreCase(uri.getScheme())
+        && shouldAttachRequestBody(sampler, result, false)) {
+      lowLevelDebug("Cleartext request with body; using HTTP/1.1-only client for {}", uri);
+      return httpClientHttp1Only;
+    }
+    return selectHttpClient(uri);
   }
 
   private boolean requestAdvertisesEncoding(HTTP2Sampler sampler, String encoding) {
@@ -3271,7 +3292,8 @@ public class HTTP2JettyClient {
     // 2. Upgrade headers are for cleartext HTTP, not HTTPS
     // 3. It violates the HTTP/2 protocol (RFC 7540)
     if (http1UpgradeRequired && enableHttp2 && !"https".equalsIgnoreCase(url.getProtocol())
-        && !shouldUseH2cPriorKnowledge(request.getURI())) {
+        && !shouldUseH2cPriorKnowledge(request.getURI())
+        && !Boolean.TRUE.equals(request.getAttributes().get(ATTR_SKIP_H2C_UPGRADE))) {
       Mutable headers = ((Mutable) request.getHeaders());
       addHeaderIfMissing(HttpHeader.UPGRADE, "h2c", headers);
       addHeaderIfMissing(HttpHeader.HTTP2_SETTINGS, buildH2cSettingsHeaderValue(), headers);
@@ -3558,13 +3580,18 @@ public class HTTP2JettyClient {
     }
   }
 
-  private void setBody(Request request, HTTP2Sampler sampler, HTTPSampleResult result)
+  private void setBody(Request request, HTTP2Sampler sampler, HTTPSampleResult result,
+                       boolean areFollowingRedirect)
       throws IOException {
+    if (!shouldAttachRequestBody(sampler, result, areFollowingRedirect)) {
+      result.setQueryString("");
+      return;
+    }
     String contentEncoding = sampler.getContentEncoding();
     String contentTypeHeader =
         request.getHeaders() != null ? request.getHeaders().get(HTTPConstants.HEADER_CONTENT_TYPE)
             : null;
-    boolean hasContentTypeHeader = contentTypeHeader != null && contentTypeHeader.isEmpty();
+    boolean hasContentTypeHeader = StringUtils.isNotBlank(contentTypeHeader);
     StringBuilder postBody = new StringBuilder();
     if (sampler.getUseMultipart()) {
       // In Jetty 12, MultiPartRequestContent API has changed significantly
@@ -3637,44 +3664,56 @@ public class HTTP2JettyClient {
         request.body(requestContent);
         postBody.append("<actual file content, not shown here>");
       } else {
-        if (!hasContentTypeHeader && ADD_CONTENT_TYPE_TO_POST_IF_MISSING) {
-          HttpFields headers = request.getHeaders();
-          if (headers instanceof HttpFields.Mutable) {
-            ((HttpFields.Mutable) headers).put(HTTPConstants.HEADER_CONTENT_TYPE,
-                HTTPConstants.APPLICATION_X_WWW_FORM_URLENCODED);
-          }
-        }
         Charset contentCharset = buildCharsetOrDefault(contentEncoding, StandardCharsets.UTF_8);
         if (sampler.getSendParameterValuesAsPostBody()) {
+          if (!hasContentTypeHeader) {
+            HttpFields headers = request.getHeaders();
+            if (headers instanceof HttpFields.Mutable) {
+              ((HttpFields.Mutable) headers).put(HTTPConstants.HEADER_CONTENT_TYPE,
+                  "text/plain; charset=" + contentCharset.name());
+            }
+          }
           for (JMeterProperty jMeterProperty : sampler.getArguments()) {
             HTTPArgument arg = (HTTPArgument) jMeterProperty.getObjectValue();
             postBody.append(arg.getEncodedValue(contentCharset.name()));
           }
+          String bodyContentType = request.getHeaders() != null
+              ? request.getHeaders().get(HTTPConstants.HEADER_CONTENT_TYPE)
+              : null;
           // In Jetty 12, StringRequestContent implements Request.Content directly
           Request.Content requestContent =
-              new StringRequestContent(contentTypeHeader, postBody.toString(),
-                  contentCharset);
+              new StringRequestContent(bodyContentType, postBody.toString(), contentCharset);
           request.body(requestContent);
-        } else if (isMethodWithBody(sampler.getMethod())) {
-          Fields fields = new Fields();
-          for (JMeterProperty p : sampler.getArguments()) {
-            HTTPArgument arg = (HTTPArgument) p.getObjectValue();
-            String parameterName = arg.getName();
-            if (!arg.isSkippable(parameterName)) {
-              String parameterValue = arg.getValue();
-              if (!arg.isAlwaysEncoded()) {
-                // The FormRequestContent always urlencodes both name and value, in this case the
-                // value is already encoded by the user so is needed to decode the value now, so
-                // that when the httpclient encodes it, we end up with the same value as the user
-                // had entered.
-                parameterName = URLDecoder.decode(parameterName, contentCharset.name());
-                parameterValue = URLDecoder.decode(parameterValue, contentCharset.name());
-              }
-              fields.add(parameterName, parameterValue);
+        } else {
+          if (!hasContentTypeHeader && ADD_CONTENT_TYPE_TO_POST_IF_MISSING
+              && isMethodWithBody(sampler.getMethod())) {
+            HttpFields headers = request.getHeaders();
+            if (headers instanceof HttpFields.Mutable) {
+              ((HttpFields.Mutable) headers).put(HTTPConstants.HEADER_CONTENT_TYPE,
+                  HTTPConstants.APPLICATION_X_WWW_FORM_URLENCODED);
             }
           }
-          postBody.append(FormRequestContent.convert(fields));
-          request.body(new FormRequestContent(fields, contentCharset));
+          if (isMethodWithBody(sampler.getMethod())) {
+            Fields fields = new Fields();
+            for (JMeterProperty p : sampler.getArguments()) {
+              HTTPArgument arg = (HTTPArgument) p.getObjectValue();
+              String parameterName = arg.getName();
+              if (!arg.isSkippable(parameterName)) {
+                String parameterValue = arg.getValue();
+                if (!arg.isAlwaysEncoded()) {
+                  // The FormRequestContent always urlencodes both name and value, in this case
+                  // the value is already encoded by the user so is needed to decode the value
+                  // now, so that when the httpclient encodes it, we end up with the same value
+                  // as the user had entered.
+                  parameterName = URLDecoder.decode(parameterName, contentCharset.name());
+                  parameterValue = URLDecoder.decode(parameterValue, contentCharset.name());
+                }
+                fields.add(parameterName, parameterValue);
+              }
+            }
+            postBody.append(FormRequestContent.convert(fields));
+            request.body(new FormRequestContent(fields, contentCharset));
+          }
         }
       }
     }
@@ -3889,6 +3928,29 @@ public class HTTP2JettyClient {
 
   private boolean isMethodWithBody(String method) {
     return METHODS_WITH_BODY.contains(method);
+  }
+
+  /**
+   * Matches HttpClient4: entities are only attached for POST/PUT/PATCH, or GET/DELETE when
+   * {@code postBodyRaw} is enabled ({@code HttpGetWithEntity}).
+   */
+  private boolean shouldAttachRequestBody(HTTP2Sampler sampler, HTTPSampleResult result,
+                                          boolean areFollowingRedirect) {
+    String method = resolveRequestMethod(sampler, result);
+    if (areFollowingRedirect && !isMethodWithBody(method)) {
+      return false;
+    }
+    if (isMethodWithBody(method)) {
+      return true;
+    }
+    return sampler.getSendParameterValuesAsPostBody();
+  }
+
+  private String resolveRequestMethod(HTTP2Sampler sampler, HTTPSampleResult result) {
+    if (result != null && StringUtils.isNotBlank(result.getHTTPMethod())) {
+      return result.getHTTPMethod();
+    }
+    return sampler.getMethod();
   }
 
   private boolean isSupportedMethod(String method) {
