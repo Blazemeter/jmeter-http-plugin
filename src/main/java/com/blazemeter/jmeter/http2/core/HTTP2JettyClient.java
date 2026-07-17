@@ -19,6 +19,7 @@ import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.net.URLConnection;
 import java.net.URLDecoder;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
@@ -142,6 +143,11 @@ public class HTTP2JettyClient {
   private static final Path ALPN_DEBUG_LOG_PATH = resolveAlpnLogPath();
   private static final boolean ADD_CONTENT_TYPE_TO_POST_IF_MISSING = JMeterUtils.getPropDefault(
       "http.post_add_content_type_if_missing", false);
+  // Matches HTTPFileImpl: caps stored response data for file:// samples, while sampleEnd's
+  // bodySize still reflects the true total bytes read.
+  private static final int MAX_FILE_SAMPLE_BYTES_TO_STORE = JMeterUtils.getPropDefault(
+      "httpsampler.max_bytes_to_store_per_request", 10 * 1024 * 1024);
+  private static final int FILE_SAMPLE_BUFFER_SIZE = 4096;
   private static final Pattern PORT_PATTERN = Pattern.compile("\\d+");
   private static final String MULTI_PART_SEPARATOR = "--";
   private static final String LINE_SEPARATOR = "\r\n";
@@ -1524,6 +1530,11 @@ public class HTTP2JettyClient {
     lowLevelDebug("=== HTTP2JettyClient.sample() called ===");
     lowLevelDebug("Method: {}, URL: {}", result.getHTTPMethod(), result.getURL());
 
+    URL sampleUrl = result.getURL();
+    if (sampleUrl != null && "file".equalsIgnoreCase(sampleUrl.getProtocol())) {
+      return sampleLocalFile(sampler, result, sampleUrl, areFollowingRedirect, depth);
+    }
+
     errorWhenNotSupportedMethod(result.getHTTPMethod());
     setAuthManager(sampler);
     RequestContext context = buildRequestContext(result, resolveClientForRequest(sampler, result));
@@ -1563,6 +1574,55 @@ public class HTTP2JettyClient {
 
     postContentResponse(sampler, request, result, contentResponse, cacheManager);
     result.setEndTime(listener.getResponseEnd());
+
+    resetSamplerDataBeforeResultProcessing(result);
+    return sampler.resultProcessing(areFollowingRedirect, depth, result);
+  }
+
+  /**
+   * Matches HttpClient4's {@code HTTPFileImpl}: {@code file://} samples always use GET, open the
+   * URL directly (Java's built-in {@code file} URL handler - relative paths resolve against the
+   * JVM's working directory, not via {@link org.apache.jmeter.services.FileServer}), and always
+   * report {@code text/html} as the content type regardless of the file's actual type, since this
+   * exists to test the HTML embedded-resource parser against local fixtures, not to serve
+   * arbitrary static files.
+   */
+  private HTTPSampleResult sampleLocalFile(HTTP2Sampler sampler, HTTPSampleResult result, URL url,
+                                           boolean areFollowingRedirect, int depth)
+      throws Exception {
+    result.setHTTPMethod(HTTPConstants.GET);
+    result.setURL(url);
+    result.setSampleLabel(url.toString());
+    result.sampleStart();
+
+    ByteArrayOutputStream output = new ByteArrayOutputStream(FILE_SAMPLE_BUFFER_SIZE);
+    long totalBytes = 0;
+    URLConnection connection = url.openConnection();
+    try (InputStream inputStream = connection.getInputStream()) {
+      byte[] buffer = new byte[FILE_SAMPLE_BUFFER_SIZE];
+      int bytesRead;
+      while ((bytesRead = inputStream.read(buffer)) != -1) {
+        if (totalBytes < MAX_FILE_SAMPLE_BYTES_TO_STORE) {
+          int toStore = (int) Math.min(bytesRead, MAX_FILE_SAMPLE_BYTES_TO_STORE - totalBytes);
+          output.write(buffer, 0, toStore);
+        }
+        totalBytes += bytesRead;
+      }
+    }
+
+    result.sampleEnd();
+    result.setResponseData(output.toByteArray());
+    result.setBodySize(totalBytes);
+    result.setResponseCodeOK();
+    result.setResponseMessageOK();
+    result.setSuccessful(true);
+    String contentType = "text/html";
+    String contentEncoding = sampler.getContentEncoding();
+    if (StringUtils.isNotBlank(contentEncoding)) {
+      contentType = contentType + "; charset=" + contentEncoding;
+    }
+    result.setContentType(contentType);
+    result.setEncodingAndType(contentType);
 
     resetSamplerDataBeforeResultProcessing(result);
     return sampler.resultProcessing(areFollowingRedirect, depth, result);
