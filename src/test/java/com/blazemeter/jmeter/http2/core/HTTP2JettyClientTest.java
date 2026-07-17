@@ -455,7 +455,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String requestBody = TEST_ARGUMENT_1 + TEST_ARGUMENT_2;
     HTTPSampleResult httpSampleResult = buildResult(true, Code.OK,
         hostHeader(),
-        requestBody.getBytes(StandardCharsets.UTF_8), "text/plain",
+        requestBody.getBytes(StandardCharsets.UTF_8), "text/plain; charset=UTF-8",
         createURL(SERVER_PATH_200_WITH_BODY), HTTPConstants.POST);
 
     validateResponse(sample(SERVER_PATH_200_WITH_BODY, HTTPConstants.POST), httpSampleResult);
@@ -637,7 +637,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
         buildResult(true, HttpStatus.Code.OK, HttpFields.build().add(HttpHeader.HOST,
                 hostHeaderValue()),
             requestBody.getBytes(StandardCharsets.UTF_8),
-        "text/plain", createURL(SERVER_PATH_200_WITH_BODY),
+        "text/plain; charset=UTF-8", createURL(SERVER_PATH_200_WITH_BODY),
         HTTPConstants.DELETE);
 
     validateResponse(sample(SERVER_PATH_200_WITH_BODY, HTTPConstants.DELETE), expected);
@@ -1540,12 +1540,13 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
 
     client = new HTTP2JettyClient(true, "Test");
     client.start();
-    Request httpRequest = client.sampleAsync(
-        sampler,
-        buildBaseResult(createURL(SERVER_PATH_200), HTTPConstants.GET),
-        sampler.getFutureResponseListener());
-    ContentResponse contentResponse = client.send(httpRequest, listener);
-    assertThat(contentResponse.getContent()).isNotEmpty();
+    HTTPSampleResult result = buildBaseResult(createURL(SERVER_PATH_200), HTTPConstants.GET);
+    Request httpRequest = client.sampleAsync(sampler, result, sampler.getFutureResponseListener());
+    httpRequest.send(listener);
+    // Goes through sampleFromListener() -> getContent(), the single place that owns the
+    // HTTP/1.1 fallback decision (the listener no longer resolves protocol_error on its own).
+    HTTPSampleResult sampleResult = client.sampleFromListener(sampler, result, false, 0, listener);
+    assertThat(sampleResult.getResponseData()).isNotEmpty();
   }
 
   @Test

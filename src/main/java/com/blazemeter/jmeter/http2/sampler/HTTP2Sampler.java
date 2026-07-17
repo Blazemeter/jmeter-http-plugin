@@ -117,12 +117,6 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   private static final String USER_AGENT = "User-Agent"; // $NON-NLS-1$
   private static final boolean USE_JAVA_REGEX = !getPropDefault(
       "jmeter.regex.engine", "oro").equalsIgnoreCase("oro");
-  private static final String RESPONSE_PARSERS = // list of parsers
-      JMeterUtils.getProperty("HTTPResponse.parsers"); //$NON-NLS-1$
-
-  static {
-    loadResponseParsersFromProperties();
-  }
 
   private final transient Callable<HTTP2JettyClient> clientFactory;
   private final boolean dumpAtThreadEnd =
@@ -614,12 +608,31 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         result);
   }
 
+  private void copyJettyProtocolSettingsToEmbeddedSampler(HTTP2Sampler embedded) {
+    embedded.setProfile(getProfile());
+    embedded.setEnableHttp3(getEnableHttp3());
+    embedded.setEnableHttp2(getEnableHttp2());
+    embedded.setEnableHttp1(getEnableHttp1());
+    embedded.setAlpnEnabled(getAlpnEnabled());
+    embedded.setFallbackEnabled(getFallbackEnabled());
+    embedded.setProtocolErrorFallbackEnabled(getProtocolErrorFallbackEnabled());
+    embedded.setAltSvcCacheEnabled(getAltSvcCacheEnabled());
+    embedded.setHttp1OnlyCacheEnabled(getHttp1OnlyCacheEnabled());
+    embedded.setH2cCacheEnabled(getH2cCacheEnabled());
+    embedded.setHttp2PriorKnowledgeEnabled(getHttp2PriorKnowledgeEnabled());
+    embedded.setHappyEyeballsDelayMs(getHappyEyeballsDelayMs());
+    embedded.setHttp3BrokenCooldownMs(getHttp3BrokenCooldownMs());
+    embedded.setHttp1OnlyCooldownMs(getHttp1OnlyCooldownMs());
+    embedded.setH2cCacheTtlMs(getH2cCacheTtlMs());
+    embedded.setHttp1UpgradeEnabled(isHttp1UpgradeEnabled());
+  }
+
   /**
-   * Copies Jetty/ALPN/protocol flags from this sampler onto an embedded-resource child sampler so
-   * child requests obey the same profile as the parent. Without this, a fresh {@link HTTP2Sampler}
-   * falls back to default profile semantics (typically HTTP/1.1 enabled), which incorrectly applies
-   * the global HTTP/1.1-only origin cache ({@link HTTP2JettyClient}) even when the parent has
-   * HTTP/1.1 explicitly disabled (e.g. HTTP/2-only mode).
+   * Builds an embedded-resource child sampler for a {@code file://} URL discovered by the HTML
+   * parser (e.g. a relative {@code href}/{@code src} resolved against a {@code file://} parent).
+   * {@code setImageParser} is enabled for {@code .html}/{@code .htm} targets so nested embedded
+   * resources (e.g. an iframe pointing at another local HTML file) are themselves parsed and
+   * downloaded, matching how a real HTTP-embedded HTML resource would recurse.
    */
   private HTTP2Sampler newFileEmbeddedSampler(URL url) {
     HTTP2Sampler fileSampler = new HTTP2Sampler();
@@ -642,6 +655,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     return fileSampler;
   }
 
+  /** {@code file://} URLs have no HTTP-style path to label sub-results with; build one instead. */
   private static String formatFileEmbeddedLabel(URL url, int index) {
     String path = url.getPath();
     if (path != null && path.startsWith("/")) {
@@ -653,32 +667,16 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   private static void relabelFileEmbeddedChildren(HTTPSampleResult parent) {
     int childIndex = 0;
     for (SampleResult child : parent.getSubResults()) {
-      if (child instanceof HTTPSampleResult httpChild && httpChild.getURL() != null
-          && "file".equalsIgnoreCase(httpChild.getURL().getProtocol())) {
-        httpChild.setSampleLabel(
-            formatFileEmbeddedLabel(httpChild.getURL(), childIndex++));
-        relabelFileEmbeddedChildren(httpChild);
+      if (child instanceof HTTPSampleResult) {
+        HTTPSampleResult httpChild = (HTTPSampleResult) child;
+        if (httpChild.getURL() != null
+            && "file".equalsIgnoreCase(httpChild.getURL().getProtocol())) {
+          httpChild.setSampleLabel(
+              formatFileEmbeddedLabel(httpChild.getURL(), childIndex++));
+          relabelFileEmbeddedChildren(httpChild);
+        }
       }
     }
-  }
-
-  private void copyJettyProtocolSettingsToEmbeddedSampler(HTTP2Sampler embedded) {
-    embedded.setProfile(getProfile());
-    embedded.setEnableHttp3(getEnableHttp3());
-    embedded.setEnableHttp2(getEnableHttp2());
-    embedded.setEnableHttp1(getEnableHttp1());
-    embedded.setAlpnEnabled(getAlpnEnabled());
-    embedded.setFallbackEnabled(getFallbackEnabled());
-    embedded.setProtocolErrorFallbackEnabled(getProtocolErrorFallbackEnabled());
-    embedded.setAltSvcCacheEnabled(getAltSvcCacheEnabled());
-    embedded.setHttp1OnlyCacheEnabled(getHttp1OnlyCacheEnabled());
-    embedded.setH2cCacheEnabled(getH2cCacheEnabled());
-    embedded.setHttp2PriorKnowledgeEnabled(getHttp2PriorKnowledgeEnabled());
-    embedded.setHappyEyeballsDelayMs(getHappyEyeballsDelayMs());
-    embedded.setHttp3BrokenCooldownMs(getHttp3BrokenCooldownMs());
-    embedded.setHttp1OnlyCooldownMs(getHttp1OnlyCooldownMs());
-    embedded.setH2cCacheTtlMs(getH2cCacheTtlMs());
-    embedded.setHttp1UpgradeEnabled(isHttp1UpgradeEnabled());
   }
 
   private HTTP2JettyClient buildClient() throws Exception {
@@ -763,8 +761,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   }
 
   /**
-   * JMeter batch plans configure HTML parsers via {@code -q jmeter-batch.properties}. The plugin
-   * class may load before those properties exist, so register parsers lazily on first use.
+   * JMeter batch runs configure HTML parsers via {@code -q jmeter-batch.properties}, loaded after
+   * this class may already have been initialized - so register parsers lazily on first use
+   * instead of in a static block, to read whatever properties are actually in effect by then.
    */
   private static void ensureResponseParsersLoaded() {
     if (!PARSERS_FOR_CONTENT_TYPE.isEmpty()) {
@@ -778,16 +777,16 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   }
 
   private static void loadResponseParsersFromProperties() {
-    String responseParsers = JMeterUtils.getProperty("HTTPResponse.parsers");
-    String[] parsers = JOrphanUtils.split(responseParsers, " ", true);
+    String responseParsers = JMeterUtils.getProperty("HTTPResponse.parsers"); //$NON-NLS-1$
+    String[] parsers = JOrphanUtils.split(responseParsers, " ", true); // empty array for null
     for (final String parser : parsers) {
-      String classname = JMeterUtils.getProperty(parser + ".className");
+      String classname = JMeterUtils.getProperty(parser + ".className"); //$NON-NLS-1$
       if (classname == null) {
         LOG.error("Cannot find .className property for {}, ensure you set property: '{}.className'",
             parser, parser);
         continue;
       }
-      String typeList = JMeterUtils.getProperty(parser + ".types");
+      String typeList = JMeterUtils.getProperty(parser + ".types"); //$NON-NLS-1$
       if (typeList != null) {
         String[] types = JOrphanUtils.split(typeList, " ", true);
         for (final String type : types) {

@@ -12,7 +12,6 @@ import com.github.luben.zstd.ZstdInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
@@ -21,6 +20,7 @@ import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.net.URLConnection;
 import java.net.URLDecoder;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
@@ -64,7 +64,6 @@ import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPArgument;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
-import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.services.FileServer;
 import org.apache.jmeter.testelement.property.JMeterProperty;
 import org.apache.jmeter.util.JMeterUtils;
@@ -146,6 +145,11 @@ public class HTTP2JettyClient {
   private static final Path ALPN_DEBUG_LOG_PATH = resolveAlpnLogPath();
   private static final boolean ADD_CONTENT_TYPE_TO_POST_IF_MISSING = JMeterUtils.getPropDefault(
       "http.post_add_content_type_if_missing", false);
+  // Matches HTTPFileImpl: caps stored response data for file:// samples, while sampleEnd's
+  // bodySize still reflects the true total bytes read.
+  private static final int MAX_FILE_SAMPLE_BYTES_TO_STORE = JMeterUtils.getPropDefault(
+      "httpsampler.max_bytes_to_store_per_request", 10 * 1024 * 1024);
+  private static final int FILE_SAMPLE_BUFFER_SIZE = 4096;
   private static final Pattern PORT_PATTERN = Pattern.compile("\\d+");
   private static final String MULTI_PART_SEPARATOR = "--";
   private static final String LINE_SEPARATOR = "\r\n";
@@ -153,6 +157,7 @@ public class HTTP2JettyClient {
   private static final String ALT_SVC_HEADER = "alt-svc";
   private static final String ATTR_HTTP3_ATTEMPTED = "bzm.http3.attempted";
   private static final String ATTR_H2C_FALLBACK_ATTEMPTED = "bzm.h2cFallbackAttempted";
+  private static final String ATTR_SKIP_H2C_UPGRADE = "bzm.skipH2cUpgrade";
   private static final String ATTR_ORIGIN_KEY = "bzm.http3.origin";
   private static final String ATTR_REQUEST_HEADERS_SERIALIZED = "bzm.request.headers.serialized";
   private static final String PROP_SKIP_REDUNDANT_MANUAL_DECODE =
@@ -1154,6 +1159,8 @@ public class HTTP2JettyClient {
     }
     ensureHostHeader(http11Request, url);
     configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
+
+    // Copy body if present
     setBody(http11Request, sampler, result, false);
     JmeterRequestHeadersSupport.prepareFromSampler(http11Request, sampler.getUseKeepAlive());
 
@@ -1233,8 +1240,18 @@ public class HTTP2JettyClient {
       JmeterRequestHeadersSupport.prepareFromSampler(http11Request, (Boolean) useKeepAlive);
     }
     configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
-    if (originalRequest.getBody() != null) {
-      http11Request.body(originalRequest.getBody());
+    Request.Content body = originalRequest.getBody();
+    if (body != null) {
+      // The original attempt may already have read some or all of this content before
+      // failing; rewind it back to the start before reuse, exactly as Jetty's own retry
+      // paths do (see AuthenticationProtocolHandler/HttpRedirector). Skipping this can send
+      // a fallback request that declares the right Content-Length but no actual body bytes,
+      // hanging the server until its idle timeout instead of failing fast.
+      if (!body.rewind()) {
+        throw new IllegalStateException(
+            "Request body for " + uri + " is not reproducible for HTTP/1.1 fallback retry");
+      }
+      http11Request.body(body);
     }
     SslClientCertAliasSupport.copyFromRequest(originalRequest, http11Request);
     return http11Request;
@@ -1409,7 +1426,10 @@ public class HTTP2JettyClient {
     String method = result.getHTTPMethod();
     request.method(method);
     if (shouldAttachRequestBody(sampler, result, areFollowingRedirect)) {
-      request.attribute(JmeterHttpClientAttributes.SKIP_H2C_UPGRADE, Boolean.TRUE);
+      // The h2c Upgrade dance sends this request as plain HTTP/1.1 first; attaching a body
+      // to it works but isn't well-supported across servers, so skip the upgrade attempt
+      // entirely for bodied cleartext requests (see resolveClientForRequest).
+      request.attribute(ATTR_SKIP_H2C_UPGRADE, Boolean.TRUE);
     }
     setHeaders(request, url, sampler.getHeaderManager());
     ensureHostHeader(request, url);
@@ -1510,7 +1530,6 @@ public class HTTP2JettyClient {
     lowLevelDebug("Request built: URI={}, method={}", request.getURI(), request.getMethod());
     samplePrepareRequest(request, sampler, result, context.client);
     listener.setRequest(request);
-    listener.setFallbackHttp1Client(httpClientHttp1Only);
     lowLevelDebug("Request prepared, ready to send");
     return request;
 
@@ -1552,7 +1571,6 @@ public class HTTP2JettyClient {
     HTTP2FutureResponseListener listener = new HTTP2FutureResponseListener(maxBufferSize);
     lowLevelDebug("=== HTTP2FutureResponseListener created successfully ===");
     listener.setRequest(request);
-    listener.setFallbackHttp1Client(httpClientHttp1Only);
     lowLevelDebug("=== About to call send() ===");
     ContentResponse contentResponse;
     try {
@@ -1575,6 +1593,55 @@ public class HTTP2JettyClient {
 
     postContentResponse(sampler, request, result, contentResponse, cacheManager);
     result.setEndTime(listener.getResponseEnd());
+
+    resetSamplerDataBeforeResultProcessing(result);
+    return sampler.resultProcessing(areFollowingRedirect, depth, result);
+  }
+
+  /**
+   * Matches HttpClient4's {@code HTTPFileImpl}: {@code file://} samples always use GET, open the
+   * URL directly (Java's built-in {@code file} URL handler - relative paths resolve against the
+   * JVM's working directory, not via {@link org.apache.jmeter.services.FileServer}), and always
+   * report {@code text/html} as the content type regardless of the file's actual type, since this
+   * exists to test the HTML embedded-resource parser against local fixtures, not to serve
+   * arbitrary static files.
+   */
+  private HTTPSampleResult sampleLocalFile(HTTP2Sampler sampler, HTTPSampleResult result, URL url,
+                                           boolean areFollowingRedirect, int depth)
+      throws Exception {
+    result.setHTTPMethod(HTTPConstants.GET);
+    result.setURL(url);
+    result.setSampleLabel(url.toString());
+    result.sampleStart();
+
+    ByteArrayOutputStream output = new ByteArrayOutputStream(FILE_SAMPLE_BUFFER_SIZE);
+    long totalBytes = 0;
+    URLConnection connection = url.openConnection();
+    try (InputStream inputStream = connection.getInputStream()) {
+      byte[] buffer = new byte[FILE_SAMPLE_BUFFER_SIZE];
+      int bytesRead;
+      while ((bytesRead = inputStream.read(buffer)) != -1) {
+        if (totalBytes < MAX_FILE_SAMPLE_BYTES_TO_STORE) {
+          int toStore = (int) Math.min(bytesRead, MAX_FILE_SAMPLE_BYTES_TO_STORE - totalBytes);
+          output.write(buffer, 0, toStore);
+        }
+        totalBytes += bytesRead;
+      }
+    }
+
+    result.sampleEnd();
+    result.setResponseData(output.toByteArray());
+    result.setBodySize(totalBytes);
+    result.setResponseCodeOK();
+    result.setResponseMessageOK();
+    result.setSuccessful(true);
+    String contentType = "text/html";
+    String contentEncoding = sampler.getContentEncoding();
+    if (StringUtils.isNotBlank(contentEncoding)) {
+      contentType = contentType + "; charset=" + contentEncoding;
+    }
+    result.setContentType(contentType);
+    result.setEncodingAndType(contentType);
 
     resetSamplerDataBeforeResultProcessing(result);
     return sampler.resultProcessing(areFollowingRedirect, depth, result);
@@ -3228,8 +3295,7 @@ public class HTTP2JettyClient {
     // 3. It violates the HTTP/2 protocol (RFC 7540)
     if (http1UpgradeRequired && enableHttp2 && !"https".equalsIgnoreCase(url.getProtocol())
         && !shouldUseH2cPriorKnowledge(request.getURI())
-        && !Boolean.TRUE.equals(
-            request.getAttributes().get(JmeterHttpClientAttributes.SKIP_H2C_UPGRADE))) {
+        && !Boolean.TRUE.equals(request.getAttributes().get(ATTR_SKIP_H2C_UPGRADE))) {
       Mutable headers = ((Mutable) request.getHeaders());
       addHeaderIfMissing(HttpHeader.UPGRADE, "h2c", headers);
       addHeaderIfMissing(HttpHeader.HTTP2_SETTINGS, buildH2cSettingsHeaderValue(), headers);
@@ -3571,8 +3637,7 @@ public class HTTP2JettyClient {
         if (StringUtils.isBlank(file.getParamName())) {
           throw new IllegalStateException("Param name is blank");
         }
-        File resolvedFile = resolveHttpFile(file.getPath());
-        String fileName = resolvedFile.getName();
+        String fileName = resolveHttpFile(file.getPath()).getName();
         postBody.append(buildFilePartRequestBody(file, fileName, boundary));
       }
       postBody.append(MULTI_PART_SEPARATOR).append(boundary).append(MULTI_PART_SEPARATOR)
@@ -3596,9 +3661,8 @@ public class HTTP2JettyClient {
           }
         }
         // In Jetty 12, PathRequestContent implements Request.Content directly
-        File resolvedFile = resolveHttpFile(file.getPath());
         Request.Content requestContent =
-            new PathRequestContent(mimeTypeFile, resolvedFile.toPath());
+            new PathRequestContent(mimeTypeFile, resolveHttpFile(file.getPath()).toPath());
         request.body(requestContent);
         postBody.append("<actual file content, not shown here>");
       } else {
@@ -3618,6 +3682,7 @@ public class HTTP2JettyClient {
           String bodyContentType = request.getHeaders() != null
               ? request.getHeaders().get(HTTPConstants.HEADER_CONTENT_TYPE)
               : null;
+          // In Jetty 12, StringRequestContent implements Request.Content directly
           Request.Content requestContent =
               new StringRequestContent(bodyContentType, postBody.toString(), contentCharset);
           request.body(requestContent);
@@ -3638,10 +3703,10 @@ public class HTTP2JettyClient {
               if (!arg.isSkippable(parameterName)) {
                 String parameterValue = arg.getValue();
                 if (!arg.isAlwaysEncoded()) {
-                  // The FormRequestContent always urlencodes both name and value, in this case the
-                  // value is already encoded by the user so is needed to decode the value now, so
-                  // that when the httpclient encodes it, we end up with the same value as the user
-                  // had entered.
+                  // The FormRequestContent always urlencodes both name and value, in this case
+                  // the value is already encoded by the user so is needed to decode the value
+                  // now, so that when the httpclient encodes it, we end up with the same value
+                  // as the user had entered.
                   parameterName = URLDecoder.decode(parameterName, contentCharset.name());
                   parameterValue = URLDecoder.decode(parameterValue, contentCharset.name());
                 }
@@ -3655,93 +3720,6 @@ public class HTTP2JettyClient {
       }
     }
     result.setQueryString(postBody.toString());
-  }
-
-  private File resolveHttpFile(String path) throws IOException {
-    if (StringUtils.isBlank(path)) {
-      throw new IOException("Empty HTTP file path");
-    }
-    File resolved = FileServer.getFileServer().getResolvedFile(path);
-    if (resolved.isFile()) {
-      return resolved;
-    }
-    Path inBin = Paths.get(JMeterUtils.getJMeterBinDir(), path);
-    if (Files.isRegularFile(inBin)) {
-      return inBin.toFile();
-    }
-    throw new IOException("HTTP file not found: " + path);
-  }
-
-  private HTTPSampleResult sampleLocalFile(HTTP2Sampler sampler, HTTPSampleResult result, URL url,
-                                           boolean areFollowingRedirect, int depth)
-      throws Exception {
-    Path filePath = resolveLocalFilePath(url);
-    byte[] data = Files.readAllBytes(filePath);
-    result.sampleStart();
-    result.setResponseCode("200");
-    result.setResponseMessage("OK");
-    result.setSuccessful(true);
-    result.setResponseData(data);
-    String encoding = sampler.getContentEncoding();
-    if (StringUtils.isNotBlank(encoding)) {
-      result.setDataEncoding(encoding);
-    }
-    String contentType = probeLocalFileContentType(filePath);
-    if (contentType != null) {
-      result.setContentType(contentType);
-      result.setResponseHeaders("Content-Type: " + contentType + "\n");
-    }
-    if (contentType != null && contentType.toLowerCase(Locale.ROOT).startsWith("text/")) {
-      result.setDataType(SampleResult.TEXT);
-    }
-    result.sampleEnd();
-    resetSamplerDataBeforeResultProcessing(result);
-    return sampler.resultProcessing(areFollowingRedirect, depth, result);
-  }
-
-  private static Path resolveLocalFilePath(URL url) throws IOException {
-    try {
-      Path direct = Paths.get(url.toURI());
-      if (Files.isRegularFile(direct)) {
-        return direct;
-      }
-    } catch (Exception ignored) {
-      // Fall back to JMeter bin-relative paths used by bin/testfiles JMX plans.
-    }
-    String rawPath = url.getPath();
-    if (rawPath == null || rawPath.isEmpty()) {
-      throw new IOException("Empty file URL path: " + url);
-    }
-    String relative = rawPath.startsWith("/") ? rawPath.substring(1) : rawPath;
-    Path inBin = Paths.get(JMeterUtils.getJMeterBinDir()).resolve(relative);
-    if (Files.isRegularFile(inBin)) {
-      return inBin;
-    }
-    throw new FileNotFoundException(relative + " (The system cannot find the file specified)");
-  }
-
-  private static String probeLocalFileContentType(Path filePath) throws IOException {
-    String probed = Files.probeContentType(filePath);
-    if (StringUtils.isNotBlank(probed)) {
-      return probed;
-    }
-    String name = filePath.getFileName().toString().toLowerCase(Locale.ROOT);
-    if (name.endsWith(".html") || name.endsWith(".htm")) {
-      return "text/html";
-    }
-    if (name.endsWith(".css")) {
-      return "text/css";
-    }
-    if (name.endsWith(".gif")) {
-      return "image/gif";
-    }
-    if (name.endsWith(".jpg") || name.endsWith(".jpeg")) {
-      return "image/jpeg";
-    }
-    if (name.endsWith(".png")) {
-      return "image/png";
-    }
-    return null;
   }
 
   private void initializeSentBytes(HTTPSampleResult result, Request request) {
@@ -3853,6 +3831,26 @@ public class HTTP2JettyClient {
       }
     }
     return ret == null ? DEFAULT_FILE_MIME_TYPE : ret;
+  }
+
+  /**
+   * Resolves a sampler file path the same way HttpClient4 does: relative to the running test
+   * plan's directory via {@link FileServer}, falling back to JMeter's {@code bin} directory for
+   * files bundled alongside JMeter itself.
+   */
+  private File resolveHttpFile(String path) throws IOException {
+    if (StringUtils.isBlank(path)) {
+      throw new IOException("Empty HTTP file path");
+    }
+    File resolved = FileServer.getFileServer().getResolvedFile(path);
+    if (resolved.isFile()) {
+      return resolved;
+    }
+    Path inBin = Paths.get(JMeterUtils.getJMeterBinDir(), path);
+    if (Files.isRegularFile(inBin)) {
+      return inBin.toFile();
+    }
+    throw new IOException("HTTP file not found: " + path);
   }
 
   /**
