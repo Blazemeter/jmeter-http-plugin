@@ -7,6 +7,7 @@ import com.blazemeter.jmeter.http2.core.HTTP2ClientProfileConfig;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
 import com.blazemeter.jmeter.http2.core.HpackFailureDetector;
+import com.blazemeter.jmeter.http2.core.JmeterHttpClientExceptionMapper;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -602,7 +603,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         result.sampleEnd();
       }
     }
-    return errorResult(e, result);
+    return errorResult(
+        JmeterHttpClientExceptionMapper.forSampleResult(e, getAutoRedirects(), result.getURL()),
+        result);
   }
 
   /**
