@@ -1150,20 +1150,27 @@ public class HTTP2JettyClient {
     lowLevelDebug("Retrying request with HTTP/1.1 only due to protocol_error");
     URL url = result.getURL();
 
+    clearContentDecoders(httpClientHttp1Only);
+
+    // Build a new request with the shared HTTP/1.1-only client (keeps auth config)
     Request http11Request = httpClientHttp1Only.newRequest(url.toURI())
         .method(result.getHTTPMethod())
         .timeout(requestTimeout, TimeUnit.MILLISECONDS)
         .followRedirects(sampler.getAutoRedirects());
+
+    // Copy headers from sampler
     if (sampler.getHeaderManager() != null) {
       setHeaders(http11Request, url, sampler.getHeaderManager());
     }
     ensureHostHeader(http11Request, url);
+
     configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
 
     // Copy body if present
     setBody(http11Request, sampler, result, false);
     JmeterRequestHeadersSupport.prepareFromSampler(http11Request, sampler.getUseKeepAlive());
 
+    // Send request
     lowLevelDebug("Sending HTTP/1.1 fallback request");
     ContentResponse response = http11Request.send();
 

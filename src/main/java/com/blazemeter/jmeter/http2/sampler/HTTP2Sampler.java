@@ -608,6 +608,13 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         result);
   }
 
+  /**
+   * Copies Jetty/ALPN/protocol flags from this sampler onto an embedded-resource child sampler so
+   * child requests obey the same profile as the parent. Without this, a fresh {@link HTTP2Sampler}
+   * falls back to default profile semantics (typically HTTP/1.1 enabled), which incorrectly applies
+   * the global HTTP/1.1-only origin cache ({@link HTTP2JettyClient}) even when the parent has
+   * HTTP/1.1 explicitly disabled (e.g. HTTP/2-only mode).
+   */
   private void copyJettyProtocolSettingsToEmbeddedSampler(HTTP2Sampler embedded) {
     embedded.setProfile(getProfile());
     embedded.setEnableHttp3(getEnableHttp3());
