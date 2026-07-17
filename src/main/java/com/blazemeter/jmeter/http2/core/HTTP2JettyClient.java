@@ -11,6 +11,7 @@ import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import com.github.luben.zstd.ZstdInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
@@ -62,6 +63,7 @@ import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPArgument;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
+import org.apache.jmeter.services.FileServer;
 import org.apache.jmeter.testelement.property.JMeterProperty;
 import org.apache.jmeter.util.JMeterUtils;
 import org.brotli.dec.BrotliInputStream;
@@ -3546,7 +3548,7 @@ public class HTTP2JettyClient {
         if (StringUtils.isBlank(file.getParamName())) {
           throw new IllegalStateException("Param name is blank");
         }
-        String fileName = Paths.get((file.getPath())).getFileName().toString();
+        String fileName = resolveHttpFile(file.getPath()).getName();
         postBody.append(buildFilePartRequestBody(file, fileName, boundary));
       }
       postBody.append(MULTI_PART_SEPARATOR).append(boundary).append(MULTI_PART_SEPARATOR)
@@ -3571,7 +3573,7 @@ public class HTTP2JettyClient {
         }
         // In Jetty 12, PathRequestContent implements Request.Content directly
         Request.Content requestContent =
-            new PathRequestContent(mimeTypeFile, Path.of(file.getPath()));
+            new PathRequestContent(mimeTypeFile, resolveHttpFile(file.getPath()).toPath());
         request.body(requestContent);
         postBody.append("<actual file content, not shown here>");
       } else {
@@ -3731,6 +3733,26 @@ public class HTTP2JettyClient {
   }
 
   /**
+   * Resolves a sampler file path the same way HttpClient4 does: relative to the running test
+   * plan's directory via {@link FileServer}, falling back to JMeter's {@code bin} directory for
+   * files bundled alongside JMeter itself.
+   */
+  private File resolveHttpFile(String path) throws IOException {
+    if (StringUtils.isBlank(path)) {
+      throw new IOException("Empty HTTP file path");
+    }
+    File resolved = FileServer.getFileServer().getResolvedFile(path);
+    if (resolved.isFile()) {
+      return resolved;
+    }
+    Path inBin = Paths.get(JMeterUtils.getJMeterBinDir(), path);
+    if (Files.isRegularFile(inBin)) {
+      return inBin.toFile();
+    }
+    throw new IOException("HTTP file not found: " + path);
+  }
+
+  /**
    * Builds multipart/form-data body as bytes for Jetty 12.
    * In Jetty 12, MultiPartRequestContent API changed, so we build the body manually.
    *
@@ -3776,7 +3798,8 @@ public class HTTP2JettyClient {
       if (StringUtils.isBlank(file.getParamName())) {
         throw new IllegalStateException("Param name is blank");
       }
-      String fileName = Paths.get(file.getPath()).getFileName().toString();
+      File resolvedFile = resolveHttpFile(file.getPath());
+      String fileName = resolvedFile.getName();
       String mimeTypeFile = extractFileMimeType(hasContentTypeHeader, file);
 
       String partHeaders = formatMultipartPartHeaders(
@@ -3787,7 +3810,7 @@ public class HTTP2JettyClient {
       output.write(partHeaders.getBytes(StandardCharsets.US_ASCII));
 
       // Read and write file content
-      try (InputStream fileStream = Files.newInputStream(Paths.get(file.getPath()))) {
+      try (InputStream fileStream = Files.newInputStream(resolvedFile.toPath())) {
         byte[] buffer = new byte[8192];
         int bytesRead;
         while ((bytesRead = fileStream.read(buffer)) != -1) {
