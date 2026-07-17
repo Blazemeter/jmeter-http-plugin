@@ -453,7 +453,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String requestBody = TEST_ARGUMENT_1 + TEST_ARGUMENT_2;
     HTTPSampleResult httpSampleResult = buildResult(true, Code.OK,
         hostHeader(),
-        requestBody.getBytes(StandardCharsets.UTF_8), "application/octet-stream",
+        requestBody.getBytes(StandardCharsets.UTF_8), "text/plain; charset=UTF-8",
         createURL(SERVER_PATH_200_WITH_BODY), HTTPConstants.POST);
 
     validateResponse(sample(SERVER_PATH_200_WITH_BODY, HTTPConstants.POST), httpSampleResult);
@@ -628,7 +628,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
         buildResult(true, HttpStatus.Code.OK, HttpFields.build().add(HttpHeader.HOST,
                 hostHeaderValue()),
             requestBody.getBytes(StandardCharsets.UTF_8),
-        "application/octet-stream", createURL(SERVER_PATH_200_WITH_BODY),
+        "text/plain; charset=UTF-8", createURL(SERVER_PATH_200_WITH_BODY),
         HTTPConstants.DELETE);
 
     validateResponse(sample(SERVER_PATH_200_WITH_BODY, HTTPConstants.DELETE), expected);
