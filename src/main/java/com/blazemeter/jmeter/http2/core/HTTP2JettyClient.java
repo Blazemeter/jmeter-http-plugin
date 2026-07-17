@@ -1460,7 +1460,18 @@ public class HTTP2JettyClient {
                                    JettyCacheManager cacheManager)
       throws IOException {
     http1UpgradeRequired = contentResponse.getVersion() != HttpVersion.HTTP_2;
-    result.setRequestHeaders(getSerializedRequestHeaders(request, true));
+    // When autoRedirects silently follows a redirect chain at the transport layer, contentResponse
+    // carries the LAST request Jetty actually sent - not the original one passed in here. Report
+    // headers/sentBytes for that effective request, matching what HttpClient4 shows for the same
+    // scenario, instead of the pre-redirect request's (possibly different host/method/headers).
+    Request effectiveRequest = contentResponse.getRequest() != null
+        ? contentResponse.getRequest()
+        : request;
+    result.setRequestHeaders(getSerializedRequestHeaders(effectiveRequest, true));
+    long headerBytes = estimateRequestHeaderBytes(effectiveRequest);
+    if (headerBytes > result.getSentBytes()) {
+      result.setSentBytes(headerBytes);
+    }
     setResultContentResponse(result, contentResponse);
     saveCookiesInCookieManager(contentResponse, request.getURI().toURL(),
         sampler.getCookieManager());
