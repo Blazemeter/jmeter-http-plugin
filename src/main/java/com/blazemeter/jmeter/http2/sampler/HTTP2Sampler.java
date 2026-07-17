@@ -658,6 +658,58 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     embedded.setHttp1UpgradeEnabled(isHttp1UpgradeEnabled());
   }
 
+  /**
+   * Builds an embedded-resource child sampler for a {@code file://} URL discovered by the HTML
+   * parser (e.g. a relative {@code href}/{@code src} resolved against a {@code file://} parent).
+   * {@code setImageParser} is enabled for {@code .html}/{@code .htm} targets so nested embedded
+   * resources (e.g. an iframe pointing at another local HTML file) are themselves parsed and
+   * downloaded, matching how a real HTTP-embedded HTML resource would recurse.
+   */
+  private HTTP2Sampler newFileEmbeddedSampler(URL url) {
+    HTTP2Sampler fileSampler = new HTTP2Sampler();
+    copyJettyProtocolSettingsToEmbeddedSampler(fileSampler);
+    String path = url.getPath();
+    boolean htmlResource = path != null
+        && (path.endsWith(".html") || path.endsWith(".htm"));
+    fileSampler.setImageParser(htmlResource);
+    fileSampler.setMethod(HTTPConstants.GET);
+    fileSampler.setProtocol(url.getProtocol());
+    fileSampler.setDomain(url.getHost());
+    fileSampler.setPort(url.getPort());
+    if (url.getQuery() == null) {
+      fileSampler.setPath(url.getPath());
+    } else {
+      fileSampler.setPath(url.getPath() + url.getQuery());
+    }
+    fileSampler.setHeaderManager(getHeaderManager());
+    fileSampler.setCookieManager(getCookieManager());
+    return fileSampler;
+  }
+
+  /** {@code file://} URLs have no HTTP-style path to label sub-results with; build one instead. */
+  private static String formatFileEmbeddedLabel(URL url, int index) {
+    String path = url.getPath();
+    if (path != null && path.startsWith("/")) {
+      path = path.substring(1);
+    }
+    return url.getProtocol() + ":" + path + "-" + index;
+  }
+
+  private static void relabelFileEmbeddedChildren(HTTPSampleResult parent) {
+    int childIndex = 0;
+    for (SampleResult child : parent.getSubResults()) {
+      if (child instanceof HTTPSampleResult) {
+        HTTPSampleResult httpChild = (HTTPSampleResult) child;
+        if (httpChild.getURL() != null
+            && "file".equalsIgnoreCase(httpChild.getURL().getProtocol())) {
+          httpChild.setSampleLabel(
+              formatFileEmbeddedLabel(httpChild.getURL(), childIndex++));
+          relabelFileEmbeddedChildren(httpChild);
+        }
+      }
+    }
+  }
+
   private HTTP2JettyClient buildClient() throws Exception {
     HTTP2ClientKey connectionKey = buildConnectionKey();
     HTTP2JettyClient client = new HTTP2JettyClient(isHttp1UpgradeEnabled(),
@@ -933,6 +985,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
       setSyncRequest(!isConcurrentDwn); // Change default from main request based on sub request
 
+      int fileEmbeddedIndex = 0;
       while (urls.hasNext()) {
         Object binURL = urls.next(); // See catch clause below
         try {
@@ -962,6 +1015,20 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
                   errorResult(new Exception(url.toString() + " URI can not be normalized", e),
                       new HTTPSampleResult(subres)));
               setParentSampleSuccess(subres, false);
+              continue;
+            }
+
+            if ("file".equalsIgnoreCase(url.getProtocol())) {
+              HTTP2Sampler fileSampler = newFileEmbeddedSampler(url);
+              HTTPSampleResult binRes =
+                  fileSampler.sample(url, HTTPConstants.GET, false, frameDepth + 1);
+              if (binRes != null) {
+                binRes.setSampleLabel(formatFileEmbeddedLabel(url, fileEmbeddedIndex++));
+                relabelFileEmbeddedChildren(binRes);
+              }
+              subres.addSubResult(binRes);
+              setParentSampleSuccess(subres,
+                  subres.isSuccessful() && (binRes == null || binRes.isSuccessful()));
               continue;
             }
 
