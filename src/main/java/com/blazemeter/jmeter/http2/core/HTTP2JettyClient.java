@@ -1247,8 +1247,18 @@ public class HTTP2JettyClient {
       JmeterRequestHeadersSupport.prepareFromSampler(http11Request, (Boolean) useKeepAlive);
     }
     configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
-    if (originalRequest.getBody() != null) {
-      http11Request.body(originalRequest.getBody());
+    Request.Content body = originalRequest.getBody();
+    if (body != null) {
+      // The original attempt may already have read some or all of this content before
+      // failing; rewind it back to the start before reuse, exactly as Jetty's own retry
+      // paths do (see AuthenticationProtocolHandler/HttpRedirector). Skipping this can send
+      // a fallback request that declares the right Content-Length but no actual body bytes,
+      // hanging the server until its idle timeout instead of failing fast.
+      if (!body.rewind()) {
+        throw new IllegalStateException(
+            "Request body for " + uri + " is not reproducible for HTTP/1.1 fallback retry");
+      }
+      http11Request.body(body);
     }
     SslClientCertAliasSupport.copyFromRequest(originalRequest, http11Request);
     return http11Request;
@@ -1527,7 +1537,6 @@ public class HTTP2JettyClient {
     lowLevelDebug("Request built: URI={}, method={}", request.getURI(), request.getMethod());
     samplePrepareRequest(request, sampler, result, context.client);
     listener.setRequest(request);
-    listener.setFallbackHttp1Client(httpClientHttp1Only);
     lowLevelDebug("Request prepared, ready to send");
     return request;
 
