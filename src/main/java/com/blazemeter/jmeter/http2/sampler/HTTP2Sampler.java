@@ -116,33 +116,6 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   private static final String USER_AGENT = "User-Agent"; // $NON-NLS-1$
   private static final boolean USE_JAVA_REGEX = !getPropDefault(
       "jmeter.regex.engine", "oro").equalsIgnoreCase("oro");
-  private static final String RESPONSE_PARSERS = // list of parsers
-      JMeterUtils.getProperty("HTTPResponse.parsers"); //$NON-NLS-1$
-
-  static {
-    String[] parsers =
-        JOrphanUtils.split(RESPONSE_PARSERS, " ", true); // returns empty array for null
-    for (final String parser : parsers) {
-      String classname = JMeterUtils.getProperty(parser + ".className"); //$NON-NLS-1$
-      if (classname == null) {
-        LOG.error("Cannot find .className property for {}, ensure you set property: '{}.className'",
-            parser, parser);
-        continue;
-      }
-      String typeList = JMeterUtils.getProperty(parser + ".types"); //$NON-NLS-1$
-      if (typeList != null) {
-        String[] types = JOrphanUtils.split(typeList, " ", true);
-        for (final String type : types) {
-          registerParser(type, classname);
-        }
-      } else {
-        LOG.warn(
-            "Cannot find .types property for {}, as a consequence parser " +
-                "will not be used, to make it usable, define property:'{}.types'",
-            parser, parser);
-      }
-    }
-  }
 
   private final transient Callable<HTTP2JettyClient> clientFactory;
   private final boolean dumpAtThreadEnd =
@@ -739,8 +712,50 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     PARSERS_FOR_CONTENT_TYPE.put(contentType, className);
   }
 
+  /**
+   * JMeter batch runs configure HTML parsers via {@code -q jmeter-batch.properties}, loaded after
+   * this class may already have been initialized - so register parsers lazily on first use
+   * instead of in a static block, to read whatever properties are actually in effect by then.
+   */
+  private static void ensureResponseParsersLoaded() {
+    if (!PARSERS_FOR_CONTENT_TYPE.isEmpty()) {
+      return;
+    }
+    synchronized (PARSERS_FOR_CONTENT_TYPE) {
+      if (PARSERS_FOR_CONTENT_TYPE.isEmpty()) {
+        loadResponseParsersFromProperties();
+      }
+    }
+  }
+
+  private static void loadResponseParsersFromProperties() {
+    String responseParsers = JMeterUtils.getProperty("HTTPResponse.parsers"); //$NON-NLS-1$
+    String[] parsers = JOrphanUtils.split(responseParsers, " ", true); // empty array for null
+    for (final String parser : parsers) {
+      String classname = JMeterUtils.getProperty(parser + ".className"); //$NON-NLS-1$
+      if (classname == null) {
+        LOG.error("Cannot find .className property for {}, ensure you set property: '{}.className'",
+            parser, parser);
+        continue;
+      }
+      String typeList = JMeterUtils.getProperty(parser + ".types"); //$NON-NLS-1$
+      if (typeList != null) {
+        String[] types = JOrphanUtils.split(typeList, " ", true);
+        for (final String type : types) {
+          registerParser(type, classname);
+        }
+      } else {
+        LOG.warn(
+            "Cannot find .types property for {}, as a consequence parser "
+                + "will not be used, to make it usable, define property:'{}.types'",
+            parser, parser);
+      }
+    }
+  }
+
   private LinkExtractorParser getParser(HTTPSampleResult res)
       throws LinkExtractorParseException {
+    ensureResponseParsersLoaded();
     String parserClassName =
         PARSERS_FOR_CONTENT_TYPE.get(res.getMediaType());
     if (!StringUtils.isEmpty(parserClassName)) {
