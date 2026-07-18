@@ -47,9 +47,7 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Base64;
@@ -532,11 +530,6 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
   }
 
   private void validateResponse(SampleResult result, SampleResult expected) {
-    validateResponse(result, expected, true);
-  }
-
-  private void validateResponse(SampleResult result, SampleResult expected,
-      boolean checkSentBytes) {
     // In Jetty 12.1.5, headers may include Accept-Encoding: gzip automatically
     // Use header comparison that ignores order and accepts additional headers
     assertHeadersMatchIgnoringOrder(result.getRequestHeaders(), expected.getRequestHeaders());
@@ -570,12 +563,10 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
         requestMethod);
     }
 
-    if (checkSentBytes) {
-      if (expectedBodyBytes > 0) {
-        softly.assertThat(result.getSentBytes()).isGreaterThanOrEqualTo(expectedBodyBytes);
-      } else {
-        softly.assertThat(result.getSentBytes()).isGreaterThanOrEqualTo(actualHeaderBytes);
-      }
+    if (expectedBodyBytes > 0) {
+      softly.assertThat(result.getSentBytes()).isGreaterThanOrEqualTo(expectedBodyBytes);
+    } else {
+      softly.assertThat(result.getSentBytes()).isGreaterThanOrEqualTo(actualHeaderBytes);
     }
     softly.assertThat(result.getResponseDataAsString())
         .isEqualTo(expected.getResponseDataAsString());
@@ -847,7 +838,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     HTTPSampleResult expected = buildResult(true, HttpStatus.Code.OK, hostHeader(),
       null, null, createURL(SERVER_PATH_200), HTTPConstants.GET);
     expected.setResponseData(SERVER_RESPONSE, StandardCharsets.UTF_8.name());
-    validateResponse(sampleWithGet(), expected, false);
+    validateResponse(sampleWithGet(), expected);
   }
 
 
@@ -878,7 +869,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     HTTPSampleResult expected = buildResult(true, HttpStatus.Code.OK, hostHeader(),
       null, null, createURL(SERVER_PATH_200), HTTPConstants.GET);
     expected.setResponseData(SERVER_RESPONSE, StandardCharsets.UTF_8.name());
-    validateResponse(sampleWithGet(), expected, false);
+    validateResponse(sampleWithGet(), expected);
   }
 
 
@@ -1147,10 +1138,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
         .add(HttpHeader.CONTENT_TYPE, "multipart/form-data; boundary=\"" + boundaryValue + "\"");
     // In Jetty 12, Content-Length is automatically added, so we need to include it in expected
     byte[] responseData = buildByteArrayFromFilesAndParams(expected, args, files, boundary);
-    String contentLength = parseHeaders(result.getRequestHeaders()).get("Content-Length");
-    if (contentLength == null) {
-      contentLength = Integer.toString(responseData.length);
-    }
+    String contentLength = Integer.toString(responseData.length);
     httpFields.add(HttpHeader.CONTENT_LENGTH, contentLength);
     expected.setRequestHeaders(expected.getRequestHeaders().concat(httpFields.toString()));
     expected.setResponseData(responseData);
@@ -1470,7 +1458,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     syncServerPort();
     String keyStorePropertyName = "javax.net.ssl.keyStore";
     String keyStorePasswordPropertyName = "javax.net.ssl.keyStorePassword";
-    System.setProperty(keyStorePropertyName, getKeyStorePathForClientSsl());
+    System.setProperty(keyStorePropertyName, getKeyStorePathAsUriPathWithNetSslKeyStoreFormat());
     System.setProperty(keyStorePasswordPropertyName, KEYSTORE_PASSWORD);
     System.setProperty("javax.net.ssl.keyStoreType", "PKCS12");
     SSLManager.reset();
@@ -1494,15 +1482,15 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     }
   }
 
-  private String getKeyStorePathForClientSsl() throws IOException {
-    try (InputStream in = getClass().getResourceAsStream("keystore.p12")) {
-      if (in == null) {
-        throw new IllegalStateException("classpath resource keystore.p12 not found");
-      }
-      Path tempKeystore = Files.createTempFile("http2-client-cert-", ".p12");
-      Files.copy(in, tempKeystore, StandardCopyOption.REPLACE_EXISTING);
-      tempKeystore.toFile().deleteOnExit();
-      return tempKeystore.toAbsolutePath().normalize().toString();
+  private String getKeyStorePathAsUriPathWithNetSslKeyStoreFormat() {
+    try {
+      // Generate a absolute path in URI format with compatibility with Windows
+      // IMPORTANT: javax.net.ssl.keyStore use a particular format,
+      // this method try to generate in that format and with compatibility with Windows
+      return "/" + new File("//").toURI().relativize(getClass().getResource("keystore.p12").toURI())
+          .getPath();
+    } catch (URISyntaxException e) {
+      throw new RuntimeException(e);
     }
   }
 
