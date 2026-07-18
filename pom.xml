@@ -30,7 +30,7 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-    <jmeter.version>5.4.1</jmeter.version>
+    <jmeter.version>5.5</jmeter.version>
     <jetty.version>12.1.11</jetty.version>
     <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.11 -->
     <brotli4j.version>1.23.0</brotli4j.version>
@@ -50,11 +50,11 @@
       <scope>provided</scope>
     </dependency>
     <!-- Apache HttpClient for compilation (classes used in JettyCacheManager) -->
-    <!-- Using same version as JMeter 5.4.1 -->
+    <!-- Using same version as JMeter 5.5 (our minimum supported version) -->
     <dependency>
       <groupId>org.apache.httpcomponents</groupId>
       <artifactId>httpcore</artifactId>
-      <version>4.4.14</version>
+      <version>4.4.15</version>
       <scope>compile</scope>
     </dependency>
     <dependency>
