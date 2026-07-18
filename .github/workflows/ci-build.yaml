@@ -10,6 +10,13 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 5.5 is the minimum supported JMeter version, 5.6.3 the latest; both are exercised
+        # end-to-end (unit + HTTP parity regression tests) since ApacheJMeter_* are provided-scope
+        # and the same compiled plugin must behave correctly against either at runtime.
+        jmeter_version: ["5.5", "5.6.3"]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -21,14 +28,17 @@ jobs:
           java-version: "17"
           cache: maven
 
-      - name: Build and test
-        run: xvfb-run -a mvn -U --batch-mode clean install
+      - name: Build and test (JMeter ${{ matrix.jmeter_version }})
+        run: >-
+          xvfb-run -a mvn -U --batch-mode
+          -Djmeter.version=${{ matrix.jmeter_version }}
+          clean install
 
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: ci-build-artifacts-${{ github.run_id }}
+          name: ci-build-artifacts-${{ matrix.jmeter_version }}-${{ github.run_id }}
           path: |
             target/jmeter-bzm-http2-*.jar
             target/jmeter-test
