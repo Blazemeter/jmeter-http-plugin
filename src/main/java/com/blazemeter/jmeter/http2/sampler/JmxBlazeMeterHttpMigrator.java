@@ -48,7 +48,11 @@ public final class JmxBlazeMeterHttpMigrator {
   }
 
   public static HashTree migrateCopy(HashTree source, MigrationResult result) {
-    ListedHashTree copy = new ListedHashTree();
+    // Declared as HashTree (not ListedHashTree) so add(Object) binds to the stable base-class
+    // method: JMeter 5.6.3's ListedHashTree added a covariant add(Object) override that older
+    // jorphan releases (e.g. 5.5) don't have, which would throw NoSuchMethodError at runtime
+    // if this class were compiled against a jar with the override and loaded into an older one.
+    HashTree copy = new ListedHashTree();
     for (Object key : source.list()) {
       Object newKey = maybeReplaceSampler(key, result);
       HashTree sub = source.getTree(key);
