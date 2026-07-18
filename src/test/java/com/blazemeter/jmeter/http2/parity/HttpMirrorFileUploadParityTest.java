@@ -61,9 +61,8 @@ public class HttpMirrorFileUploadParityTest extends HTTP2TestBase {
 
   @Before
   public void setUp() throws Exception {
-    mirrorPort = findFreePort();
-    mirrorServer = new HttpMirrorServer(mirrorPort, 10, 10);
-    mirrorServer.start();
+    mirrorPort = HttpMirrorParitySupport.findFreePort();
+    mirrorServer = HttpMirrorParitySupport.startMirrorServer(mirrorPort);
     client = HttpClient4PluginParitySupport.newHttp1PluginClient("mirror-file-upload");
   }
 
@@ -117,11 +116,5 @@ public class HttpMirrorFileUploadParityTest extends HTTP2TestBase {
     HttpMirrorParitySupport.addFormPair(sampler, DESCRIPTION, descriptionValue, false);
     HttpMirrorParitySupport.addFileUpload(sampler, "file1", uploadFile, "text/plain");
     return sampler;
-  }
-
-  private static int findFreePort() throws Exception {
-    try (java.net.ServerSocket socket = new java.net.ServerSocket(0)) {
-      return socket.getLocalPort();
-    }
   }
 }

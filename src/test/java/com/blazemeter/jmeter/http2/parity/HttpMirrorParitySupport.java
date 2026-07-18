@@ -4,14 +4,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import org.apache.jmeter.config.Arguments;
 import org.apache.jmeter.engine.util.ValueReplacer;
+import org.apache.jmeter.protocol.http.control.HttpMirrorServer;
 import org.apache.jmeter.testelement.TestPlan;
 import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.threads.JMeterVariables;
@@ -27,6 +33,41 @@ public final class HttpMirrorParitySupport {
   public static final String MIRROR_PATH = "/test/somescript.jsp";
 
   private HttpMirrorParitySupport() {
+  }
+
+  public static int findFreePort() throws IOException {
+    try (ServerSocket socket = new ServerSocket(0)) {
+      return socket.getLocalPort();
+    }
+  }
+
+  /**
+   * {@link HttpMirrorServer} extends {@link Thread} and binds its listening socket inside
+   * {@code run()}, so {@code start()} returns before the socket is actually bound - a race that
+   * only shows up under load (e.g. running the full suite), not when a test runs alone. Poll the
+   * port until it accepts a real connection before handing the server back.
+   */
+  public static HttpMirrorServer startMirrorServer(int port) throws Exception {
+    HttpMirrorServer server = new HttpMirrorServer(port, 10, 10);
+    server.start();
+    awaitListening(port);
+    return server;
+  }
+
+  private static void awaitListening(int port) throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    IOException lastFailure = null;
+    while (System.nanoTime() < deadline) {
+      try (Socket probe = new Socket()) {
+        probe.connect(new InetSocketAddress("localhost", port), 200);
+        return;
+      } catch (IOException e) {
+        lastFailure = e;
+        Thread.sleep(20);
+      }
+    }
+    throw new IllegalStateException(
+        "HttpMirrorServer did not start listening on port " + port + " within 5s", lastFailure);
   }
 
   public static HTTP2Sampler baseMirrorSampler(int mirrorPort, String method) {

@@ -34,9 +34,8 @@ public class HttpDisableArgumentsParityTest extends HTTP2TestBase {
 
   @Before
   public void setUp() throws Exception {
-    mirrorPort = findFreePort();
-    mirrorServer = new HttpMirrorServer(mirrorPort, 10, 10);
-    mirrorServer.start();
+    mirrorPort = HttpMirrorParitySupport.findFreePort();
+    mirrorServer = HttpMirrorParitySupport.startMirrorServer(mirrorPort);
     client = HttpClient4PluginParitySupport.newHttp1PluginClient("disable-args-parity");
   }
 
@@ -77,11 +76,5 @@ public class HttpDisableArgumentsParityTest extends HTTP2TestBase {
     assertThat(plugin.getResponseDataAsString()).doesNotContain("blank-name");
     assertThat(reference.getResponseDataAsString()).doesNotContain("unresolved");
     assertThat(plugin.getResponseDataAsString()).doesNotContain("unresolved");
-  }
-
-  private static int findFreePort() throws Exception {
-    try (java.net.ServerSocket socket = new java.net.ServerSocket(0)) {
-      return socket.getLocalPort();
-    }
   }
 }

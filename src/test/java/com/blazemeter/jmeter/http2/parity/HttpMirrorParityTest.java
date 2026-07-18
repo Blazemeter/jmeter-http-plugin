@@ -53,9 +53,8 @@ public class HttpMirrorParityTest extends HTTP2TestBase {
 
   @Before
   public void setUp() throws Exception {
-    mirrorPort = findFreePort();
-    mirrorServer = new HttpMirrorServer(mirrorPort, 10, 10);
-    mirrorServer.start();
+    mirrorPort = HttpMirrorParitySupport.findFreePort();
+    mirrorServer = HttpMirrorParitySupport.startMirrorServer(mirrorPort);
     client = HttpClient4PluginParitySupport.newHttp1PluginClient("mirror-parity");
   }
 
@@ -216,11 +215,5 @@ public class HttpMirrorParityTest extends HTTP2TestBase {
     result.assertRequestLineMatches();
     result.assertPostBodyContains("title=mytitle");
     result.assertPostBodyContains("description=mydescription");
-  }
-
-  private static int findFreePort() throws Exception {
-    try (java.net.ServerSocket socket = new java.net.ServerSocket(0)) {
-      return socket.getLocalPort();
-    }
   }
 }
