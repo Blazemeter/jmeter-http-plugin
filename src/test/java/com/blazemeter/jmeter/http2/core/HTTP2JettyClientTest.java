@@ -19,6 +19,9 @@ import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_BRO
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_ZSTD;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_WITH_BODY;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_302;
+import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_302_TO_ECHO;
+import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_307_TO_ECHO;
+import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_308_TO_ECHO;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_400;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_401_NO_WWW_AUTHENTICATE;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_BIG_RESPONSE;
@@ -224,6 +227,134 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     softly.assertThat(result.getRedirectLocation())
         .isEqualTo("https://localhost:" + getActivePort() + SERVER_PATH_200);
     softly.assertThat(result.getResponseDataAsString()).isEmpty();
+  }
+
+  @Test
+  public void shouldNotResendRequestBodyWhenPostRedirectIsFollowedAsGet() throws Exception {
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.POST);
+    sampler.setFollowRedirects(true);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+    HTTPSampleResult result = sample(SERVER_PATH_302_TO_ECHO, HTTPConstants.POST);
+
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    SampleResult[] subResults = result.getSubResults();
+    softly.assertThat(subResults.length).isGreaterThan(0);
+    HTTPSampleResult followUp = (HTTPSampleResult) subResults[subResults.length - 1];
+    softly.assertThat(followUp.getHTTPMethod()).isEqualTo(HTTPConstants.GET);
+    // SERVER_PATH_302_TO_ECHO redirects to SERVER_PATH_200_WITH_BODY, which echoes back
+    // any request body it receives. JMeter core rewrites POST to GET when following a
+    // 302, so the follow-up request must not carry the original POST entity (RFC 9110
+    // section 15.4.3; matches HTTPSamplerProxy/HttpClient4 behavior).
+    softly.assertThat(followUp.getResponseDataAsString()).isEmpty();
+  }
+
+  @Test
+  public void shouldPreserveRequestBodyWhenPostRedirectIsFollowedAs307ViaAutoRedirects()
+      throws Exception {
+    // Unlike 301/302/303, RFC 9110 section 15.4.8 requires a 307 redirect to preserve the
+    // original method and body. With autoRedirects enabled, Jetty's own redirect support
+    // handles the follow-up (not JMeter's manual loop, see the *ViaFollowRedirectsOnly test
+    // below), and already implements this correctly - this test locks that in.
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.POST);
+    sampler.setFollowRedirects(true);
+    sampler.setAutoRedirects(true);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+    HTTPSampleResult result = sample(SERVER_PATH_307_TO_ECHO, HTTPConstants.POST);
+
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    softly.assertThat(result.getResponseDataAsString())
+        .isEqualTo("test1=" + TEST_ARGUMENT_1 + "&test2=" + TEST_ARGUMENT_2);
+  }
+
+  @Test
+  public void shouldPreserveRequestBodyWhenPostRedirectIsFollowedAs307ViaFollowRedirectsOnly()
+      throws Exception {
+    // With autoRedirects OFF, JMeter's own manual follow-redirects loop drives this instead of
+    // Jetty. Apache JMeter got this wrong until apache/jmeter PR #6658 (merged 2026-03-19, not
+    // yet in the 5.6.3 release this project targets): HTTPSampleResult.isRedirect() only
+    // recognized 307 as a redirect for GET/HEAD (a POST+307 was returned as-is, never followed),
+    // and HTTPSamplerBase.computeMethodForRedirect() rewrote every redirected method to GET
+    // regardless of status code, dropping the body. HTTP2Sampler.resultProcessing() and
+    // .followRedirects() port JMeter's own logic with that upstream fix applied, so this path
+    // is correct even against JMeter 5.6.3's own (buggy) inherited implementation.
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.POST);
+    sampler.setFollowRedirects(true);
+    sampler.setAutoRedirects(false);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+    HTTPSampleResult result = sample(SERVER_PATH_307_TO_ECHO, HTTPConstants.POST);
+
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    HTTPSampleResult followUp =
+        (HTTPSampleResult) result.getSubResults()[result.getSubResults().length - 1];
+    softly.assertThat(followUp.getHTTPMethod()).isEqualTo(HTTPConstants.POST);
+    softly.assertThat(followUp.getResponseDataAsString())
+        .isEqualTo("test1=" + TEST_ARGUMENT_1 + "&test2=" + TEST_ARGUMENT_2);
+  }
+
+  @Test
+  public void shouldPreserveRequestBodyWhenPostRedirectIsFollowedAs308ViaFollowRedirectsOnly()
+      throws Exception {
+    // Same fix as the 307 case above (RFC 9110 section 15.4.9): unlike 307, JMeter 5.6.3's
+    // isRedirect() already recognized 308 for any method, but computeMethodForRedirect() still
+    // rewrote it to GET, dropping the body.
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.POST);
+    sampler.setFollowRedirects(true);
+    sampler.setAutoRedirects(false);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+    HTTPSampleResult result = sample(SERVER_PATH_308_TO_ECHO, HTTPConstants.POST);
+
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    HTTPSampleResult followUp =
+        (HTTPSampleResult) result.getSubResults()[result.getSubResults().length - 1];
+    softly.assertThat(followUp.getHTTPMethod()).isEqualTo(HTTPConstants.POST);
+    softly.assertThat(followUp.getResponseDataAsString())
+        .isEqualTo("test1=" + TEST_ARGUMENT_1 + "&test2=" + TEST_ARGUMENT_2);
+  }
+
+  @Test
+  public void shouldMatchJMeter563OriginalBehaviorWhenLegacyRedirectMethodHandlingEnabled()
+      throws Exception {
+    // Opt-out flag for users who need byte-for-byte parity with stock JMeter 5.6.3, bug
+    // included: a POST+307 is returned as-is (never followed), matching HTTPSampleResult
+    // .isRedirect()'s unfixed behavior for that status code.
+    String property = "blazemeter.http.legacyRedirectMethodHandling";
+    String previous = JMeterUtils.getProperty(property);
+    JMeterUtils.setProperty(property, "true");
+    try {
+      buildStartedServer();
+      sampler.setMethod(HTTPConstants.POST);
+      sampler.setFollowRedirects(true);
+      sampler.setAutoRedirects(false);
+      sampler.addArgument("test1", TEST_ARGUMENT_1);
+      sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+      HTTPSampleResult result = sample(SERVER_PATH_307_TO_ECHO, HTTPConstants.POST);
+
+      softly.assertThat(result.getResponseCode()).isEqualTo("307");
+      softly.assertThat(result.getSubResults().length).isEqualTo(0);
+    } finally {
+      if (previous == null) {
+        JMeterUtils.getJMeterProperties().remove(property);
+      } else {
+        JMeterUtils.setProperty(property, previous);
+      }
+    }
   }
 
   private void buildStartedServer() throws Exception {

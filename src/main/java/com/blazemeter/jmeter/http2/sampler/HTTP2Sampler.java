@@ -10,9 +10,11 @@ import com.blazemeter.jmeter.http2.core.HpackFailureDetector;
 import com.blazemeter.jmeter.http2.core.JmeterHttpClientExceptionMapper;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
+import com.blazemeter.jmeter.http2.util.Rfc9110Redirects;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.helger.commons.annotation.VisibleForTesting;
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.MalformedURLException;
 import java.net.URISyntaxException;
@@ -757,9 +759,118 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         : buildClient();
   }
 
+  /**
+   * JMeter 5.6.3's {@code HTTPSampleResult.isRedirect()} only recognizes a {@code 307} as a
+   * redirect for GET/HEAD, so a POST/PUT/PATCH/DELETE + 307 is returned as-is by the inherited
+   * {@code resultProcessing()} - {@link #followRedirects} below is never even reached. See
+   * {@link Rfc9110Redirects} for the fix this ports (apache/jmeter PR #6658) and why it's applied
+   * this way instead of overriding {@code HTTPSampleResult.isRedirect()} directly. This drives
+   * the follow-up itself only for that one gap, then hands off to the inherited
+   * {@code resultProcessing()} (marking {@code areFollowingRedirect=true}) for everything else
+   * (embedded resources, etc.) exactly as it would normally run. Falls back to the unfixed
+   * inherited behavior when {@link Rfc9110Redirects#useLegacyMethodHandling()}.
+   */
+  @Override
   public HTTPSampleResult resultProcessing(final boolean pAreFollowingRedirect,
                                            final int frameDepth, final HTTPSampleResult pRes) {
+    if (!Rfc9110Redirects.useLegacyMethodHandling()
+        && !pAreFollowingRedirect
+        && !pRes.isRedirect()
+        && Rfc9110Redirects.isRedirect(pRes.getResponseCode())
+        && getFollowRedirects()) {
+      HTTPSampleResult followed = followRedirects(pRes, frameDepth);
+      return super.resultProcessing(true, frameDepth, followed);
+    }
     return super.resultProcessing(pAreFollowingRedirect, frameDepth, pRes);
+  }
+
+  /**
+   * Ported from {@code HTTPSamplerBase.followRedirects} (JMeter 5.6.3) with the fix from
+   * apache/jmeter PR #6658 (see {@link Rfc9110Redirects} and {@link #resultProcessing}):
+   * {@code computeMethodForRedirect} now takes the response code into account so 307/308
+   * preserve the original method (RFC 9110 sections 15.4.8/15.4.9), instead of always rewriting
+   * to GET like 301/302/303 do. Uses {@link Rfc9110Redirects#isRedirect} instead of
+   * {@code HTTPSampleResult.isRedirect()} to decide whether to keep following a redirect chain,
+   * for the same reason {@link #resultProcessing} avoids relying on that method for 307. Falls
+   * back to the inherited, unfixed JMeter behavior when
+   * {@link Rfc9110Redirects#useLegacyMethodHandling()}.
+   */
+  @Override
+  protected HTTPSampleResult followRedirects(HTTPSampleResult res, int frameDepth) {
+    if (Rfc9110Redirects.useLegacyMethodHandling()) {
+      return super.followRedirects(res, frameDepth);
+    }
+    HTTPSampleResult totalRes = new HTTPSampleResult(res);
+    totalRes.addRawSubResult(res);
+    HTTPSampleResult lastRes = res;
+
+    int redirect;
+    for (redirect = 0; redirect < MAX_REDIRECTS; redirect++) {
+      boolean invalidRedirectUrl = false;
+      String location = lastRes.getRedirectLocation();
+      if (JMeterUtils.getPropDefault("httpsampler.redirect.removeslashdotdot", true)) {
+        location = ConversionUtils.removeSlashDotDot(location);
+      }
+      location = encodeSpaces(location);
+      String method = computeMethodForRedirect(lastRes.getHTTPMethod(), lastRes.getResponseCode());
+
+      try {
+        URL url = ConversionUtils.makeRelativeURL(lastRes.getURL(), location);
+        url = ConversionUtils.sanitizeUrl(url).toURL();
+        HTTPSampleResult tempRes = sample(url, method, true, frameDepth);
+        if (tempRes != null) {
+          lastRes = tempRes;
+        } else {
+          break;
+        }
+      } catch (MalformedURLException | URISyntaxException e) {
+        errorResult(e, lastRes);
+        invalidRedirectUrl = true;
+      }
+      if (lastRes.getSubResults() != null && lastRes.getSubResults().length > 0) {
+        for (SampleResult sub : lastRes.getSubResults()) {
+          totalRes.addSubResult(sub);
+        }
+      } else if (!invalidRedirectUrl) {
+        totalRes.addSubResult(lastRes);
+      }
+
+      if (!Rfc9110Redirects.isRedirect(lastRes.getResponseCode())) {
+        break;
+      }
+    }
+    if (redirect >= MAX_REDIRECTS) {
+      lastRes = errorResult(
+          new IOException("Exceeded maximum number of redirects: " + MAX_REDIRECTS),
+          new HTTPSampleResult(lastRes));
+      totalRes.addSubResult(lastRes);
+    }
+
+    totalRes.setSampleLabel(totalRes.getSampleLabel() + "->" + lastRes.getSampleLabel());
+    totalRes.setURL(lastRes.getURL());
+    totalRes.setHTTPMethod(lastRes.getHTTPMethod());
+    totalRes.setQueryString(lastRes.getQueryString());
+    totalRes.setRequestHeaders(lastRes.getRequestHeaders());
+    totalRes.setResponseData(lastRes.getResponseData());
+    totalRes.setResponseCode(lastRes.getResponseCode());
+    totalRes.setSuccessful(lastRes.isSuccessful());
+    totalRes.setResponseMessage(lastRes.getResponseMessage());
+    totalRes.setDataType(lastRes.getDataType());
+    totalRes.setResponseHeaders(lastRes.getResponseHeaders());
+    totalRes.setContentType(lastRes.getContentType());
+    totalRes.setDataEncoding(lastRes.getDataEncodingNoDefault());
+    return totalRes;
+  }
+
+  private String computeMethodForRedirect(String initialMethod, String responseCode) {
+    if (HTTPConstants.SC_TEMPORARY_REDIRECT.equals(responseCode)
+        || HTTPConstants.SC_PERMANENT_REDIRECT.equals(responseCode)) {
+      return initialMethod;
+    }
+    if (!HTTPConstants.HEAD.equalsIgnoreCase(initialMethod)) {
+      return HTTPConstants.GET;
+    }
+    return initialMethod;
   }
 
   static void registerParser(String contentType, String className) {

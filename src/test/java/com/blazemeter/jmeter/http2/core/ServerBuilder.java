@@ -87,6 +87,13 @@ public class ServerBuilder {
    */
   public static final String SERVER_PATH_401_NO_WWW_AUTHENTICATE = "/test/401-no-www-authenticate";
   public static final String SERVER_PATH_302 = "/test/302";
+  /** Redirects to {@link #SERVER_PATH_200_WITH_BODY}, which echoes back whatever body it received. */
+  public static final String SERVER_PATH_302_TO_ECHO = "/test/302-to-echo";
+  /** Same as {@link #SERVER_PATH_302_TO_ECHO} but with a 307, which RFC 9110 requires to
+   *  preserve the original method and body (unlike 301/302/303). */
+  public static final String SERVER_PATH_307_TO_ECHO = "/test/307-to-echo";
+  /** Same as {@link #SERVER_PATH_307_TO_ECHO} but with a 308 (also method/body-preserving). */
+  public static final String SERVER_PATH_308_TO_ECHO = "/test/308-to-echo";
   public static final String SERVER_PATH_200_WITH_BODY = "/test/body";
   public static final String SERVER_PATH_JSON_ONLY = "/test/json-only";
   public static final String SERVER_PATH_DELETE_DATA = "/test/delete";
@@ -324,6 +331,21 @@ public class ServerBuilder {
             resp.addHeader(HTTPConstants.HEADER_LOCATION,
                 "https://localhost:" + req.getLocalPort() + SERVER_PATH_200);
             resp.setStatus(HttpStatus.FOUND_302);
+            break;
+          case SERVER_PATH_302_TO_ECHO:
+            resp.addHeader(HTTPConstants.HEADER_LOCATION,
+                "https://localhost:" + req.getLocalPort() + SERVER_PATH_200_WITH_BODY);
+            resp.setStatus(HttpStatus.FOUND_302);
+            break;
+          case SERVER_PATH_307_TO_ECHO:
+            resp.addHeader(HTTPConstants.HEADER_LOCATION,
+                "https://localhost:" + req.getLocalPort() + SERVER_PATH_200_WITH_BODY);
+            resp.setStatus(HttpStatus.TEMPORARY_REDIRECT_307);
+            break;
+          case SERVER_PATH_308_TO_ECHO:
+            resp.addHeader(HTTPConstants.HEADER_LOCATION,
+                "https://localhost:" + req.getLocalPort() + SERVER_PATH_200_WITH_BODY);
+            resp.setStatus(HttpStatus.PERMANENT_REDIRECT_308);
             break;
           case SERVER_PATH_200_WITH_BODY:
             String bodyRequest = req.getReader().lines().collect(Collectors.joining());
