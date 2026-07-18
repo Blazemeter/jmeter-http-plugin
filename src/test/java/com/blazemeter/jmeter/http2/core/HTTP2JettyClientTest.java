@@ -1443,6 +1443,18 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     sampleWithGet();
   }
 
+  private String getKeyStorePathAsUriPathWithNetSslKeyStoreFormat() {
+    try {
+      // Generate a absolute path in URI format with compatibility with Windows
+      // IMPORTANT: javax.net.ssl.keyStore use a particular format,
+      // this method try to generate in that format and with compatibility with Windows
+      return "/" + new File("//").toURI().relativize(getClass().getResource("keystore.p12").toURI())
+          .getPath();
+    } catch (URISyntaxException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
   @Test
   public void shouldGetSuccessResponseWhenServerRequiresClientCertAndOneIsConfigured()
       throws Exception {
@@ -1479,18 +1491,6 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
       System.clearProperty(keyStorePasswordPropertyName);
       System.clearProperty("javax.net.ssl.keyStoreType");
       SSLManager.reset();
-    }
-  }
-
-  private String getKeyStorePathAsUriPathWithNetSslKeyStoreFormat() {
-    try {
-      // Generate a absolute path in URI format with compatibility with Windows
-      // IMPORTANT: javax.net.ssl.keyStore use a particular format,
-      // this method try to generate in that format and with compatibility with Windows
-      return "/" + new File("//").toURI().relativize(getClass().getResource("keystore.p12").toURI())
-          .getPath();
-    } catch (URISyntaxException e) {
-      throw new RuntimeException(e);
     }
   }
 
