@@ -31,6 +31,18 @@ public class HttpRedirectsParityTest extends HTTP2TestBase {
   @Parameterized.Parameter(2)
   public boolean shouldExposeRedirectLocation;
 
+  /**
+   * Whether THIS plugin exposes the redirect location - differs from
+   * {@link #shouldExposeRedirectLocation} (which reference HttpClient4/JMeter 5.6.3 does) only
+   * for 307 + a non-GET/HEAD method: JMeter 5.6.3's {@code HTTPSampleResult.isRedirect()} treats
+   * that combination as "not a redirect" and never exposes the location, a bug fixed upstream in
+   * apache/jmeter PR #6658 (see {@code Rfc9110Redirects}). This plugin ports that fix by default,
+   * so it deliberately diverges from the (buggy) reference here; set
+   * {@code -Dblazemeter.http.legacyRedirectMethodHandling=true} to match the reference exactly.
+   */
+  @Parameterized.Parameter(3)
+  public boolean pluginShouldExposeRedirectLocation;
+
   private ParityRedirectServer redirectServer;
   private HTTP2JettyClient client;
   private HTTP2Sampler sampler;
@@ -50,8 +62,8 @@ public class HttpRedirectsParityTest extends HTTP2TestBase {
         row(303, "POST", true),
         row(307, "GET", true),
         row(307, "HEAD", true),
-        row(307, "POST", false),
-        row(307, "PUT", false),
+        row(307, "POST", false, true),
+        row(307, "PUT", false, true),
         row(308, "GET", true),
         row(308, "HEAD", true),
         row(308, "POST", true),
@@ -62,7 +74,12 @@ public class HttpRedirectsParityTest extends HTTP2TestBase {
   }
 
   private static Object[] row(int code, String method, boolean shouldRedirect) {
-    return new Object[] {code, method, shouldRedirect};
+    return row(code, method, shouldRedirect, shouldRedirect);
+  }
+
+  private static Object[] row(int code, String method, boolean shouldRedirect,
+      boolean pluginShouldRedirect) {
+    return new Object[] {code, method, shouldRedirect, pluginShouldRedirect};
   }
 
   @BeforeClass
@@ -101,16 +118,24 @@ public class HttpRedirectsParityTest extends HTTP2TestBase {
     HTTPSampleResult reference = HttpClient4PluginParitySupport.sampleHttpClient4(sampler, url);
     HTTPSampleResult plugin = HttpClient4PluginParitySupport.samplePlugin(client, sampler, url);
 
-    HttpClient4PluginParitySupport.assertCoreParity(reference, plugin,
-        redirectCode + " " + method);
+    // Not assertCoreParity(): its blanket redirectLocation check doesn't allow the deliberate
+    // 307+non-GET/HEAD divergence below, so success/response code/message are asserted directly.
+    String context = redirectCode + " " + method;
+    org.assertj.core.api.Assertions.assertThat(plugin.isSuccessful())
+        .as("%s success", context).isEqualTo(reference.isSuccessful());
+    org.assertj.core.api.Assertions.assertThat(plugin.getResponseCode())
+        .as("%s response code", context).isEqualTo(reference.getResponseCode());
 
-    String expectedLocation = shouldExposeRedirectLocation
+    String expectedReferenceLocation = shouldExposeRedirectLocation
+        ? redirectServer.url("/target")
+        : null;
+    String expectedPluginLocation = pluginShouldExposeRedirectLocation
         ? redirectServer.url("/target")
         : null;
     org.assertj.core.api.Assertions.assertThat(reference.getRedirectLocation())
-        .isEqualTo(expectedLocation);
+        .isEqualTo(expectedReferenceLocation);
     org.assertj.core.api.Assertions.assertThat(plugin.getRedirectLocation())
-        .isEqualTo(expectedLocation);
+        .isEqualTo(expectedPluginLocation);
     org.assertj.core.api.Assertions.assertThat(reference.getResponseCode())
         .isEqualTo(String.valueOf(redirectCode));
     org.assertj.core.api.Assertions.assertThat(plugin.getResponseCode())
