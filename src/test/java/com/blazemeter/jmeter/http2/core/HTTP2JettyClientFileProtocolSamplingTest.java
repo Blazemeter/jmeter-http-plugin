@@ -9,6 +9,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.junit.After;
@@ -49,7 +50,15 @@ public class HTTP2JettyClientFileProtocolSamplingTest extends HTTP2TestBase {
     assertThat(sampled.isSuccessful()).isTrue();
     assertThat(sampled.getResponseCode()).isEqualTo("200");
     assertThat(sampled.getHTTPMethod()).isEqualTo(HTTPConstants.GET);
-    assertThat(sampled.getContentType()).isEqualTo("text/html");
+    // HTTP2Sampler.getContentEncoding()'s default is JMeter-version-dependent: 5.6.3 added a
+    // hardcoded UTF-8 schema default (HTTPSamplerBaseSchema), while 5.5 (our minimum supported
+    // version) leaves it blank until explicitly set. Read the sampler's actual runtime default
+    // instead of hardcoding the literal so this test passes on both supported versions.
+    String defaultContentEncoding = new HTTP2Sampler().getContentEncoding();
+    String expectedContentType = StringUtils.isBlank(defaultContentEncoding)
+        ? "text/html"
+        : "text/html; charset=" + defaultContentEncoding;
+    assertThat(sampled.getContentType()).isEqualTo(expectedContentType);
     assertThat(sampled.getResponseDataAsString()).isEqualTo(fileContent);
   }
 
