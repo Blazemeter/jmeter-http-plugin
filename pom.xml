@@ -33,8 +33,8 @@
     <jmeter.version>5.5</jmeter.version>
     <jmeter.regression.version>5.6.3</jmeter.regression.version>
     <jmeter.regression.tests>TEST_HTTP,ResponseDecompression,TestHeaderManager,TestCookieManager</jmeter.regression.tests>
-    <jmeter.regression.tier4.tests>HTMLParserTestFile_2,TEST_HTTPS,Http4ImplDigestAuth,Http4ImplPreemptiveBasicAuth</jmeter.regression.tier4.tests>
-    <jmeter.regression.flaky.tests>TestKeepAlive,TestRedirectionPolicies</jmeter.regression.flaky.tests>
+    <jmeter.regression.extended.tests>HTMLParserTestFile_2,TEST_HTTPS,Http4ImplDigestAuth,Http4ImplPreemptiveBasicAuth</jmeter.regression.extended.tests>
+    <jmeter.regression.external.tests>TestKeepAlive,TestRedirectionPolicies</jmeter.regression.external.tests>
     <jetty.version>12.1.11</jetty.version>
     <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.11 -->
     <brotli4j.version>1.23.0</brotli4j.version>
@@ -719,13 +719,13 @@
       </build>
     </profile>
     <profile>
-      <id>jmeter-regression-f4</id>
+      <id>jmeter-regression-extended</id>
       <properties>
         <checkstyle.skip>true</checkstyle.skip>
         <skipTests>true</skipTests>
         <jmeter.regression>true</jmeter.regression>
-        <jmeter.regression.tier>4</jmeter.regression.tier>
-        <jmeter.regression.tests>${jmeter.regression.tier4.tests}</jmeter.regression.tests>
+        <jmeter.regression.tier>extended</jmeter.regression.tier>
+        <jmeter.regression.tests>${jmeter.regression.extended.tests}</jmeter.regression.tests>
       </properties>
       <build>
         <plugins>
@@ -757,13 +757,13 @@
       </build>
     </profile>
     <profile>
-      <id>jmeter-regression-flaky</id>
+      <id>jmeter-regression-external</id>
       <properties>
         <checkstyle.skip>true</checkstyle.skip>
         <skipTests>true</skipTests>
         <jmeter.regression>true</jmeter.regression>
-        <jmeter.regression.tier>flaky</jmeter.regression.tier>
-        <jmeter.regression.tests>${jmeter.regression.flaky.tests}</jmeter.regression.tests>
+        <jmeter.regression.tier>external</jmeter.regression.tier>
+        <jmeter.regression.tests>${jmeter.regression.external.tests}</jmeter.regression.tests>
       </properties>
       <build>
         <plugins>

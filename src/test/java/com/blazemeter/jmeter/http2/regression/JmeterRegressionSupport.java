@@ -20,19 +20,21 @@ public final class JmeterRegressionSupport {
   private JmeterRegressionSupport() {
   }
 
-  public static final String TIER1_TESTS =
+  public static final String CORE_TESTS =
       "TEST_HTTP,ResponseDecompression,TestHeaderManager,TestCookieManager";
 
-  /** F4: HTTPS, HTML embedded parser, digest/basic auth (see docs/jmeter-regression.md). */
-  public static final String TIER4_TESTS =
+  /** Extended: HTTPS, HTML embedded parser, digest/basic auth (see docs/jmeter-regression.md). */
+  public static final String EXTENDED_TESTS =
       "HTMLParserTestFile_2,TEST_HTTPS,Http4ImplDigestAuth,Http4ImplPreemptiveBasicAuth";
 
-  /** Optional / flaky Apache batch plans (external services; not in default CI). */
-  /** HTTP-focused flaky plans (BUG_62847/Bug54685 are JMeter core-only, not HTTP sampler tests). */
-  public static final String TIER_FLAKY_TESTS = "TestKeepAlive,TestRedirectionPolicies";
+  /**
+   * HTTP-focused plans that call real third-party hosts (not in default CI; opt-in only).
+   * BUG_62847/Bug54685 are JMeter core-only plans, not HTTP sampler tests, so they're excluded.
+   */
+  public static final String EXTERNAL_TESTS = "TestKeepAlive,TestRedirectionPolicies";
 
   /** Optional; requires HttpClient4 CPS throttling not yet implemented in the Jetty client. */
-  public static final String TIER_FLAKY_OPTIONAL_TESTS = "SlowCharsFeature";
+  public static final String EXTERNAL_OPTIONAL_TESTS = "SlowCharsFeature";
 
   /**
    * Plans that call third-party hosts; ref/plugin runs are sequential so 5xx vs 2xx drift is
@@ -50,7 +52,7 @@ public final class JmeterRegressionSupport {
         && !Boolean.getBoolean("jmeter.regression.enableSlowChars");
   }
 
-  private static final String DEFAULT_REGRESSION_TESTS = TIER1_TESTS;
+  private static final String DEFAULT_REGRESSION_TESTS = CORE_TESTS;
 
   /** Plans that only make sense against HttpClient4 / HTTP/1.1 (keep-alive, Connection: close). */
   private static final Set<String> HTTP1_ONLY_PLANS = Set.of("TestKeepAlive");
@@ -196,10 +198,10 @@ public final class JmeterRegressionSupport {
       return null;
     }
     return switch (tier.trim().toLowerCase(Locale.ROOT)) {
-      case "1", "tier1", "tier-1" -> TIER1_TESTS;
-      case "4", "f4", "tier4", "tier-4" -> TIER4_TESTS;
-      case "flaky", "optional" -> TIER_FLAKY_TESTS;
-      case "all" -> TIER1_TESTS + "," + TIER4_TESTS + "," + TIER_FLAKY_TESTS;
+      case "core" -> CORE_TESTS;
+      case "extended" -> EXTENDED_TESTS;
+      case "external", "optional" -> EXTERNAL_TESTS;
+      case "all" -> CORE_TESTS + "," + EXTENDED_TESTS + "," + EXTERNAL_TESTS;
       default -> null;
     };
   }
