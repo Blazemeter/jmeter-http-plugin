@@ -10,10 +10,11 @@ import java.io.File;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.Path;
+import org.apache.jmeter.config.Arguments;
+import org.apache.jmeter.protocol.http.sampler.HTTPSamplerProxy;
 import org.apache.jorphan.collections.HashTree;
+import org.apache.jorphan.collections.ListedHashTree;
 import org.junit.Before;
-import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -23,25 +24,13 @@ public class JmxBlazeMeterHttpMigratorCliTest extends HTTP2TestBase {
   @Rule
   public TemporaryFolder tempFolder = new TemporaryFolder();
 
-  private static File testHttpJmx;
-  private static File testGetJmx;
+  private File sampleJmx;
+  private File otherSampleJmx;
 
   private ByteArrayOutputStream outBuffer;
   private ByteArrayOutputStream errBuffer;
   private PrintStream out;
   private PrintStream err;
-
-  @BeforeClass
-  public static void locateFixtures() {
-    testHttpJmx =
-        Path.of("src", "test", "resources", "jmeter-regression", "5.6.3", "TEST_HTTP.jmx")
-            .toFile();
-    testGetJmx =
-        Path.of("src", "test", "resources", "jmeter-regression", "5.6.3", "TEST_GET.jmx")
-            .toFile();
-    assertTrue(testHttpJmx.isFile());
-    assertTrue(testGetJmx.isFile());
-  }
 
   @Before
   public void setUpStreams() {
@@ -49,6 +38,14 @@ public class JmxBlazeMeterHttpMigratorCliTest extends HTTP2TestBase {
     errBuffer = new ByteArrayOutputStream();
     out = new PrintStream(outBuffer, true, StandardCharsets.UTF_8);
     err = new PrintStream(errBuffer, true, StandardCharsets.UTF_8);
+  }
+
+  @Before
+  public void writeSampleFixtures() throws Exception {
+    sampleJmx = tempFolder.newFile("sample.jmx");
+    JmxBlazeMeterHttpMigrator.saveTree(buildSamplePlan("first-call", "/a"), sampleJmx);
+    otherSampleJmx = tempFolder.newFile("other-sample.jmx");
+    JmxBlazeMeterHttpMigrator.saveTree(buildSamplePlan("second-call", "/b"), otherSampleJmx);
   }
 
   @Test
@@ -68,14 +65,14 @@ public class JmxBlazeMeterHttpMigratorCliTest extends HTTP2TestBase {
   @Test
   public void failsWithUsageErrorWhenTargetAndInPlaceConflict() {
     int exitCode = JmxBlazeMeterHttpMigratorCli.run(
-        new String[] {testHttpJmx.getPath(), "out.jmx", "--in-place"}, out, err);
+        new String[] {sampleJmx.getPath(), "out.jmx", "--in-place"}, out, err);
     assertEquals(JmxBlazeMeterHttpMigratorCli.EXIT_USAGE_ERROR, exitCode);
   }
 
   @Test
   public void failsWithUsageErrorWhenNeitherTargetNorInPlaceNorDryRun() {
     int exitCode =
-        JmxBlazeMeterHttpMigratorCli.run(new String[] {testHttpJmx.getPath()}, out, err);
+        JmxBlazeMeterHttpMigratorCli.run(new String[] {sampleJmx.getPath()}, out, err);
     assertEquals(JmxBlazeMeterHttpMigratorCli.EXIT_USAGE_ERROR, exitCode);
   }
 
@@ -92,7 +89,7 @@ public class JmxBlazeMeterHttpMigratorCliTest extends HTTP2TestBase {
   public void migratesSingleFileToTarget() throws Exception {
     File target = new File(tempFolder.getRoot(), "migrated.jmx");
     int exitCode = JmxBlazeMeterHttpMigratorCli.run(
-        new String[] {testHttpJmx.getPath(), target.getPath()}, out, err);
+        new String[] {sampleJmx.getPath(), target.getPath()}, out, err);
     assertEquals(JmxBlazeMeterHttpMigratorCli.EXIT_OK, exitCode);
     assertTrue(target.isFile());
 
@@ -100,7 +97,7 @@ public class JmxBlazeMeterHttpMigratorCliTest extends HTTP2TestBase {
     assertEquals(0, JmxBlazeMeterHttpMigrator.countMigratableSamplers(migrated));
     assertTrue(JmxBlazeMeterHttpMigrator.countHttp2Samplers(migrated) > 0);
 
-    HashTree original = JmxBlazeMeterHttpMigrator.loadTree(testHttpJmx);
+    HashTree original = JmxBlazeMeterHttpMigrator.loadTree(sampleJmx);
     assertTrue("source file must stay untouched",
         JmxBlazeMeterHttpMigrator.countMigratableSamplers(original) > 0);
   }
@@ -108,7 +105,7 @@ public class JmxBlazeMeterHttpMigratorCliTest extends HTTP2TestBase {
   @Test
   public void migratesSingleFileInPlace() throws Exception {
     File source = tempFolder.newFile("in-place.jmx");
-    Files.copy(testHttpJmx.toPath(), source.toPath(),
+    Files.copy(sampleJmx.toPath(), source.toPath(),
         java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 
     int exitCode = JmxBlazeMeterHttpMigratorCli.run(
@@ -123,7 +120,7 @@ public class JmxBlazeMeterHttpMigratorCliTest extends HTTP2TestBase {
   @Test
   public void dryRunReportsCountWithoutWriting() throws Exception {
     File source = tempFolder.newFile("dry-run.jmx");
-    Files.copy(testHttpJmx.toPath(), source.toPath(),
+    Files.copy(sampleJmx.toPath(), source.toPath(),
         java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     long beforeModified = source.lastModified();
     long beforeLength = source.length();
@@ -141,33 +138,33 @@ public class JmxBlazeMeterHttpMigratorCliTest extends HTTP2TestBase {
     File sourceDir = tempFolder.newFolder("source");
     File nested = new File(sourceDir, "nested");
     assertTrue(nested.mkdirs());
-    Files.copy(testHttpJmx.toPath(), new File(sourceDir, "TEST_HTTP.jmx").toPath());
-    Files.copy(testGetJmx.toPath(), new File(nested, "TEST_GET.jmx").toPath());
+    Files.copy(sampleJmx.toPath(), new File(sourceDir, "sample.jmx").toPath());
+    Files.copy(otherSampleJmx.toPath(), new File(nested, "other-sample.jmx").toPath());
 
     File targetDir = new File(tempFolder.getRoot(), "target");
     int exitCode = JmxBlazeMeterHttpMigratorCli.run(
         new String[] {sourceDir.getPath(), "--out", targetDir.getPath()}, out, err);
     assertEquals(JmxBlazeMeterHttpMigratorCli.EXIT_OK, exitCode);
 
-    File migratedHttp = new File(targetDir, "TEST_HTTP.jmx");
-    File migratedGet = new File(new File(targetDir, "nested"), "TEST_GET.jmx");
-    assertTrue(migratedHttp.isFile());
-    assertTrue(migratedGet.isFile());
+    File migratedSample = new File(targetDir, "sample.jmx");
+    File migratedOther = new File(new File(targetDir, "nested"), "other-sample.jmx");
+    assertTrue(migratedSample.isFile());
+    assertTrue(migratedOther.isFile());
     assertTrue(JmxBlazeMeterHttpMigrator.countHttp2Samplers(
-        JmxBlazeMeterHttpMigrator.loadTree(migratedHttp)) > 0);
+        JmxBlazeMeterHttpMigrator.loadTree(migratedSample)) > 0);
     assertTrue(outBuffer.toString(StandardCharsets.UTF_8).contains("Total migrated:"));
   }
 
   @Test
   public void dryRunOverDirectoryReportsTotalsWithoutWriting() throws Exception {
     File sourceDir = tempFolder.newFolder("source-dry");
-    Files.copy(testHttpJmx.toPath(), new File(sourceDir, "TEST_HTTP.jmx").toPath());
+    Files.copy(sampleJmx.toPath(), new File(sourceDir, "sample.jmx").toPath());
 
     int exitCode = JmxBlazeMeterHttpMigratorCli.run(
         new String[] {sourceDir.getPath(), "--dry-run"}, out, err);
     assertEquals(JmxBlazeMeterHttpMigratorCli.EXIT_OK, exitCode);
     assertTrue(outBuffer.toString(StandardCharsets.UTF_8).contains("Total would migrate:"));
-    assertFalse(new File(sourceDir, "TEST_HTTP.jmx.bak").exists());
+    assertFalse(new File(sourceDir, "sample.jmx.bak").exists());
   }
 
   @Test
@@ -177,5 +174,21 @@ public class JmxBlazeMeterHttpMigratorCliTest extends HTTP2TestBase {
         new String[] {emptyDir.getPath(), "--in-place"}, out, err);
     assertEquals(JmxBlazeMeterHttpMigratorCli.EXIT_OK, exitCode);
     assertTrue(outBuffer.toString(StandardCharsets.UTF_8).contains("No .jmx files found"));
+  }
+
+  private static HashTree buildSamplePlan(String samplerName, String path) {
+    HashTree tree = new ListedHashTree();
+    HTTPSamplerProxy sampler = new HTTPSamplerProxy();
+    sampler.setName(samplerName);
+    sampler.setDomain("example.org");
+    sampler.setPath(path);
+    sampler.setMethod("GET");
+    sampler.setArguments(new Arguments());
+    // A real .jmx always has guiclass set (by the GUI when the element is created);
+    // SaveService.loadTree NPEs reading it back otherwise.
+    sampler.setProperty(org.apache.jmeter.testelement.TestElement.GUI_CLASS,
+        "org.apache.jmeter.protocol.http.control.gui.HttpTestSampleGui");
+    tree.add(sampler);
+    return tree;
   }
 }

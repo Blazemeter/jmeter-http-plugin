@@ -6,27 +6,32 @@ import static org.junit.Assert.assertTrue;
 
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import java.io.File;
-import java.nio.file.Path;
+import org.apache.jmeter.config.Arguments;
 import org.apache.jmeter.protocol.http.sampler.HTTPSamplerProxy;
 import org.apache.jmeter.testelement.TestElement;
 import org.apache.jorphan.collections.HashTree;
-import org.junit.BeforeClass;
+import org.apache.jorphan.collections.ListedHashTree;
+import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 public class JmxBlazeMeterHttpMigratorTest extends HTTP2TestBase {
 
-  private static File testHttpJmx;
+  @Rule
+  public TemporaryFolder tempFolder = new TemporaryFolder();
 
-  @BeforeClass
-  public static void locateTestHttpJmx() {
-    Path path = Path.of("src", "test", "resources", "jmeter-regression", "5.6.3", "TEST_HTTP.jmx");
-    testHttpJmx = path.toFile();
-    assertTrue("TEST_HTTP.jmx must exist at " + path, testHttpJmx.isFile());
+  private File samplePlanJmx;
+
+  @Before
+  public void writeSamplePlan() throws Exception {
+    samplePlanJmx = tempFolder.newFile("sample-plan.jmx");
+    JmxBlazeMeterHttpMigrator.saveTree(buildSamplePlanWithTwoSamplers(), samplePlanJmx);
   }
 
   @Test
-  public void migratesAllApacheHttpSamplersInTestHttpPlan() throws Exception {
-    HashTree tree = JmxBlazeMeterHttpMigrator.loadTree(testHttpJmx);
+  public void migratesAllApacheHttpSamplersInSamplePlan() throws Exception {
+    HashTree tree = JmxBlazeMeterHttpMigrator.loadTree(samplePlanJmx);
     int before = JmxBlazeMeterHttpMigrator.countMigratableSamplers(tree);
     assertTrue(before > 0);
 
@@ -47,7 +52,7 @@ public class JmxBlazeMeterHttpMigratorTest extends HTTP2TestBase {
     src.setMethod("POST");
     src.setFollowRedirects(true);
 
-    HashTree tree = new org.apache.jorphan.collections.ListedHashTree();
+    HashTree tree = new ListedHashTree();
     tree.add(src);
 
     JmxBlazeMeterHttpMigrator.migrateTree(tree);
@@ -70,7 +75,7 @@ public class JmxBlazeMeterHttpMigratorTest extends HTTP2TestBase {
     org.apache.jmeter.assertions.ResponseAssertion assertion =
         new org.apache.jmeter.assertions.ResponseAssertion();
     assertion.setName("assert-ok");
-    HashTree tree = new org.apache.jorphan.collections.ListedHashTree();
+    HashTree tree = new ListedHashTree();
     HashTree sub = tree.add(parent);
     sub.add(assertion);
 
@@ -85,12 +90,46 @@ public class JmxBlazeMeterHttpMigratorTest extends HTTP2TestBase {
 
   @Test
   public void migrateFileWritesNewJmx() throws Exception {
-    File target = File.createTempFile("migrated-", ".jmx");
-    target.deleteOnExit();
-    JmxBlazeMeterHttpMigrator.migrateFile(testHttpJmx, target);
+    File target = tempFolder.newFile("migrated.jmx");
+    JmxBlazeMeterHttpMigrator.migrateFile(samplePlanJmx, target);
 
     HashTree loaded = JmxBlazeMeterHttpMigrator.loadTree(target);
     assertEquals(0, JmxBlazeMeterHttpMigrator.countMigratableSamplers(loaded));
     assertTrue(JmxBlazeMeterHttpMigrator.countHttp2Samplers(loaded) > 0);
+  }
+
+  private static HashTree buildSamplePlanWithTwoSamplers() {
+    HashTree tree = new ListedHashTree();
+
+    HTTPSamplerProxy first = new HTTPSamplerProxy();
+    first.setName("first-call");
+    first.setDomain("example.org");
+    first.setPath("/a");
+    first.setMethod("GET");
+    first.setArguments(new Arguments());
+    setGuiClass(first);
+    tree.add(first);
+
+    HTTPSamplerProxy second = new HTTPSamplerProxy();
+    second.setName("second-call");
+    second.setDomain("example.org");
+    second.setPath("/b");
+    second.setMethod("POST");
+    second.setArguments(new Arguments());
+    setGuiClass(second);
+    tree.add(second);
+
+    return tree;
+  }
+
+  /**
+   * A real .jmx always has {@code guiclass} on each element (set by the GUI when the element is
+   * created); {@code SaveService.loadTree} NPEs reading it back otherwise, since
+   * {@code TestElementConverter} passes the (then-null) {@code guiclass} XML attribute straight
+   * into a {@code Properties} lookup.
+   */
+  private static void setGuiClass(TestElement element) {
+    element.setProperty(TestElement.GUI_CLASS,
+        "org.apache.jmeter.protocol.http.control.gui.HttpTestSampleGui");
   }
 }
