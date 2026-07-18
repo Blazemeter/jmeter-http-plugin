@@ -1003,11 +1003,13 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     sampler.setImageParser(true);
     String message = "message";
     String responseCode = "300";
+    String previousCacheMode = JMeterUtils.getProperty("cache_manager.cached_resource_mode");
     JMeterUtils.setProperty("cache_manager.cached_resource_mode", "RETURN_CUSTOM_STATUS");
     JMeterUtils.setProperty("RETURN_CUSTOM_STATUS.message", message);
     JMeterUtils.setProperty("RETURN_CUSTOM_STATUS.code", responseCode);
     JmeterCachedResourceModeSupport.refreshSnapshotFromProperties();
     configureCacheManagerToSampler(true, false);
+    try {
     HTTPSampleResult firstRequestExpected = buildResult(true, Code.OK,
       hostHeader(), null, null, createURL(SERVER_PATH_200_EMBEDDED), HTTPConstants.GET);
     firstRequestExpected.setResponseData(BASIC_HTML_TEMPLATE, StandardCharsets.UTF_8.name());
@@ -1020,6 +1022,9 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     firstRequestExpected.setSentBytes(0);
     firstRequestExpected.setResponseData("", StandardCharsets.UTF_8.name());
     validateEmbeddedResultCached(sampleWithGet(SERVER_PATH_200_EMBEDDED), firstRequestExpected);
+    } finally {
+      restoreCacheResourceMode(previousCacheMode);
+    }
   }
 
   /**
@@ -1035,10 +1040,12 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     buildStartedServer();
     sampler.setImageParser(true);
     String message = "message";
+    String previousCacheMode = JMeterUtils.getProperty("cache_manager.cached_resource_mode");
     JMeterUtils.setProperty("cache_manager.cached_resource_mode", "RETURN_200_CACHE");
     JMeterUtils.setProperty("RETURN_200_CACHE.message", message);
     JmeterCachedResourceModeSupport.refreshSnapshotFromProperties();
     configureCacheManagerToSampler(true, false);
+    try {
     // First request must connect to the server
     HTTPSampleResult expected = buildResult(true, Code.OK,
       hostHeader(), null, null, createURL(SERVER_PATH_200_EMBEDDED), HTTPConstants.GET);
@@ -1050,6 +1057,17 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     expected.setResponseData("", StandardCharsets.UTF_8.name());
     expected.setResponseMessage(message);
     validateEmbeddedResultCached(sampleWithGet(SERVER_PATH_200_EMBEDDED), expected);
+    } finally {
+      restoreCacheResourceMode(previousCacheMode);
+    }
+  }
+
+  private void restoreCacheResourceMode(String previousCacheMode) {
+    if (previousCacheMode == null) {
+      JMeterUtils.getJMeterProperties().remove("cache_manager.cached_resource_mode");
+    } else {
+      JMeterUtils.setProperty("cache_manager.cached_resource_mode", previousCacheMode);
+    }
   }
 
   @Test
