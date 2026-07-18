@@ -8,6 +8,7 @@ import com.blazemeter.jmeter.http2.core.jetty.custom.http2.CustomHttpClientTrans
 import com.blazemeter.jmeter.http2.core.jetty.custom.http3.CustomClientConnectionFactoryOverHTTP3;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
+import com.blazemeter.jmeter.http2.util.Rfc9110Redirects;
 import com.github.luben.zstd.ZstdInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -4022,7 +4023,12 @@ public class HTTP2JettyClient {
     result.setSuccessful(
         contentResponse.getStatus() >= 200 && contentResponse.getStatus() <= 399);
     result.setResponseHeaders(extractResponseHeaders(contentResponse, responseMessage));
-    if (result.isRedirect()) {
+    // Use the RFC 9110-correct redirect check (see Rfc9110Redirects), not result.isRedirect():
+    // JMeter 5.6.3's version misses 307 for non-GET/HEAD methods, which would otherwise leave
+    // redirectLocation unset and break HTTP2Sampler.followRedirects()/resultProcessing() for
+    // that case.
+    if (Rfc9110Redirects.useLegacyMethodHandling() ? result.isRedirect()
+        : Rfc9110Redirects.isRedirect(result.getResponseCode())) {
       result.setRedirectLocation(extractRedirectLocation(contentResponse));
     }
 
