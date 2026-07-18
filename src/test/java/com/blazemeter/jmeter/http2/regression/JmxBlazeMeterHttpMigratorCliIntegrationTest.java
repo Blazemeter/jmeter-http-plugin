@@ -68,7 +68,10 @@ public class JmxBlazeMeterHttpMigratorCliIntegrationTest extends HTTP2TestBase {
       throws Exception {
     Path libDir = distribution.getHomeDir().resolve("lib");
     Path extDir = libDir.resolve("ext");
-    String classpath = libDir.resolve("*") + File.pathSeparator + extDir.resolve("*");
+    // "*" is a JVM classpath-wildcard convention, not a real path segment: Path.resolve("*")
+    // throws InvalidPathException on Windows, where "*" is a reserved filename character.
+    String classpath = libDir + File.separator + "*" + File.pathSeparator
+        + extDir + File.separator + "*";
 
     List<String> command = new ArrayList<>();
     command.add(JmeterRegressionRunner.resolveJavaExecutable());
