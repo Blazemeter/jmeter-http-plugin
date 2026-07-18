@@ -55,7 +55,13 @@ jobs:
         env:
           JMETER_PATH_BASE: ${{ github.workspace }}/.jmeter
         run: |
-          JMETER_VERSION=5.6.3 JMETER_PATH=$JMETER_PATH_BASE/5.6.3 sh testJMeter.sh
+          # Verify the built plugin jar loads and runs against every JMeter version we claim
+          # to support: 5.5 (minimum) through 5.6.3 (latest), regardless of which version the
+          # jar itself was compiled against (jmeter.version in pom.xml is provided-scope).
+          for JMETER_VERSION in 5.5 5.6.3; do
+            echo "=== Compatibility check against JMeter $JMETER_VERSION ==="
+            JMETER_VERSION=$JMETER_VERSION JMETER_PATH=$JMETER_PATH_BASE/$JMETER_VERSION sh testJMeter.sh
+          done
 
       - name: Upload compatibility artifacts on failure
         if: failure()
