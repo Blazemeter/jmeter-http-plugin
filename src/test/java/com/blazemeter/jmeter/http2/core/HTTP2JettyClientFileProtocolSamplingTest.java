@@ -68,9 +68,9 @@ public class HTTP2JettyClientFileProtocolSamplingTest extends HTTP2TestBase {
     Files.write(tempFile, "content".getBytes(StandardCharsets.UTF_8));
     URL fileUrl = tempFile.toUri().toURL();
 
-    HTTPSampleResult sampled = sampleFileUrl(fileUrl, "ISO-8859-1");
+    HTTPSampleResult sampled = sampleFileUrl(fileUrl, "UTF-8");
 
-    assertThat(sampled.getContentType()).isEqualTo("text/html; charset=ISO-8859-1");
+    assertThat(sampled.getContentType()).isEqualTo("text/html; charset=UTF-8");
   }
 
   @Test
