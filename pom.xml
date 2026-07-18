@@ -30,7 +30,7 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-    <jmeter.version>5.6.3</jmeter.version>
+    <jmeter.version>5.5</jmeter.version>
     <jmeter.regression.version>5.6.3</jmeter.regression.version>
     <jmeter.regression.tests>TEST_HTTP,ResponseDecompression,TestHeaderManager,TestCookieManager</jmeter.regression.tests>
     <jmeter.regression.tier4.tests>HTMLParserTestFile_2,TEST_HTTPS,Http4ImplDigestAuth,Http4ImplPreemptiveBasicAuth</jmeter.regression.tier4.tests>
@@ -66,11 +66,11 @@
       <scope>test</scope>
     </dependency>
     <!-- Apache HttpClient for compilation (classes used in JettyCacheManager) -->
-    <!-- Using same version as JMeter 5.6.3 -->
+    <!-- Using same version as JMeter 5.5 (our minimum supported version) -->
     <dependency>
       <groupId>org.apache.httpcomponents</groupId>
       <artifactId>httpcore</artifactId>
-      <version>4.4.16</version>
+      <version>4.4.15</version>
       <scope>compile</scope>
     </dependency>
     <dependency>
