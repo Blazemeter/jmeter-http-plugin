@@ -311,7 +311,7 @@ Common configurations:
 <a id="readme-buffer-capacity"></a>
 ### Buffer capacity
 
-By default, the size of downloaded resources is limited to 2 MB (2,097,152 bytes); you can raise the limit by setting `blazemeter.http.maxBufferSize` in `jmeter.properties` or `user.properties` (value in bytes).
+By default there is no buffering cap (`blazemeter.http.maxBufferSize=-1`, same idea as JMeter’s unlimited response store). Set `blazemeter.http.maxBufferSize` in `jmeter.properties` or `user.properties` to a positive size in bytes if you want Jetty to reject larger bodies (Jetty’s own `BufferingResponseListener` default is 2 MiB if you construct it without a size).
 
 
 <a id="readme-alpn"></a>
@@ -375,7 +375,7 @@ Restart JMeter after changing JMeter properties that are applied when affected c
 | **Attribute** | **Description** | **Default** |
 |---|---|---:|
 | **blazemeter.http.proxy_enabled** | When **`true`**, the HTTP(S) Test Script Recorder creates **`bzm - HTTP Sampler`** instead of stock **HTTP Request** (legacy `HTTP2Sampler.proxy_enabled` accepted) | true |
-| **blazemeter.http.maxBufferSize** | Maximum size of the downloaded resources in bytes | 2097152 |
+| **blazemeter.http.maxBufferSize** | Maximum size of buffered response bodies in bytes (`-1` = unlimited) | -1 |
 | **blazemeter.http.minThreads** | Minimum number of threads per HTTP client | 1 |
 | **blazemeter.http.maxThreads** | Maximum number of threads per HTTP client | 5 |
 | **blazemeter.http.maxRequestsQueuedPerDestination** | Maximum number of requests that may be queued to a destination | 32767 |

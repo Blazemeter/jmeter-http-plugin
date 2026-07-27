@@ -190,7 +190,8 @@ public class HTTP2JettyClient {
   private static final Map<String, Http1OnlyEntry> HTTP1_ONLY_CACHE = new ConcurrentHashMap<>();
   private static final Map<String, H2cEntry> H2C_CACHE = new ConcurrentHashMap<>();
   private int requestTimeout = 0;
-  private int maxBufferSize = 21 * 1024 * 1024;
+  /** {@code -1} means unlimited (Jetty {@code DynamicCapacity} treats negative as no cap). */
+  private int maxBufferSize = -1;
   private int maxThreads = 5;
   private boolean maxThreadsConfigured = false;
   private int minThreads = 1;
@@ -737,7 +738,7 @@ public class HTTP2JettyClient {
             "httpJettyClient.byteBufferPoolFactor", String.valueOf(byteBufferPoolFactor)));
     maxBufferSize =
         Integer.parseInt(BzmHttpPluginProperties.getPropDefault("httpJettyClient.maxBufferSize",
-            String.valueOf(2 * 1024 * 1024)));
+            "-1"));
     minThreads = Integer
         .parseInt(BzmHttpPluginProperties.getPropDefault("httpJettyClient.minThreads",
             String.valueOf(minThreads)));

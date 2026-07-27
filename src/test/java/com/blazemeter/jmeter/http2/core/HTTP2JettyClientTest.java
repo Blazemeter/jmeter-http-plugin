@@ -1629,24 +1629,65 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
   public void shouldGetResponseWhenBufferSizeIsSmallerOrTheSameAsMaxBufferSize() throws Exception {
     buildStartedServer();
     JMeterUtils.setProperty("httpJettyClient.maxBufferSize", String.valueOf(BIG_BUFFER_SIZE));
-    HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
-    //Since no text response was set, we validate the size of the response body instead.
-    assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+    try {
+      HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+      //Since no text response was set, we validate the size of the response body instead.
+      assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+    } finally {
+      clearMaxBufferSizeProperties();
+    }
   }
 
   @Test(expected = IllegalArgumentException.class)
   public void shouldThrowAnExceptionWhenBufferSizeIsBiggerThanMaxBufferSize() throws Throwable {
     buildStartedServer();
     JMeterUtils.setProperty("httpJettyClient.maxBufferSize", String.valueOf(BIG_BUFFER_SIZE - 1));
-    sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+    try {
+      sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+    } finally {
+      clearMaxBufferSizeProperties();
+    }
   }
 
   @Test(expected = IllegalArgumentException.class)
   public void shouldNotGetAResponseWhenBufferSizeIsBiggerThanMaxBufferSize() throws Exception {
     buildStartedServer();
     JMeterUtils.setProperty("httpJettyClient.maxBufferSize", String.valueOf(BIG_BUFFER_SIZE - 1));
-    //There is no response, since an exception is thrown in this case
-    sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+    try {
+      //There is no response, since an exception is thrown in this case
+      sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+    } finally {
+      clearMaxBufferSizeProperties();
+    }
+  }
+
+  /**
+   * Regression guard: plugin default {@code maxBufferSize=-1} must accept bodies larger than
+   * Jetty {@link org.eclipse.jetty.client.BufferingResponseListener}'s built-in 2 MiB default.
+   * {@link ServerBuilder#BIG_BUFFER_SIZE} is 4 MiB; if the unlimited default is lost, Jetty aborts
+   * with {@code Buffering capacity 2097152 exceeded}.
+   */
+  @Test
+  public void shouldGetBigResponseWhenMaxBufferSizeUsesUnlimitedPluginDefault() throws Exception {
+    clearMaxBufferSizeProperties();
+    buildStartedServer();
+    client.loadProperties();
+    assertThat(client.getMaxBufferSize())
+        .as("plugin default must stay unlimited (-1), not Jetty's 2 MiB BufferingResponseListener "
+            + "default")
+        .isEqualTo(-1);
+
+    HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+
+    assertThat(result.isSuccessful()).isTrue();
+    assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+  }
+
+  private static void clearMaxBufferSizeProperties() {
+    java.util.Properties props = JMeterUtils.getJMeterProperties();
+    props.remove("blazemeter.http.maxBufferSize");
+    props.remove("HTTP2Sampler.maxBufferSize");
+    props.remove("httpJettyClient.maxBufferSize");
   }
 
   @Test
