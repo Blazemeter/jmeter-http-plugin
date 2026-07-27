@@ -451,8 +451,8 @@ public class ServerBuilder {
             resp.setStatus(HttpStatus.OK_200);
             break;
           case SERVER_PATH_BIG_RESPONSE:
-            resp.getOutputStream().write(new byte[(int) BIG_BUFFER_SIZE]);
             resp.setContentType("image/jpg");
+            resp.getOutputStream().write(new byte[(int) BIG_BUFFER_SIZE]);
             break;
         }
       }

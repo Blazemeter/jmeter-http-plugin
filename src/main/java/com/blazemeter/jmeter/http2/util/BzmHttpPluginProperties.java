@@ -29,6 +29,20 @@ public final class BzmHttpPluginProperties {
   /** Legacy prefix for async-controller-related JMeter properties (backward compatibility). */
   public static final String CONTROLLER_LEGACY_PREFIX = "http2AsyncController.";
 
+  /**
+   * Plugin property for max bytes stored in HTTP sample response data (any accepted prefix form).
+   * Aliases: {@code blazemeter.http.maxBufferSize}, {@code HTTP2Sampler.maxBufferSize},
+   * {@code httpJettyClient.maxBufferSize}.
+   */
+  public static final String MAX_BUFFER_SIZE_PROP = "httpJettyClient.maxBufferSize";
+
+  /**
+   * Stock JMeter property for max response bytes stored per request (HTTPSamplerBase /
+   * HTTPFileImpl).
+   */
+  public static final String JMETER_MAX_BYTES_TO_STORE_PER_REQUEST =
+      "httpsampler.max_bytes_to_store_per_request";
+
   private static final String PREFERRED_PREFIX = "blazemeter.http.";
   private static final String LEGACY_SAMPLER_PREFIX = "HTTP2Sampler.";
   private static final String LEGACY_JETTY_PREFIX = "httpJettyClient.";
@@ -68,6 +82,14 @@ public final class BzmHttpPluginProperties {
         samplerKeyForSuffix(suffix),
         jettyKeyForSuffix(suffix)
     };
+  }
+
+  /**
+   * All accepted JMeter property keys for a plugin setting (preferred + legacy aliases), for
+   * tests or cleanup that must remove every form.
+   */
+  public static String[] keysInResolveOrder(String propertyName) {
+    return allKeysInResolveOrder(propertyName);
   }
 
   /** Suffix after {@link #CONTROLLER_PREFERRED_PREFIX} or {@link #CONTROLLER_LEGACY_PREFIX}. */

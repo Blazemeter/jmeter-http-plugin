@@ -309,9 +309,23 @@ Common configurations:
 
 
 <a id="readme-buffer-capacity"></a>
-### Buffer capacity
+### Buffer capacity / response store truncation
 
-By default there is no buffering cap (`blazemeter.http.maxBufferSize=-1`, same idea as JMeter’s unlimited response store). Set `blazemeter.http.maxBufferSize` in `jmeter.properties` or `user.properties` to a positive size in bytes if you want Jetty to reject larger bodies (Jetty’s own `BufferingResponseListener` default is 2 MiB if you construct it without a size).
+By default there is no store cap (`blazemeter.http.maxBufferSize` unset → effective **`-1`**): Jetty buffers without a hard fail (unlike Jetty’s own `BufferingResponseListener` 2 MiB default), and the full decoded body is kept in the sample.
+
+When a positive limit applies, behaviour matches Apache JMeter’s
+`httpsampler.max_bytes_to_store_per_request`: the sample stays **successful**, only the first N
+bytes are stored in response data, `bodySize` reflects the full decoded length, and JMeter logs
+`Big response, truncating it to {} bytes` at **DEBUG**. Truncation is skipped while recording.
+
+**Precedence** (first match wins):
+
+1. Plugin `blazemeter.http.maxBufferSize` (aliases `HTTP2Sampler.maxBufferSize` /
+   `httpJettyClient.maxBufferSize`) if set
+2. Else JMeter `httpsampler.max_bytes_to_store_per_request` if set
+3. Else `-1` (no truncation)
+
+`<= 0` means do not truncate.
 
 
 <a id="readme-alpn"></a>
@@ -375,7 +389,7 @@ Restart JMeter after changing JMeter properties that are applied when affected c
 | **Attribute** | **Description** | **Default** |
 |---|---|---:|
 | **blazemeter.http.proxy_enabled** | When **`true`**, the HTTP(S) Test Script Recorder creates **`bzm - HTTP Sampler`** instead of stock **HTTP Request** (legacy `HTTP2Sampler.proxy_enabled` accepted) | true |
-| **blazemeter.http.maxBufferSize** | Maximum size of buffered response bodies in bytes (`-1` = unlimited) | -1 |
+| **blazemeter.http.maxBufferSize** | Max bytes stored in sample response data (`<=0` / unset default path = no truncation). Overrides JMeter store limit when set | -1 |
 | **blazemeter.http.minThreads** | Minimum number of threads per HTTP client | 1 |
 | **blazemeter.http.maxThreads** | Maximum number of threads per HTTP client | 5 |
 | **blazemeter.http.maxRequestsQueuedPerDestination** | Maximum number of requests that may be queued to a destination | 32767 |
