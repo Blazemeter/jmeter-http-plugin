@@ -43,6 +43,9 @@ public class Http401WithoutWwwAuthenticateParityTest extends HTTP2TestBase {
   private HTTP2JettyClient pluginClient;
   private HTTP2Sampler sampler;
   private String originalSharedThreadPoolProperty;
+  private String originalEnableHttp1Property;
+  private String originalEnableHttp2Property;
+  private String originalEnableHttp3Property;
 
   @BeforeClass
   public static void setupClass() {
@@ -52,6 +55,9 @@ public class Http401WithoutWwwAuthenticateParityTest extends HTTP2TestBase {
   @Before
   public void setUp() throws Exception {
     originalSharedThreadPoolProperty = JMeterUtils.getProperty("httpJettyClient.sharedThreadPool");
+    originalEnableHttp1Property = JMeterUtils.getProperty("httpJettyClient.enableHttp1");
+    originalEnableHttp2Property = JMeterUtils.getProperty("httpJettyClient.enableHttp2");
+    originalEnableHttp3Property = JMeterUtils.getProperty("httpJettyClient.enableHttp3");
     JMeterUtils.setProperty("httpJettyClient.sharedThreadPool", "false");
     JMeterUtils.setProperty("httpJettyClient.enableHttp1", "true");
     JMeterUtils.setProperty("httpJettyClient.enableHttp2", "false");
@@ -90,11 +96,17 @@ public class Http401WithoutWwwAuthenticateParityTest extends HTTP2TestBase {
     if (server != null) {
       server.stop();
     }
-    if (originalSharedThreadPoolProperty == null) {
-      JMeterUtils.getJMeterProperties().remove("httpJettyClient.sharedThreadPool");
+    restoreProperty("httpJettyClient.sharedThreadPool", originalSharedThreadPoolProperty);
+    restoreProperty("httpJettyClient.enableHttp1", originalEnableHttp1Property);
+    restoreProperty("httpJettyClient.enableHttp2", originalEnableHttp2Property);
+    restoreProperty("httpJettyClient.enableHttp3", originalEnableHttp3Property);
+  }
+
+  private static void restoreProperty(String key, String originalValue) {
+    if (originalValue == null) {
+      JMeterUtils.getJMeterProperties().remove(key);
     } else {
-      JMeterUtils.setProperty("httpJettyClient.sharedThreadPool",
-          originalSharedThreadPoolProperty);
+      JMeterUtils.setProperty(key, originalValue);
     }
   }
 
