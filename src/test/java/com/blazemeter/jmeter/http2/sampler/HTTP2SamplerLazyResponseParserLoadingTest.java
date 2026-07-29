@@ -9,6 +9,7 @@ import java.util.HashMap;
 import java.util.Map;
 import org.apache.jmeter.util.JMeterUtils;
 import org.junit.After;
+import org.junit.AfterClass;
 import org.junit.Test;
 
 /**
@@ -28,17 +29,32 @@ public class HTTP2SamplerLazyResponseParserLoadingTest extends HTTP2TestBase {
   private String originalResponseParsersProperty;
   private String originalClassNameProperty;
   private String originalTypesProperty;
+  /** Only {@link #loadsParsersOnFirstUseFromPropertiesSetAfterClassInitialization} mutates these. */
+  private boolean restoredResponseParserProperties;
 
   @After
   public void tearDown() throws Exception {
-    restoreProperty("HTTPResponse.parsers", originalResponseParsersProperty);
-    restoreProperty(TEST_PARSER_KEY + ".className", originalClassNameProperty);
-    restoreProperty(TEST_PARSER_KEY + ".types", originalTypesProperty);
+    if (restoredResponseParserProperties) {
+      restoreProperty("HTTPResponse.parsers", originalResponseParsersProperty);
+      restoreProperty(TEST_PARSER_KEY + ".className", originalClassNameProperty);
+      restoreProperty(TEST_PARSER_KEY + ".types", originalTypesProperty);
+    }
     if (originalParsers != null) {
       Map<String, String> parsers = parsersField();
       parsers.clear();
       parsers.putAll(originalParsers);
     }
+  }
+
+  /**
+   * {@link #doesNotReloadOnceParsersAreAlreadyRegistered} must not wipe {@code HTTPResponse.parsers}
+   * for later test classes (JUnit creates a fresh instance per method; that test never captures the
+   * original property, and a naive {@code restore(null)} would {@code remove} the suite default).
+   */
+  @AfterClass
+  public static void restoreSuiteResponseParserProperties() throws Exception {
+    JMeterTestUtils.ensureResponseParserProperties();
+    parsersField().clear();
   }
 
   @Test
@@ -50,6 +66,7 @@ public class HTTP2SamplerLazyResponseParserLoadingTest extends HTTP2TestBase {
     originalResponseParsersProperty = JMeterUtils.getProperty("HTTPResponse.parsers");
     originalClassNameProperty = JMeterUtils.getProperty(TEST_PARSER_KEY + ".className");
     originalTypesProperty = JMeterUtils.getProperty(TEST_PARSER_KEY + ".types");
+    restoredResponseParserProperties = true;
 
     // Set AFTER the class (and its old static block, if it still existed) would already have
     // run - simulating a JMeter batch run applying -q jmeter-batch.properties post-class-load.

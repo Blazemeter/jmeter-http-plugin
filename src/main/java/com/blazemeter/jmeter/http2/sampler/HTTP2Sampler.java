@@ -402,7 +402,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
             this.result.setIgnore();
           }
           HTTP2FutureResponseListener listener =
-              new HTTP2FutureResponseListener(client.getMaxBufferSize());
+              new HTTP2FutureResponseListener(HTTP2JettyClient.getJettyBufferingMaxLength());
           this.asyncListener = listener;
           Request req = client.sampleAsync(this, this.result, listener);
           req.send(listener); // Fire the Async

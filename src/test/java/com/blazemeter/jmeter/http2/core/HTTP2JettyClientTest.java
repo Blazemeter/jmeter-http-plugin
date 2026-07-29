@@ -38,6 +38,7 @@ import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.core.ServerBuilder.TeardownableServer;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import com.blazemeter.jmeter.http2.sampler.JMeterTestUtils;
+import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import com.google.common.io.Resources;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -1626,27 +1627,116 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
   }
 
   @Test
-  public void shouldGetResponseWhenBufferSizeIsSmallerOrTheSameAsMaxBufferSize() throws Exception {
+  public void shouldStoreFullBodyWhenWithinMaxBytesToStore() throws Exception {
     buildStartedServer();
-    JMeterUtils.setProperty("httpJettyClient.maxBufferSize", String.valueOf(BIG_BUFFER_SIZE));
+    JMeterUtils.setProperty(BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP,
+        String.valueOf(BIG_BUFFER_SIZE));
+    try {
+      HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+      assertThat(result.isSuccessful()).isTrue();
+      assertThat(result.getResponseData().length).isEqualTo(BIG_BUFFER_SIZE);
+      assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+    } finally {
+      clearMaxBytesToStoreProperties();
+    }
+  }
+
+  @Test
+  public void shouldTruncateStoredResponseLikeJMeterWhenPluginMaxBufferSizeExceeded()
+      throws Exception {
+    buildStartedServer();
+    int storeLimit = BIG_BUFFER_SIZE - 1;
+    JMeterUtils.setProperty(BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP,
+        String.valueOf(storeLimit));
+    try {
+      HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+      assertThat(result.isSuccessful()).isTrue();
+      assertThat(result.getResponseCode()).isEqualTo("200");
+      assertThat(result.getResponseData().length).isEqualTo(storeLimit);
+      // Full decoded length retained for throughput/size (JMeter file:// / store semantics).
+      assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+      assertThat(result.getResponseMessage()).doesNotContain("Buffering capacity");
+      // ServerBuilder marks the big body as image/jpg → binary data type like stock JMeter.
+      assertThat(result.getDataType()).isEqualTo(SampleResult.BINARY);
+      assertThat(result.getContentType()).startsWith("image/jpg");
+    } finally {
+      clearMaxBytesToStoreProperties();
+    }
+  }
+
+  @Test
+  public void shouldUseJMeterMaxBytesToStoreWhenPluginMaxBufferSizeUnset() throws Exception {
+    clearMaxBytesToStoreProperties();
+    buildStartedServer();
+    int storeLimit = BIG_BUFFER_SIZE - 1;
+    JMeterUtils.setProperty(BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST,
+        String.valueOf(storeLimit));
+    try {
+      client.loadProperties();
+      assertThat(client.getMaxBufferSize()).isEqualTo(storeLimit);
+
+      HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+      assertThat(result.isSuccessful()).isTrue();
+      assertThat(result.getResponseData().length).isEqualTo(storeLimit);
+      assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+    } finally {
+      clearMaxBytesToStoreProperties();
+    }
+  }
+
+  @Test
+  public void shouldPreferPluginMaxBufferSizeOverJMeterMaxBytesToStore() throws Exception {
+    clearMaxBytesToStoreProperties();
+    buildStartedServer();
+    int jmeterLimit = 1024;
+    int pluginLimit = BIG_BUFFER_SIZE - 1;
+    JMeterUtils.setProperty(BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST,
+        String.valueOf(jmeterLimit));
+    JMeterUtils.setProperty(BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP,
+        String.valueOf(pluginLimit));
+    try {
+      client.loadProperties();
+      assertThat(client.getMaxBufferSize()).isEqualTo(pluginLimit);
+
+      HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+      assertThat(result.isSuccessful()).isTrue();
+      assertThat(result.getResponseData().length).isEqualTo(pluginLimit);
+      assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+    } finally {
+      clearMaxBytesToStoreProperties();
+    }
+  }
+
+  /**
+   * Regression guard: plugin default store limit {@code -1} must accept bodies larger than
+   * Jetty {@link org.eclipse.jetty.client.BufferingResponseListener}'s built-in 2 MiB default.
+   * {@link ServerBuilder#BIG_BUFFER_SIZE} is 4 MiB; if Jetty buffering were left at 2 MiB, the
+   * sample would fail with {@code Buffering capacity 2097152 exceeded}.
+   */
+  @Test
+  public void shouldGetBigResponseWhenMaxBufferSizeUsesUnlimitedPluginDefault() throws Exception {
+    clearMaxBytesToStoreProperties();
+    buildStartedServer();
+    client.loadProperties();
+    assertThat(client.getMaxBufferSize())
+        .as("plugin default must stay unlimited (-1), not Jetty's 2 MiB BufferingResponseListener "
+            + "default")
+        .isEqualTo(-1);
+
     HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
-    //Since no text response was set, we validate the size of the response body instead.
+
+    assertThat(result.isSuccessful()).isTrue();
+    assertThat(result.getResponseData().length).isEqualTo(BIG_BUFFER_SIZE);
     assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
   }
 
-  @Test(expected = IllegalArgumentException.class)
-  public void shouldThrowAnExceptionWhenBufferSizeIsBiggerThanMaxBufferSize() throws Throwable {
-    buildStartedServer();
-    JMeterUtils.setProperty("httpJettyClient.maxBufferSize", String.valueOf(BIG_BUFFER_SIZE - 1));
-    sampleWithGet(SERVER_PATH_BIG_RESPONSE);
-  }
-
-  @Test(expected = IllegalArgumentException.class)
-  public void shouldNotGetAResponseWhenBufferSizeIsBiggerThanMaxBufferSize() throws Exception {
-    buildStartedServer();
-    JMeterUtils.setProperty("httpJettyClient.maxBufferSize", String.valueOf(BIG_BUFFER_SIZE - 1));
-    //There is no response, since an exception is thrown in this case
-    sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+  private static void clearMaxBytesToStoreProperties() {
+    java.util.Properties props = JMeterUtils.getJMeterProperties();
+    for (String key : BzmHttpPluginProperties.keysInResolveOrder(
+        BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP)) {
+      props.remove(key);
+    }
+    props.remove(BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST);
   }
 
   @Test
