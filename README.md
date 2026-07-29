@@ -1,3 +1,5 @@
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/blazemeter/jmeter-http-plugin/total?style=for-the-badge&link=https%3A%2F%2Fgithub.com%2FBlazemeter%2Fjmeter-http-plugin%2Freleases)
+---
 # BlazeMeter HTTP Plugin for JMeter (HTTP/1.1, HTTP/2, HTTP/3/QUIC)
 
 ---

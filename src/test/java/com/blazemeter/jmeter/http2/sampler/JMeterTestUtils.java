@@ -17,17 +17,24 @@ public class JMeterTestUtils {
       TestJMeterUtils.createJmeterEnv();
       // Use a real locale to avoid ignoreresources warnings in test logs.
       JMeterUtils.setLocale(Locale.ENGLISH);
-      JMeterUtils.setProperty("HTTPResponse.parsers", "htmlParser wmlParser cssParser");
-      JMeterUtils.setProperty("htmlParser.className",
-          "org.apache.jmeter.protocol.http.parser.LagartoBasedHtmlParser");
-      JMeterUtils.setProperty("htmlParser.types",
-          "text/html application/xhtml+xml application/xml text/xml");
-      JMeterUtils.setProperty("wmlParser.className",
-          "org.apache.jmeter.protocol.http.parser.RegexpHTMLParser");
-      JMeterUtils.setProperty("wmlParser.types", "text/vnd.wap.wml");
-      JMeterUtils
-          .setProperty("cssParser.className", "org.apache.jmeter.protocol.http.parser.CssParser");
-      JMeterUtils.setProperty("cssParser.types", "text/css");
     }
+    // Always (re)apply: individual tests may mutate or remove these properties, and
+    // HTTP2Sampler loads parsers lazily from whatever is set when first needed.
+    ensureResponseParserProperties();
+  }
+
+  /** Suite defaults for HTML/CSS/WML link extractors used by embedded-resource downloads. */
+  public static void ensureResponseParserProperties() {
+    JMeterUtils.setProperty("HTTPResponse.parsers", "htmlParser wmlParser cssParser");
+    JMeterUtils.setProperty("htmlParser.className",
+        "org.apache.jmeter.protocol.http.parser.LagartoBasedHtmlParser");
+    JMeterUtils.setProperty("htmlParser.types",
+        "text/html application/xhtml+xml application/xml text/xml");
+    JMeterUtils.setProperty("wmlParser.className",
+        "org.apache.jmeter.protocol.http.parser.RegexpHTMLParser");
+    JMeterUtils.setProperty("wmlParser.types", "text/vnd.wap.wml");
+    JMeterUtils.setProperty("cssParser.className",
+        "org.apache.jmeter.protocol.http.parser.CssParser");
+    JMeterUtils.setProperty("cssParser.types", "text/css");
   }
 }
