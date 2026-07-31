@@ -2,13 +2,17 @@ package com.blazemeter.jmeter.http2.core;
 
 import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
 
+import com.blazemeter.jmeter.http2.core.jetty.CustomWwwAuthenticationProtocolHandler;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http2.CustomClientConnectionFactoryOverHTTP2;
+import com.blazemeter.jmeter.http2.core.jetty.custom.http2.CustomHttpClientTransportOverHTTP2;
 import com.blazemeter.jmeter.http2.core.jetty.custom.http3.CustomClientConnectionFactoryOverHTTP3;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
+import com.blazemeter.jmeter.http2.util.Rfc9110Redirects;
 import com.github.luben.zstd.ZstdInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
@@ -17,8 +21,10 @@ import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.net.URLConnection;
 import java.net.URLDecoder;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -32,6 +38,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -46,6 +53,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.stream.StreamSupport;
 import java.util.zip.GZIPInputStream;
+import java.util.zip.Inflater;
 import java.util.zip.InflaterInputStream;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.jmeter.protocol.http.control.AuthManager;
@@ -58,7 +66,9 @@ import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPArgument;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
+import org.apache.jmeter.services.FileServer;
 import org.apache.jmeter.testelement.property.JMeterProperty;
+import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.util.JMeterUtils;
 import org.brotli.dec.BrotliInputStream;
 import org.eclipse.jetty.client.AbstractAuthentication;
@@ -99,7 +109,6 @@ import org.eclipse.jetty.http.MetaData;
 import org.eclipse.jetty.http2.HTTP2Session;
 import org.eclipse.jetty.http2.api.Session;
 import org.eclipse.jetty.http2.client.HTTP2Client;
-import org.eclipse.jetty.http2.client.transport.HttpClientTransportOverHTTP2;
 import org.eclipse.jetty.http2.frames.Frame;
 import org.eclipse.jetty.http2.frames.GoAwayFrame;
 import org.eclipse.jetty.http2.frames.HeadersFrame;
@@ -132,19 +141,33 @@ public class HTTP2JettyClient {
       "HTTP2JettyClient build: host-header-filter+http3-always-v2026-01-26";
   private static final boolean FORCE_HTTP2_ONLY = false;
   private static final Set<String> SUPPORTED_METHODS = new HashSet<>(Arrays
-      .asList(HTTPConstants.GET, HTTPConstants.POST, HTTPConstants.PUT, HTTPConstants.PATCH,
-          HTTPConstants.OPTIONS, HTTPConstants.DELETE));
+      .asList(HTTPConstants.GET, HTTPConstants.HEAD, HTTPConstants.POST, HTTPConstants.PUT,
+          HTTPConstants.PATCH, HTTPConstants.OPTIONS, HTTPConstants.DELETE));
   private static final Set<String> METHODS_WITH_BODY = new HashSet<>(Arrays
       .asList(HTTPConstants.POST, HTTPConstants.PUT, HTTPConstants.PATCH));
   private static final Path ALPN_DEBUG_LOG_PATH = resolveAlpnLogPath();
   private static final boolean ADD_CONTENT_TYPE_TO_POST_IF_MISSING = JMeterUtils.getPropDefault(
       "http.post_add_content_type_if_missing", false);
+  // Matches HTTPFileImpl: caps stored response data for file:// samples, while sampleEnd's
+  // bodySize still reflects the true total bytes read. Separate from HTTP store truncation
+  // ({@link #maxBufferSize}): JMeter also keeps HTTPFileImpl's 10 MiB default distinct from
+  // HTTPSamplerBase's default of 0 for the same property name.
+  private static final int MAX_FILE_SAMPLE_BYTES_TO_STORE = JMeterUtils.getPropDefault(
+      BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST, 10 * 1024 * 1024);
+  private static final int FILE_SAMPLE_BUFFER_SIZE = 4096;
+  /**
+   * Jetty {@code BufferingResponseListener} hard cap. Always unlimited so large bodies are not
+   * aborted; SampleResult store truncation uses {@link #maxBufferSize} instead (JMeter parity).
+   */
+  private static final int JETTY_BUFFERING_UNLIMITED = -1;
   private static final Pattern PORT_PATTERN = Pattern.compile("\\d+");
   private static final String MULTI_PART_SEPARATOR = "--";
   private static final String LINE_SEPARATOR = "\r\n";
   private static final String DEFAULT_FILE_MIME_TYPE = "application/octet-stream";
   private static final String ALT_SVC_HEADER = "alt-svc";
   private static final String ATTR_HTTP3_ATTEMPTED = "bzm.http3.attempted";
+  private static final String ATTR_H2C_FALLBACK_ATTEMPTED = "bzm.h2cFallbackAttempted";
+  private static final String ATTR_SKIP_H2C_UPGRADE = "bzm.skipH2cUpgrade";
   private static final String ATTR_ORIGIN_KEY = "bzm.http3.origin";
   private static final String ATTR_REQUEST_HEADERS_SERIALIZED = "bzm.request.headers.serialized";
   private static final String PROP_SKIP_REDUNDANT_MANUAL_DECODE =
@@ -176,7 +199,12 @@ public class HTTP2JettyClient {
   private static final Map<String, Http1OnlyEntry> HTTP1_ONLY_CACHE = new ConcurrentHashMap<>();
   private static final Map<String, H2cEntry> H2C_CACHE = new ConcurrentHashMap<>();
   private int requestTimeout = 0;
-  private int maxBufferSize = 21 * 1024 * 1024;
+  /**
+   * Max bytes stored in {@link HTTPSampleResult} response data ({@code <= 0} = no truncation).
+   * Resolved from plugin {@code maxBufferSize} if set, else JMeter
+   * {@code httpsampler.max_bytes_to_store_per_request} if set, else {@code -1}.
+   */
+  private int maxBufferSize = -1;
   private int maxThreads = 5;
   private boolean maxThreadsConfigured = false;
   private int minThreads = 1;
@@ -213,6 +241,10 @@ public class HTTP2JettyClient {
   private CompressionContentDecoderFactory brotliDecoderFactory;
   private CompressionContentDecoderFactory zstdDecoderFactory;
   private ContentDecoder.Factory gzipDecoderFactory;
+  // Jetty's compression module ships gzip/brotli/zstd decoders but no deflate one, so
+  // DeflateContentDecoderFactory is our own Inflater-based implementation (not a Jetty class).
+  // Kept initialized for the disableDeflateDecoder diagnostic toggle, but no longer registered
+  // per-request; see the comment in configureContentDecoders() below.
   private DeflateContentDecoderFactory deflateDecoderFactory;
   private boolean decoderFactoriesInitialized = false;
   private int quicMaxIdleTimeout = 30000;
@@ -272,6 +304,11 @@ public class HTTP2JettyClient {
     ClientConnectionFactory.Info http11 = HttpClientConnectionFactory.HTTP11;
 
     HTTP2Client http2Client = new HTTP2Client(clientConnector);
+    // HTTP2Client defaults to 8 KiB; HttpClient defaults to -1 (no local HPACK cap). Match
+    // HttpClient here so parsers are not created with 8192. On start(), Jetty configure()
+    // re-syncs from HttpClient.getMaxResponseHeadersSize(), so this stays dynamic if callers
+    // change HttpClient before start().
+    http2Client.setMaxResponseHeadersSize(-1);
     enableFrameLoggingIfConfigured(http2Client);
 
     // Add session listener to log SETTINGS frames received from server (for debugging Issue #12071)
@@ -506,6 +543,7 @@ public class HTTP2JettyClient {
 
     ClientConnector h2cUpgradeConnector = createClientConnector(name + "-h2c-upgrade");
     HTTP2Client http2cUpgradeClient = new HTTP2Client(h2cUpgradeConnector);
+    http2cUpgradeClient.setMaxResponseHeadersSize(-1);
     http2cUpgradeClient.setUseALPN(false);
     if (disableServerPush) {
       http2cUpgradeClient.setMaxConcurrentPushedStreams(0);
@@ -524,13 +562,14 @@ public class HTTP2JettyClient {
 
     ClientConnector h2cConnector = createClientConnector(name + "-h2c");
     HTTP2Client http2cClient = new HTTP2Client(h2cConnector);
+    http2cClient.setMaxResponseHeadersSize(-1);
     http2cClient.setUseALPN(false);
     if (disableServerPush) {
       http2cClient.setMaxConcurrentPushedStreams(0);
     } else {
       http2cClient.setMaxConcurrentPushedStreams(maxConcurrentPushedStreams);
     }
-    HttpClientTransport h2cTransport = new HttpClientTransportOverHTTP2(http2cClient);
+    HttpClientTransport h2cTransport = new CustomHttpClientTransportOverHTTP2(http2cClient);
     configureTransport(h2cTransport);
     this.httpClientH2cPrior = new HttpClient(h2cTransport);
     configureHttpClient(this.httpClientH2cPrior, h2cConnector);
@@ -692,8 +731,17 @@ public class HTTP2JettyClient {
     return httpClient;
   }
 
+  /**
+   * Max bytes kept in the sample response data (JMeter-style store truncation). {@code <= 0} means
+   * do not truncate.
+   */
   public int getMaxBufferSize() {
     return maxBufferSize;
+  }
+
+  /** Length passed to Jetty buffering listeners; always unlimited so truncation is store-only. */
+  public static int getJettyBufferingMaxLength() {
+    return JETTY_BUFFERING_UNLIMITED;
   }
 
   public int getRequestTimeout() {
@@ -710,9 +758,7 @@ public class HTTP2JettyClient {
     byteBufferPoolFactor =
         Integer.parseInt(BzmHttpPluginProperties.getPropDefault(
             "httpJettyClient.byteBufferPoolFactor", String.valueOf(byteBufferPoolFactor)));
-    maxBufferSize =
-        Integer.parseInt(BzmHttpPluginProperties.getPropDefault("httpJettyClient.maxBufferSize",
-            String.valueOf(2 * 1024 * 1024)));
+    maxBufferSize = resolveMaxBytesToStorePerRequest();
     minThreads = Integer
         .parseInt(BzmHttpPluginProperties.getPropDefault("httpJettyClient.minThreads",
             String.valueOf(minThreads)));
@@ -842,6 +888,25 @@ public class HTTP2JettyClient {
     if (!enableHttp1) {
       protocolErrorFallbackEnabled = false;
     }
+  }
+
+  /**
+   * Plugin {@code maxBufferSize} wins when set; otherwise JMeter
+   * {@code httpsampler.max_bytes_to_store_per_request} when set; otherwise {@code -1} (no
+   * truncation). {@code <= 0} means do not truncate, matching JMeter's store semantics.
+   */
+  private static int resolveMaxBytesToStorePerRequest() {
+    if (BzmHttpPluginProperties.isDefined(BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP)) {
+      return Integer.parseInt(BzmHttpPluginProperties.getPropDefault(
+          BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP, "-1").trim());
+    }
+    Properties props = JMeterUtils.getJMeterProperties();
+    if (props != null
+        && props.containsKey(BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST)) {
+      return Integer.parseInt(JMeterUtils.getPropDefault(
+          BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST, "0").trim());
+    }
+    return -1;
   }
 
   private boolean getBooleanProp(String key, Boolean overrideValue, boolean defaultValue) {
@@ -1042,6 +1107,7 @@ public class HTTP2JettyClient {
       lowLevelDebug("Starting HttpClient: name={}, http1UpgradeRequired={}",
           httpClient.getName(), http1UpgradeRequired);
       httpClient.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClient);
       lowLevelDebug("HttpClient started successfully");
     } else {
       lowLevelDebug("HttpClient already started");
@@ -1049,22 +1115,26 @@ public class HTTP2JettyClient {
     if (httpClientNoH3 != httpClient && !httpClientNoH3.isStarted()) {
       lowLevelDebug("Starting HttpClient (no HTTP/3): name={}", httpClientNoH3.getName());
       httpClientNoH3.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientNoH3);
       lowLevelDebug("HttpClient (no HTTP/3) started successfully");
     }
     if (!httpClientHttp1Only.isStarted()) {
       lowLevelDebug("Starting HttpClient (HTTP/1.1 only): name={}", httpClientHttp1Only.getName());
       httpClientHttp1Only.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientHttp1Only);
       lowLevelDebug("HttpClient (HTTP/1.1 only) started successfully");
     }
     if (!httpClientH2cPrior.isStarted()) {
       lowLevelDebug("Starting HttpClient (H2C prior knowledge): name={}",
           httpClientH2cPrior.getName());
       httpClientH2cPrior.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientH2cPrior);
       lowLevelDebug("HttpClient (H2C prior knowledge) started successfully");
     }
     if (!httpClientH2cUpgrade.isStarted()) {
       lowLevelDebug("Starting HttpClient (H2C upgrade): name={}", httpClientH2cUpgrade.getName());
       httpClientH2cUpgrade.start();
+      CustomWwwAuthenticationProtocolHandler.install(httpClientH2cUpgrade);
       lowLevelDebug("HttpClient (H2C upgrade) started successfully");
     }
   }
@@ -1100,6 +1170,7 @@ public class HTTP2JettyClient {
     // Start the client
     if (!http11Client.isStarted()) {
       http11Client.start();
+      CustomWwwAuthenticationProtocolHandler.install(http11Client);
       lowLevelDebug("HTTP/1.1-only fallback client started");
     }
 
@@ -1134,10 +1205,11 @@ public class HTTP2JettyClient {
     }
     ensureHostHeader(http11Request, url);
 
-    configureContentDecoders(httpClientHttp1Only, http11Request);
+    configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
 
     // Copy body if present
-    setBody(http11Request, sampler, result);
+    setBody(http11Request, sampler, result, false);
+    JmeterRequestHeadersSupport.prepareFromSampler(http11Request, sampler.getUseKeepAlive());
 
     // Send request
     lowLevelDebug("Sending HTTP/1.1 fallback request");
@@ -1171,54 +1243,153 @@ public class HTTP2JettyClient {
     lowLevelDebug("Retrying request with HTTP/1.1 only: method={}, URI={}",
         originalRequest.getMethod(), uri);
 
-    clearContentDecoders(httpClientHttp1Only);
-
     try {
-      // Rebuild the request with the shared HTTP/1.1-only client
-      Request http11Request = httpClientHttp1Only.newRequest(uri)
-          .method(originalRequest.getMethod())
-          .timeout(requestTimeout, TimeUnit.MILLISECONDS)
-          .followRedirects(originalRequest.isFollowRedirects());
-
-      // Copy headers from original request
-      if (originalRequest.getHeaders() != null) {
-        HttpFields originalHeaders = originalRequest.getHeaders();
-        HttpFields requestHeaders = http11Request.getHeaders();
-        if (requestHeaders instanceof HttpFields.Mutable) {
-          HttpFields.Mutable newHeaders = (HttpFields.Mutable) requestHeaders;
-          originalHeaders.forEach(field -> {
-            // Skip HTTP/2 pseudo-headers (they don't exist in HTTP/1.1)
-            String name = field.getName();
-            if (!name.startsWith(":")) {
-              newHeaders.put(name, field.getValue());
-            }
-          });
-        }
-        // Note: In Jetty 12, Request headers are typically mutable.
-        // If they're not mutable, the headers from the original request
-        // will be lost, but this is an edge case.
-      }
-      ensureHostHeader(http11Request, uri);
-
-      configureContentDecoders(httpClientHttp1Only, http11Request);
-
-      // Copy body if present
-      if (originalRequest.getBody() != null) {
-        http11Request.body(originalRequest.getBody());
-      }
-
-      // Send request and wait for response
+      Request http11Request = buildHttp11FallbackRequest(originalRequest);
       lowLevelDebug("Sending HTTP/1.1 fallback request");
       ContentResponse response = http11Request.send();
-
       lowLevelDebug("HTTP/1.1 fallback request succeeded: status={}, version={}",
           response.getStatus(), response.getVersion());
-
       return response;
     } catch (Exception e) {
       LOG.error("HTTP/1.1 fallback also failed for URI: {}", uri, e);
       throw new ExecutionException("HTTP/1.1 fallback failed", e);
     }
+  }
+
+  private Request buildHttp11FallbackRequest(Request originalRequest) {
+    URI uri = originalRequest.getURI();
+    clearContentDecoders(httpClientHttp1Only);
+    Request http11Request = httpClientHttp1Only.newRequest(uri)
+        .method(originalRequest.getMethod())
+        .timeout(requestTimeout, TimeUnit.MILLISECONDS)
+        .followRedirects(originalRequest.isFollowRedirects());
+    JmeterRequestHeadersSupport.copySamplerHeaderState(originalRequest, http11Request);
+    http11Request.attribute(ATTR_H2C_FALLBACK_ATTEMPTED, Boolean.TRUE);
+    if (originalRequest.getHeaders() != null) {
+      HttpFields originalHeaders = originalRequest.getHeaders();
+      HttpFields requestHeaders = http11Request.getHeaders();
+      if (requestHeaders instanceof HttpFields.Mutable) {
+        HttpFields.Mutable newHeaders = (HttpFields.Mutable) requestHeaders;
+        originalHeaders.forEach(field -> {
+          // Skip HTTP/2 pseudo-headers and h2c upgrade headers - neither exists in HTTP/1.1,
+          // and re-sending them would trigger another (futile) upgrade attempt on this retry.
+          String name = field.getName();
+          if (name.startsWith(":") || isH2cUpgradeHeader(name, field.getValue())) {
+            return;
+          }
+          newHeaders.put(name, field.getValue());
+        });
+      }
+    }
+    ensureHostHeader(http11Request, uri);
+    Object useKeepAlive =
+        http11Request.getAttributes().get(JmeterRequestHeadersSupport.ATTR_USE_KEEPALIVE);
+    if (useKeepAlive instanceof Boolean) {
+      JmeterRequestHeadersSupport.prepareFromSampler(http11Request, (Boolean) useKeepAlive);
+    }
+    configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
+    Request.Content body = originalRequest.getBody();
+    if (body != null) {
+      // The original attempt may already have read some or all of this content before
+      // failing; rewind it back to the start before reuse, exactly as Jetty's own retry
+      // paths do (see AuthenticationProtocolHandler/HttpRedirector). Skipping this can send
+      // a fallback request that declares the right Content-Length but no actual body bytes,
+      // hanging the server until its idle timeout instead of failing fast.
+      if (!body.rewind()) {
+        throw new IllegalStateException(
+            "Request body for " + uri + " is not reproducible for HTTP/1.1 fallback retry");
+      }
+      http11Request.body(body);
+    }
+    SslClientCertAliasSupport.copyFromRequest(originalRequest, http11Request);
+    return http11Request;
+  }
+
+  private static boolean isH2cUpgradeHeader(String name, String value) {
+    if (HttpHeader.UPGRADE.is(name) || HttpHeader.HTTP2_SETTINGS.is(name)) {
+      return true;
+    }
+    if (HttpHeader.CONNECTION.is(name) && value != null) {
+      String lower = value.toLowerCase(Locale.ROOT);
+      return lower.contains("upgrade") || lower.contains("http2-settings");
+    }
+    return false;
+  }
+
+  /** True if {@code request} carried an {@code Upgrade: h2c} header or attribute. */
+  private boolean wasH2cUpgradeAttempt(Request request) {
+    if (request == null) {
+      return false;
+    }
+    Object protocol = request.getAttributes().get(HttpUpgrader.PROTOCOL_ATTRIBUTE);
+    if ("h2c".equals(protocol)) {
+      return true;
+    }
+    HttpFields headers = request.getHeaders();
+    if (headers == null) {
+      return false;
+    }
+    String upgrade = headers.get(HttpHeader.UPGRADE);
+    return upgrade != null && upgrade.toLowerCase(Locale.ROOT).contains("h2c");
+  }
+
+  /**
+   * The server answered (no timeout/error) but never actually negotiated HTTP/2 despite our
+   * {@code Upgrade: h2c} attempt - e.g. it silently ignored the header, as a compliant HTTP/1.1
+   * server that doesn't support h2c is allowed to do. Retry once with a plain HTTP/1.1 request.
+   */
+  private boolean shouldRetryAfterFailedH2cUpgrade(Request request, ContentResponse response) {
+    if (!enableHttp1 || !http1UpgradeRequired || request == null || response == null) {
+      return false;
+    }
+    URI uri = request.getURI();
+    if (uri == null || !"http".equalsIgnoreCase(uri.getScheme())) {
+      return false;
+    }
+    if (Boolean.TRUE.equals(
+        request.getAttributes().get(ATTR_H2C_FALLBACK_ATTEMPTED))) {
+      return false;
+    }
+    if (!wasH2cUpgradeAttempt(request)) {
+      return false;
+    }
+    return response.getVersion() != HttpVersion.HTTP_2;
+  }
+
+  private void markCleartextHttp1Only(URI uri) {
+    if (!enableHttp1 || !http1OnlyCacheEnabled || http1OnlyCooldownMs <= 0 || uri == null) {
+      return;
+    }
+    if (!"http".equalsIgnoreCase(uri.getScheme())) {
+      return;
+    }
+    markHttp1OnlyOrigin(originKey(uri));
+  }
+
+  /**
+   * Retries a request that timed out or failed while attempting an h2c upgrade, as plain
+   * HTTP/1.1. Returns {@code null} (instead of throwing) when the failure isn't h2c-related, or
+   * when a fallback was already attempted for this request, so callers can fall through to their
+   * existing (non-h2c) handling.
+   */
+  private ContentResponse tryCleartextHttp11FallbackAfterH2cFailure(
+      Request request, HTTP2FutureResponseListener listener)
+      throws InterruptedException, TimeoutException, ExecutionException {
+    if (!enableHttp1 || request == null) {
+      return null;
+    }
+    URI uri = request.getURI();
+    if (uri == null || !"http".equalsIgnoreCase(uri.getScheme())
+        || !wasH2cUpgradeAttempt(request)) {
+      return null;
+    }
+    if (Boolean.TRUE.equals(
+        request.getAttributes().get(ATTR_H2C_FALLBACK_ATTEMPTED))) {
+      return null;
+    }
+    lowLevelDebug("Falling back to HTTP/1.1 after failed H2C upgrade for {}", uri);
+    markCleartextHttp1Only(uri);
+    return sendWithHTTP11Only(request, listener);
   }
 
   private ContentResponse sendWithH2cPriorKnowledge(Request originalRequest)
@@ -1254,7 +1425,7 @@ public class HTTP2JettyClient {
       }
     }
     ensureHostHeader(h2cRequest, uri);
-    configureContentDecoders(httpClientH2cPrior, h2cRequest);
+    configureContentDecodersAndCapture(httpClientH2cPrior, h2cRequest);
     if (originalRequest.getBody() != null) {
       h2cRequest.body(originalRequest.getBody());
     }
@@ -1287,6 +1458,14 @@ public class HTTP2JettyClient {
                                     HTTP2Sampler sampler,
                                     HTTPSampleResult result,
                                     HttpClient client) throws IOException {
+    samplePrepareRequest(request, sampler, result, client, false);
+  }
+
+  private void samplePrepareRequest(Request request,
+                                    HTTP2Sampler sampler,
+                                    HTTPSampleResult result,
+                                    HttpClient client,
+                                    boolean areFollowingRedirect) throws IOException {
 
     URL url = result.getURL();
     lowLevelDebug("Preparing request: URL={}, method={}", url, result.getHTTPMethod());
@@ -1294,12 +1473,18 @@ public class HTTP2JettyClient {
     request.followRedirects(sampler.getAutoRedirects());
     String method = result.getHTTPMethod();
     request.method(method);
+    if (shouldAttachRequestBody(sampler, result, areFollowingRedirect)) {
+      // The h2c Upgrade dance sends this request as plain HTTP/1.1 first; attaching a body
+      // to it works but isn't well-supported across servers, so skip the upgrade attempt
+      // entirely for bodied cleartext requests (see resolveClientForRequest).
+      request.attribute(ATTR_SKIP_H2C_UPGRADE, Boolean.TRUE);
+    }
     setHeaders(request, url, sampler.getHeaderManager());
     ensureHostHeader(request, url);
     addPreemptiveAuthorizationHeader(request, url, sampler.getAuthManager());
     lowLevelDebug("Headers set, request URI: {}", request.getURI());
 
-    configureContentDecoders(client, request);
+    configureContentDecodersAndCapture(client, request);
 
     String ae = request.getHeaders() != null
         ? request.getHeaders().get(HttpHeader.ACCEPT_ENCODING)
@@ -1310,6 +1495,16 @@ public class HTTP2JettyClient {
     CookieManager cookieManager = sampler.getCookieManager();
     if (cookieManager != null) {
       result.setCookies(buildCookies(request, url, cookieManager));
+    } else {
+      // HttpClient4 reports whatever Cookie header actually went out, even when it wasn't
+      // built by a CookieManager (e.g. set directly via HeaderManager).
+      HttpFields headers = request.getHeaders();
+      if (headers != null) {
+        String cookieHeader = headers.get(HttpHeader.COOKIE);
+        if (cookieHeader != null && !cookieHeader.isEmpty()) {
+          result.setCookies(cookieHeader);
+        }
+      }
     }
 
     if (!sampler.getProxyHost().isEmpty()) {
@@ -1322,7 +1517,8 @@ public class HTTP2JettyClient {
     }
     result.sampleStart();
 
-    setBody(request, sampler, result);
+    setBody(request, sampler, result, areFollowingRedirect);
+    JmeterRequestHeadersSupport.prepareFromSampler(request, sampler.getUseKeepAlive());
     initializeSentBytes(result, request);
 
   }
@@ -1348,7 +1544,18 @@ public class HTTP2JettyClient {
                                    JettyCacheManager cacheManager)
       throws IOException {
     http1UpgradeRequired = contentResponse.getVersion() != HttpVersion.HTTP_2;
-    result.setRequestHeaders(getSerializedRequestHeaders(request, true));
+    // When autoRedirects silently follows a redirect chain at the transport layer, contentResponse
+    // carries the LAST request Jetty actually sent - not the original one passed in here. Report
+    // headers/sentBytes for that effective request, matching what HttpClient4 shows for the same
+    // scenario, instead of the pre-redirect request's (possibly different host/method/headers).
+    Request effectiveRequest = contentResponse.getRequest() != null
+        ? contentResponse.getRequest()
+        : request;
+    result.setRequestHeaders(getSerializedRequestHeaders(effectiveRequest, true));
+    long headerBytes = estimateRequestHeaderBytes(effectiveRequest);
+    if (headerBytes > result.getSentBytes()) {
+      result.setSentBytes(headerBytes);
+    }
     setResultContentResponse(result, contentResponse);
     saveCookiesInCookieManager(contentResponse, request.getURI().toURL(),
         sampler.getCookieManager());
@@ -1371,7 +1578,6 @@ public class HTTP2JettyClient {
     lowLevelDebug("Request built: URI={}, method={}", request.getURI(), request.getMethod());
     samplePrepareRequest(request, sampler, result, context.client);
     listener.setRequest(request);
-    listener.setFallbackHttp1Client(httpClientHttp1Only);
     lowLevelDebug("Request prepared, ready to send");
     return request;
 
@@ -1391,12 +1597,17 @@ public class HTTP2JettyClient {
     lowLevelDebug("=== HTTP2JettyClient.sample() called ===");
     lowLevelDebug("Method: {}, URL: {}", result.getHTTPMethod(), result.getURL());
 
+    URL sampleUrl = result.getURL();
+    if (sampleUrl != null && "file".equalsIgnoreCase(sampleUrl.getProtocol())) {
+      return sampleLocalFile(sampler, result, sampleUrl, areFollowingRedirect, depth);
+    }
+
     errorWhenNotSupportedMethod(result.getHTTPMethod());
     setAuthManager(sampler);
     RequestContext context = buildRequestContext(result, resolveClientForRequest(sampler, result));
     Request request = context.request;
 
-    samplePrepareRequest(request, sampler, result, context.client);
+    samplePrepareRequest(request, sampler, result, context.client, areFollowingRedirect);
 
     JettyCacheManager cacheManager =
         JettyCacheManager.fromCacheManager(sampler.getCacheManager());
@@ -1404,8 +1615,9 @@ public class HTTP2JettyClient {
       return cacheManager.buildCachedSampleResult(result);
     }
     lowLevelDebug("=== Creating HTTP2FutureResponseListener ===");
-    lowLevelDebug("maxBufferSize: {}", maxBufferSize);
-    HTTP2FutureResponseListener listener = new HTTP2FutureResponseListener(maxBufferSize);
+    lowLevelDebug("maxBytesToStorePerRequest: {}", maxBufferSize);
+    HTTP2FutureResponseListener listener =
+        new HTTP2FutureResponseListener(JETTY_BUFFERING_UNLIMITED);
     lowLevelDebug("=== HTTP2FutureResponseListener created successfully ===");
     listener.setRequest(request);
     lowLevelDebug("=== About to call send() ===");
@@ -1419,9 +1631,9 @@ public class HTTP2JettyClient {
       }
       throw e;
     } catch (ExecutionException e) {
-      if (protocolErrorFallbackEnabled && enableHttp1
-          && ProtocolErrorException.isProtocolError(e)) {
-        LOG.warn("Protocol error during send(), retrying with HTTP/1.1 only");
+      Throwable cause = e.getCause();
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+        LOG.warn("Transport failure during send(), retrying with HTTP/1.1 only");
         return retryWithHTTP11Only(sampler, result);
       }
       throw e;
@@ -1430,6 +1642,55 @@ public class HTTP2JettyClient {
 
     postContentResponse(sampler, request, result, contentResponse, cacheManager);
     result.setEndTime(listener.getResponseEnd());
+
+    resetSamplerDataBeforeResultProcessing(result);
+    return sampler.resultProcessing(areFollowingRedirect, depth, result);
+  }
+
+  /**
+   * Matches HttpClient4's {@code HTTPFileImpl}: {@code file://} samples always use GET, open the
+   * URL directly (Java's built-in {@code file} URL handler - relative paths resolve against the
+   * JVM's working directory, not via {@link org.apache.jmeter.services.FileServer}), and always
+   * report {@code text/html} as the content type regardless of the file's actual type, since this
+   * exists to test the HTML embedded-resource parser against local fixtures, not to serve
+   * arbitrary static files.
+   */
+  private HTTPSampleResult sampleLocalFile(HTTP2Sampler sampler, HTTPSampleResult result, URL url,
+                                           boolean areFollowingRedirect, int depth)
+      throws Exception {
+    result.setHTTPMethod(HTTPConstants.GET);
+    result.setURL(url);
+    result.setSampleLabel(url.toString());
+    result.sampleStart();
+
+    ByteArrayOutputStream output = new ByteArrayOutputStream(FILE_SAMPLE_BUFFER_SIZE);
+    long totalBytes = 0;
+    URLConnection connection = url.openConnection();
+    try (InputStream inputStream = connection.getInputStream()) {
+      byte[] buffer = new byte[FILE_SAMPLE_BUFFER_SIZE];
+      int bytesRead;
+      while ((bytesRead = inputStream.read(buffer)) != -1) {
+        if (totalBytes < MAX_FILE_SAMPLE_BYTES_TO_STORE) {
+          int toStore = (int) Math.min(bytesRead, MAX_FILE_SAMPLE_BYTES_TO_STORE - totalBytes);
+          output.write(buffer, 0, toStore);
+        }
+        totalBytes += bytesRead;
+      }
+    }
+
+    result.sampleEnd();
+    result.setResponseData(output.toByteArray());
+    result.setBodySize(totalBytes);
+    result.setResponseCodeOK();
+    result.setResponseMessageOK();
+    result.setSuccessful(true);
+    String contentType = "text/html";
+    String contentEncoding = sampler.getContentEncoding();
+    if (StringUtils.isNotBlank(contentEncoding)) {
+      contentType = contentType + "; charset=" + contentEncoding;
+    }
+    result.setContentType(contentType);
+    result.setEncodingAndType(contentType);
 
     resetSamplerDataBeforeResultProcessing(result);
     return sampler.resultProcessing(areFollowingRedirect, depth, result);
@@ -1502,7 +1763,9 @@ public class HTTP2JettyClient {
       LOG.error("isProtocolError(cause): {}", isProtocolErrorCause);
       LOG.error("isProtocolError(exception): {}", isProtocolErrorException);
 
-      if ((isProtocolErrorCause || isProtocolErrorException) && protocolErrorFallbackEnabled) {
+      if ((isProtocolErrorCause || isProtocolErrorException) && protocolErrorFallbackEnabled
+          && !HpackFailureDetector.indicatesHpackFailure(e)
+          && !HpackFailureDetector.indicatesHpackFailure(cause)) {
         LOG.warn("HTTP/2 protocol_error detected in sampleFromListener()! "
             + "Attempting fallback to HTTP/1.1");
         LOG.warn("Error: {}", cause != null ? cause.getMessage() : e.getMessage());
@@ -1563,6 +1826,14 @@ public class HTTP2JettyClient {
     } catch (TimeoutException e) {
       if (http1UpgradeRequired && "http".equalsIgnoreCase(uri.getScheme())) {
         try {
+          ContentResponse fallback = tryCleartextHttp11FallbackAfterH2cFailure(request, listener);
+          if (fallback != null) {
+            return fallback;
+          }
+        } catch (Exception fallbackException) {
+          LOG.error("HTTP/1.1 fallback after H2C timeout failed", fallbackException);
+        }
+        try {
           LOG.warn("H2C upgrade timed out; retrying with prior knowledge");
           return sendWithH2cPriorKnowledge(request);
         } catch (Exception retryException) {
@@ -1596,10 +1867,8 @@ public class HTTP2JettyClient {
           throw e;
         }
       }
-      if ((cause instanceof ProtocolErrorException
-          || ProtocolErrorException.isProtocolError(cause))
-          && protocolErrorFallbackEnabled) {
-        LOG.warn("HTTP/2 protocol_error detected in send()! Attempting fallback to HTTP/1.1");
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+        LOG.warn("Transport failure detected in send()! Attempting fallback to HTTP/1.1");
         LOG.warn("Error details: message='{}', exception={}",
             cause != null ? cause.getMessage() : e.getMessage(),
             cause != null ? cause.getClass().getName() : "unknown");
@@ -1653,7 +1922,8 @@ public class HTTP2JettyClient {
     java.util.concurrent.atomic.AtomicBoolean h2Started =
         new java.util.concurrent.atomic.AtomicBoolean(false);
 
-    HTTP2FutureResponseListener h2Listener = new HTTP2FutureResponseListener(maxBufferSize);
+    HTTP2FutureResponseListener h2Listener =
+        new HTTP2FutureResponseListener(JETTY_BUFFERING_UNLIMITED);
     Request h2Request = cloneRequest(h3Request, httpClientNoH3);
     h2Listener.setRequest(h2Request);
 
@@ -1816,6 +2086,17 @@ public class HTTP2JettyClient {
             response.getStatus(), response.getVersion(), elapsed, contentLength);
         int headerCount = response.getHeaders() != null ? response.getHeaders().size() : 0;
         lowLevelDebug("Response headers: {}", headerCount);
+        if (originalRequest != null
+            && shouldRetryAfterFailedH2cUpgrade(originalRequest, response)) {
+          lowLevelDebug("H2C upgrade did not negotiate HTTP/2; retrying with HTTP/1.1 for {}",
+              originalRequest.getURI());
+          markCleartextHttp1Only(originalRequest.getURI());
+          ContentResponse fallbackResponse = sendWithHTTP11Only(originalRequest, listener);
+          updateHttp1OnlyCache(originalRequest, fallbackResponse);
+          updateH2cCache(originalRequest, fallbackResponse);
+          updateAltSvcCache(originalRequest, fallbackResponse.getHeaders());
+          return fallbackResponse;
+        }
         if (originalRequest != null && response.getVersion() == HttpVersion.HTTP_3) {
           recordHttp3Success(originalRequest.getURI());
         }
@@ -1830,6 +2111,21 @@ public class HTTP2JettyClient {
       long endGet = System.currentTimeMillis();
       long elapsed = endGet - getStart;
       LOG.error("Request timeout after {}ms: {}", elapsed, e.getMessage());
+      if (originalRequest != null) {
+        try {
+          ContentResponse fallback =
+              tryCleartextHttp11FallbackAfterH2cFailure(originalRequest, listener);
+          if (fallback != null) {
+            updateHttp1OnlyCache(originalRequest, fallback);
+            updateH2cCache(originalRequest, fallback);
+            updateAltSvcCache(originalRequest, fallback.getHeaders());
+            return fallback;
+          }
+        } catch (Exception fallbackException) {
+          LOG.error("HTTP/1.1 fallback after H2C timeout in getContent() failed",
+              fallbackException);
+        }
+      }
       throw new TimeoutException("The request took more than " + elapsed
           + " milliseconds to complete");
     } catch (ExecutionException e) {
@@ -1861,10 +2157,8 @@ public class HTTP2JettyClient {
           }
         }
       }
-      if ((cause instanceof ProtocolErrorException
-          || ProtocolErrorException.isProtocolError(cause))
-          && protocolErrorFallbackEnabled) {
-        LOG.warn("HTTP/2 protocol_error detected in getContent()! "
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+        LOG.warn("Transport failure detected in getContent()! "
             + "Attempting fallback to HTTP/1.1");
         LOG.warn("Error details: message='{}', exception={}",
             cause != null ? cause.getMessage() : e.getMessage(),
@@ -2084,9 +2378,14 @@ public class HTTP2JettyClient {
     } else if (addGzip && disableGzipDecoder) {
       lowLevelDebug("Gzip decoder disabled by blazemeter.http.disableGzipDecoder");
     }
-    if (addDeflate && deflateDecoderFactory != null && !disableDeflateDecoder) {
-      factories.put(deflateDecoderFactory);
-    } else if (addDeflate && disableDeflateDecoder) {
+    // Not registering deflateDecoderFactory here on purpose. It decodes per-chunk as bytes
+    // arrive off the wire, so if the first bytes don't inflate as zlib-wrapped (RFC 1950) there's
+    // no clean way to rewind and retry as raw/headerless deflate (RFC 1951) - some servers send
+    // "Content-Encoding: deflate" as raw deflate despite the RFC implying zlib. getDecodedContent()
+    // below instead decodes the fully buffered response body, where retrying with a fresh
+    // Inflater is trivial, so all deflate decoding is funneled through decodeDeflate() there to
+    // match HttpClient4 (which also tries zlib first, then raw).
+    if (addDeflate && disableDeflateDecoder) {
       lowLevelDebug("Deflate decoder disabled by blazemeter.http.disableDeflateDecoder");
     }
 
@@ -2105,8 +2404,17 @@ public class HTTP2JettyClient {
     }
   }
 
+  private void configureContentDecodersAndCapture(HttpClient client, Request request) {
+    configureContentDecoders(client, request);
+    JmeterCompressionHeadersSupport.installCapture(request);
+  }
+
   private HttpClient selectHttpClient(URI uri) {
     if (uri != null && "http".equalsIgnoreCase(uri.getScheme())) {
+      if (enableHttp1 && isHttp1Only(uri)) {
+        lowLevelDebug("HTTP/1.1-only cache hit for cleartext origin {}", originKey(uri));
+        return httpClientHttp1Only;
+      }
       if (!enableHttp2 && enableHttp1) {
         return httpClientHttp1Only;
       }
@@ -2354,21 +2662,32 @@ public class HTTP2JettyClient {
       return;
     }
     URI uri = request.getURI();
-    if (uri == null || !"https".equalsIgnoreCase(uri.getScheme())) {
+    if (uri == null) {
       return;
     }
     String origin = originKey(uri);
     HttpVersion version = response.getVersion();
-    if (version == HttpVersion.HTTP_1_1) {
-      Http1OnlyEntry entry = new Http1OnlyEntry();
-      entry.expiresAt = System.currentTimeMillis() + http1OnlyCooldownMs;
-      HTTP1_ONLY_CACHE.put(origin, entry);
-      lowLevelDebug("HTTP/1.1-only cache set for origin {} until {}", origin, entry.expiresAt);
-    } else if (version != null) {
-      if (HTTP1_ONLY_CACHE.remove(origin) != null) {
+    if ("https".equalsIgnoreCase(uri.getScheme())) {
+      if (version == HttpVersion.HTTP_1_1) {
+        markHttp1OnlyOrigin(origin);
+      } else if (version != null && HTTP1_ONLY_CACHE.remove(origin) != null) {
         lowLevelDebug("HTTP/1.1-only cache cleared for origin {}", origin);
       }
+      return;
     }
+    // Cleartext origin that attempted an h2c upgrade but didn't get HTTP/2 back: cache it as
+    // HTTP/1.1-only too, so later requests to the same origin skip the futile upgrade attempt.
+    if ("http".equalsIgnoreCase(uri.getScheme()) && wasH2cUpgradeAttempt(request)
+        && version != HttpVersion.HTTP_2) {
+      markHttp1OnlyOrigin(origin);
+    }
+  }
+
+  private void markHttp1OnlyOrigin(String origin) {
+    Http1OnlyEntry entry = new Http1OnlyEntry();
+    entry.expiresAt = System.currentTimeMillis() + http1OnlyCooldownMs;
+    HTTP1_ONLY_CACHE.put(origin, entry);
+    lowLevelDebug("HTTP/1.1-only cache set for origin {} until {}", origin, entry.expiresAt);
   }
 
   private void updateH2cCache(Request request, Response response) {
@@ -2430,6 +2749,31 @@ public class HTTP2JettyClient {
       current = current.getCause();
     }
     return null;
+  }
+
+  /**
+   * Unifies the two failure modes that warrant an HTTP/1.1 fallback: an explicit HTTP/2
+   * {@code protocol_error}, and a {@link ClosedChannelException} anywhere in the cause chain -
+   * some servers drop the connection outright instead of returning a clean protocol error when
+   * they don't like the request (e.g. a failed h2c upgrade attempt).
+   */
+  private boolean shouldFallbackToHttp11AfterTransportFailure(Throwable cause,
+      Throwable wrapped) {
+    if (!protocolErrorFallbackEnabled || !enableHttp1) {
+      return false;
+    }
+    return ProtocolErrorException.isProtocolError(wrapped)
+        || ProtocolErrorException.isProtocolError(cause)
+        || isClosedChannelFailure(cause != null ? cause : wrapped);
+  }
+
+  private static boolean isClosedChannelFailure(Throwable throwable) {
+    for (Throwable current = throwable; current != null; current = current.getCause()) {
+      if (current instanceof ClosedChannelException) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private ContentResponse retryAfterGoAway(Request originalRequest)
@@ -2511,7 +2855,8 @@ public class HTTP2JettyClient {
     if (originalRequest.getBody() != null) {
       request.body(originalRequest.getBody());
     }
-    configureContentDecoders(client, request);
+    SslClientCertAliasSupport.copyFromRequest(originalRequest, request);
+    configureContentDecodersAndCapture(client, request);
     return request;
   }
 
@@ -2541,7 +2886,9 @@ public class HTTP2JettyClient {
       client.setDestinationIdleTimeout(idleTimeout);
     }
     client.setIdleTimeout(idleTimeout);
-    addConnectionLogging(client);
+    if (LowLevelDebugLog.isEnabled()) {
+      addConnectionLogging(client);
+    }
   }
 
   private static void addConnectionLogging(HttpClient client) {
@@ -2589,6 +2936,9 @@ public class HTTP2JettyClient {
   }
 
   private static void logAlpnLine(String message) {
+    if (!LowLevelDebugLog.isEnabled()) {
+      return;
+    }
     try {
       Path parent = ALPN_DEBUG_LOG_PATH.getParent();
       if (parent != null) {
@@ -2888,6 +3238,10 @@ public class HTTP2JettyClient {
     boolean http3Attempted = enableHttp3 && client == httpClient && shouldAttemptHttp3(uri);
     request.attribute(ATTR_HTTP3_ATTEMPTED, http3Attempted);
     request.attribute(ATTR_ORIGIN_KEY, originKey(uri));
+    if ("https".equalsIgnoreCase(uri.getScheme())) {
+      String clientCertAlias = JMeterSslAliasResolver.resolveForRequest();
+      SslClientCertAliasSupport.bindToRequest(request, clientCertAlias);
+    }
     request.onRequestBegin(r -> result.connectEnd());
     request.onRequestContent(
         (r, c) -> result.setSentBytes(result.getSentBytes() + c.limit()));
@@ -2897,7 +3251,13 @@ public class HTTP2JettyClient {
 
   private HttpClient resolveClientForRequest(HTTP2Sampler sampler, HTTPSampleResult result)
       throws URISyntaxException {
-    return selectHttpClient(result.getURL().toURI());
+    URI uri = result.getURL().toURI();
+    if ("http".equalsIgnoreCase(uri.getScheme())
+        && shouldAttachRequestBody(sampler, result, false)) {
+      lowLevelDebug("Cleartext request with body; using HTTP/1.1-only client for {}", uri);
+      return httpClientHttp1Only;
+    }
+    return selectHttpClient(uri);
   }
 
   private boolean requestAdvertisesEncoding(HTTP2Sampler sampler, String encoding) {
@@ -2983,8 +3343,9 @@ public class HTTP2JettyClient {
     // 1. The connection is already HTTP/2 (negotiated via ALPN)
     // 2. Upgrade headers are for cleartext HTTP, not HTTPS
     // 3. It violates the HTTP/2 protocol (RFC 7540)
-    if (http1UpgradeRequired && !"https".equalsIgnoreCase(url.getProtocol())
-        && !shouldUseH2cPriorKnowledge(request.getURI())) {
+    if (http1UpgradeRequired && enableHttp2 && !"https".equalsIgnoreCase(url.getProtocol())
+        && !shouldUseH2cPriorKnowledge(request.getURI())
+        && !Boolean.TRUE.equals(request.getAttributes().get(ATTR_SKIP_H2C_UPGRADE))) {
       Mutable headers = ((Mutable) request.getHeaders());
       addHeaderIfMissing(HttpHeader.UPGRADE, "h2c", headers);
       addHeaderIfMissing(HttpHeader.HTTP2_SETTINGS, buildH2cSettingsHeaderValue(), headers);
@@ -3155,7 +3516,7 @@ public class HTTP2JettyClient {
     // For HTTPS connections, we assume HTTP/2 if ALPN negotiated it
     // For HTTP connections, we check if upgrade headers are present
     boolean isHTTP2 = "https".equalsIgnoreCase(request.getURI().getScheme())
-        || (http1UpgradeRequired && headers.contains(HttpHeader.UPGRADE));
+        || (enableHttp2 && http1UpgradeRequired && headers.contains(HttpHeader.UPGRADE));
 
     if (isHTTP2) {
       // HTTP/2 does not support Connection header except for upgrade (which we handle separately)
@@ -3271,13 +3632,18 @@ public class HTTP2JettyClient {
     }
   }
 
-  private void setBody(Request request, HTTP2Sampler sampler, HTTPSampleResult result)
+  private void setBody(Request request, HTTP2Sampler sampler, HTTPSampleResult result,
+                       boolean areFollowingRedirect)
       throws IOException {
+    if (!shouldAttachRequestBody(sampler, result, areFollowingRedirect)) {
+      result.setQueryString("");
+      return;
+    }
     String contentEncoding = sampler.getContentEncoding();
     String contentTypeHeader =
         request.getHeaders() != null ? request.getHeaders().get(HTTPConstants.HEADER_CONTENT_TYPE)
             : null;
-    boolean hasContentTypeHeader = contentTypeHeader != null && contentTypeHeader.isEmpty();
+    boolean hasContentTypeHeader = StringUtils.isNotBlank(contentTypeHeader);
     StringBuilder postBody = new StringBuilder();
     if (sampler.getUseMultipart()) {
       // In Jetty 12, MultiPartRequestContent API has changed significantly
@@ -3321,7 +3687,7 @@ public class HTTP2JettyClient {
         if (StringUtils.isBlank(file.getParamName())) {
           throw new IllegalStateException("Param name is blank");
         }
-        String fileName = Paths.get((file.getPath())).getFileName().toString();
+        String fileName = resolveHttpFile(file.getPath()).getName();
         postBody.append(buildFilePartRequestBody(file, fileName, boundary));
       }
       postBody.append(MULTI_PART_SEPARATOR).append(boundary).append(MULTI_PART_SEPARATOR)
@@ -3346,48 +3712,60 @@ public class HTTP2JettyClient {
         }
         // In Jetty 12, PathRequestContent implements Request.Content directly
         Request.Content requestContent =
-            new PathRequestContent(mimeTypeFile, Path.of(file.getPath()));
+            new PathRequestContent(mimeTypeFile, resolveHttpFile(file.getPath()).toPath());
         request.body(requestContent);
         postBody.append("<actual file content, not shown here>");
       } else {
-        if (!hasContentTypeHeader && ADD_CONTENT_TYPE_TO_POST_IF_MISSING) {
-          HttpFields headers = request.getHeaders();
-          if (headers instanceof HttpFields.Mutable) {
-            ((HttpFields.Mutable) headers).put(HTTPConstants.HEADER_CONTENT_TYPE,
-                HTTPConstants.APPLICATION_X_WWW_FORM_URLENCODED);
-          }
-        }
         Charset contentCharset = buildCharsetOrDefault(contentEncoding, StandardCharsets.UTF_8);
         if (sampler.getSendParameterValuesAsPostBody()) {
+          if (!hasContentTypeHeader) {
+            HttpFields headers = request.getHeaders();
+            if (headers instanceof HttpFields.Mutable) {
+              ((HttpFields.Mutable) headers).put(HTTPConstants.HEADER_CONTENT_TYPE,
+                  "text/plain; charset=" + contentCharset.name());
+            }
+          }
           for (JMeterProperty jMeterProperty : sampler.getArguments()) {
             HTTPArgument arg = (HTTPArgument) jMeterProperty.getObjectValue();
             postBody.append(arg.getEncodedValue(contentCharset.name()));
           }
+          String bodyContentType = request.getHeaders() != null
+              ? request.getHeaders().get(HTTPConstants.HEADER_CONTENT_TYPE)
+              : null;
           // In Jetty 12, StringRequestContent implements Request.Content directly
           Request.Content requestContent =
-              new StringRequestContent(contentTypeHeader, postBody.toString(),
-                  contentCharset);
+              new StringRequestContent(bodyContentType, postBody.toString(), contentCharset);
           request.body(requestContent);
-        } else if (isMethodWithBody(sampler.getMethod())) {
-          Fields fields = new Fields();
-          for (JMeterProperty p : sampler.getArguments()) {
-            HTTPArgument arg = (HTTPArgument) p.getObjectValue();
-            String parameterName = arg.getName();
-            if (!arg.isSkippable(parameterName)) {
-              String parameterValue = arg.getValue();
-              if (!arg.isAlwaysEncoded()) {
-                // The FormRequestContent always urlencodes both name and value, in this case the
-                // value is already encoded by the user so is needed to decode the value now, so
-                // that when the httpclient encodes it, we end up with the same value as the user
-                // had entered.
-                parameterName = URLDecoder.decode(parameterName, contentCharset.name());
-                parameterValue = URLDecoder.decode(parameterValue, contentCharset.name());
-              }
-              fields.add(parameterName, parameterValue);
+        } else {
+          if (!hasContentTypeHeader && ADD_CONTENT_TYPE_TO_POST_IF_MISSING
+              && isMethodWithBody(sampler.getMethod())) {
+            HttpFields headers = request.getHeaders();
+            if (headers instanceof HttpFields.Mutable) {
+              ((HttpFields.Mutable) headers).put(HTTPConstants.HEADER_CONTENT_TYPE,
+                  HTTPConstants.APPLICATION_X_WWW_FORM_URLENCODED);
             }
           }
-          postBody.append(FormRequestContent.convert(fields));
-          request.body(new FormRequestContent(fields, contentCharset));
+          if (isMethodWithBody(sampler.getMethod())) {
+            Fields fields = new Fields();
+            for (JMeterProperty p : sampler.getArguments()) {
+              HTTPArgument arg = (HTTPArgument) p.getObjectValue();
+              String parameterName = arg.getName();
+              if (!arg.isSkippable(parameterName)) {
+                String parameterValue = arg.getValue();
+                if (!arg.isAlwaysEncoded()) {
+                  // The FormRequestContent always urlencodes both name and value, in this case
+                  // the value is already encoded by the user so is needed to decode the value
+                  // now, so that when the httpclient encodes it, we end up with the same value
+                  // as the user had entered.
+                  parameterName = URLDecoder.decode(parameterName, contentCharset.name());
+                  parameterValue = URLDecoder.decode(parameterValue, contentCharset.name());
+                }
+                fields.add(parameterName, parameterValue);
+              }
+            }
+            postBody.append(FormRequestContent.convert(fields));
+            request.body(new FormRequestContent(fields, contentCharset));
+          }
         }
       }
     }
@@ -3436,7 +3814,8 @@ public class HTTP2JettyClient {
     if (!refresh && cached instanceof String) {
       return (String) cached;
     }
-    String serialized = buildHeadersString(request.getHeaders());
+    String serialized = buildHeadersString(
+        JmeterRequestHeadersSupport.headersForSampleResult(request));
     request.attribute(ATTR_REQUEST_HEADERS_SERIALIZED, serialized);
     return serialized;
   }
@@ -3451,6 +3830,11 @@ public class HTTP2JettyClient {
     return !contentEncoding.isEmpty() ? Charset.forName(contentEncoding) : defaultCharset;
   }
 
+  /** HttpClient4 writes raw argument values in multipart parts (not URL-encoded). */
+  private static String multipartArgumentValue(HTTPArgument arg) {
+    return arg.getValue();
+  }
+
   private String buildArgumentPartRequestBody(HTTPArgument arg, Charset contentCharset,
                                               String contentEncoding, String boundary)
       throws UnsupportedEncodingException {
@@ -3458,18 +3842,27 @@ public class HTTP2JettyClient {
     String contentType = arg.getContentType() + "; charset=" + contentCharset.name();
     String encoding = StringUtils.isNotBlank(contentEncoding) ? contentEncoding : "8bit";
     return buildPartBody(boundary, disposition, contentType, encoding,
-        arg.getEncodedValue(contentCharset.name()));
+        multipartArgumentValue(arg));
   }
 
   private String buildPartBody(String boundary, String disposition, String contentType,
                                String encoding, String value) {
-    return MULTI_PART_SEPARATOR + boundary + LINE_SEPARATOR +
-        HttpFields.build()
-            .add("Content-Disposition", "form-data; " + disposition)
-            .add(HttpHeader.CONTENT_TYPE.toString(), contentType)
-            .add("Content-Transfer-Encoding", encoding)
-            .toString()
+    return MULTI_PART_SEPARATOR + boundary + LINE_SEPARATOR
+        + formatMultipartPartHeaders("form-data; " + disposition, contentType, encoding)
         + value + LINE_SEPARATOR;
+  }
+
+  /** HC4 canonical header casing; Jetty {@link HttpFields#toString()} lowercases names. */
+  private String formatMultipartPartHeaders(String disposition, String contentType,
+                                            String transferEncoding) {
+    StringBuilder headers = new StringBuilder();
+    headers.append("Content-Disposition: ").append(disposition).append(LINE_SEPARATOR);
+    headers.append("Content-Type: ").append(contentType).append(LINE_SEPARATOR);
+    if (transferEncoding != null && !transferEncoding.isEmpty()) {
+      headers.append("Content-Transfer-Encoding: ").append(transferEncoding)
+          .append(LINE_SEPARATOR);
+    }
+    return headers.toString();
   }
 
   private String buildFilePartRequestBody(HTTPFileArg file, String fileName, String boundary) {
@@ -3488,6 +3881,26 @@ public class HTTP2JettyClient {
       }
     }
     return ret == null ? DEFAULT_FILE_MIME_TYPE : ret;
+  }
+
+  /**
+   * Resolves a sampler file path the same way HttpClient4 does: relative to the running test
+   * plan's directory via {@link FileServer}, falling back to JMeter's {@code bin} directory for
+   * files bundled alongside JMeter itself.
+   */
+  private File resolveHttpFile(String path) throws IOException {
+    if (StringUtils.isBlank(path)) {
+      throw new IOException("Empty HTTP file path");
+    }
+    File resolved = FileServer.getFileServer().getResolvedFile(path);
+    if (resolved.isFile()) {
+      return resolved;
+    }
+    Path inBin = Paths.get(JMeterUtils.getJMeterBinDir(), path);
+    if (Files.isRegularFile(inBin)) {
+      return inBin.toFile();
+    }
+    throw new IOException("HTTP file not found: " + path);
   }
 
   /**
@@ -3520,14 +3933,12 @@ public class HTTP2JettyClient {
         argContentType = argContentType + "; charset="
             + contentCharset.name().toLowerCase(Locale.ROOT);
 
-        Mutable partHeaders = HttpFields.build()
-            .add("Content-Disposition", "form-data; name=\"" + arg.getEncodedName() + "\"")
-            .add(HttpHeader.CONTENT_TYPE, argContentType);
+        String partHeaders = formatMultipartPartHeaders(
+            "form-data; name=\"" + arg.getEncodedName() + "\"", argContentType, "8bit");
 
         output.write(boundaryLine.getBytes(StandardCharsets.US_ASCII));
-        output.write(partHeaders.toString().getBytes(StandardCharsets.US_ASCII));
-        output.write(newLine.getBytes(StandardCharsets.US_ASCII));
-        String argValue = arg.getEncodedValue(contentCharset.name());
+        output.write(partHeaders.getBytes(StandardCharsets.US_ASCII));
+        String argValue = multipartArgumentValue(arg);
         output.write(argValue.getBytes(contentCharset));
         output.write(newLine.getBytes(StandardCharsets.US_ASCII));
       }
@@ -3538,22 +3949,19 @@ public class HTTP2JettyClient {
       if (StringUtils.isBlank(file.getParamName())) {
         throw new IllegalStateException("Param name is blank");
       }
-      String fileName = Paths.get(file.getPath()).getFileName().toString();
+      File resolvedFile = resolveHttpFile(file.getPath());
+      String fileName = resolvedFile.getName();
       String mimeTypeFile = extractFileMimeType(hasContentTypeHeader, file);
 
-      // Build headers using HttpFields to match the format expected by tests
-      // The test uses HttpFields.build().toString() which has a specific format
-      Mutable partHeaders = HttpFields.build()
-          .add("Content-Disposition",
-              "form-data; name=\"" + file.getParamName() + "\"; filename=\"" + fileName + "\"")
-          .add(HttpHeader.CONTENT_TYPE, mimeTypeFile);
+      String partHeaders = formatMultipartPartHeaders(
+          "form-data; name=\"" + file.getParamName() + "\"; filename=\"" + fileName + "\"",
+          mimeTypeFile, "binary");
 
       output.write(boundaryLine.getBytes(StandardCharsets.US_ASCII));
-      output.write(partHeaders.toString().getBytes(StandardCharsets.US_ASCII));
-      output.write(newLine.getBytes(StandardCharsets.US_ASCII));
+      output.write(partHeaders.getBytes(StandardCharsets.US_ASCII));
 
       // Read and write file content
-      try (InputStream fileStream = Files.newInputStream(Paths.get(file.getPath()))) {
+      try (InputStream fileStream = Files.newInputStream(resolvedFile.toPath())) {
         byte[] buffer = new byte[8192];
         int bytesRead;
         while ((bytesRead = fileStream.read(buffer)) != -1) {
@@ -3574,6 +3982,29 @@ public class HTTP2JettyClient {
     return METHODS_WITH_BODY.contains(method);
   }
 
+  /**
+   * Matches HttpClient4: entities are only attached for POST/PUT/PATCH, or GET/DELETE when
+   * {@code postBodyRaw} is enabled ({@code HttpGetWithEntity}).
+   */
+  private boolean shouldAttachRequestBody(HTTP2Sampler sampler, HTTPSampleResult result,
+                                          boolean areFollowingRedirect) {
+    String method = resolveRequestMethod(sampler, result);
+    if (areFollowingRedirect && !isMethodWithBody(method)) {
+      return false;
+    }
+    if (isMethodWithBody(method)) {
+      return true;
+    }
+    return sampler.getSendParameterValuesAsPostBody();
+  }
+
+  private String resolveRequestMethod(HTTP2Sampler sampler, HTTPSampleResult result) {
+    if (result != null && StringUtils.isNotBlank(result.getHTTPMethod())) {
+      return result.getHTTPMethod();
+    }
+    return sampler.getMethod();
+  }
+
   private boolean isSupportedMethod(String method) {
     return SUPPORTED_METHODS.contains(method);
   }
@@ -3584,6 +4015,11 @@ public class HTTP2JettyClient {
     } else {
       String ret = HttpFields.build(headers).remove(HTTPConstants.HEADER_COOKIE).toString()
           .replace("\r\n", "\n");
+      // When Cookie was the only header, removing it leaves an empty string; ret.length() - 1
+      // would then be -1, which substring() rejects.
+      if (ret.isEmpty()) {
+        return "";
+      }
       return ret.substring(0,
           ret.length() - 1); // removing final separator not included in jmeter headers
     }
@@ -3613,7 +4049,8 @@ public class HTTP2JettyClient {
     // Decode compressed payloads when possible even if the request did not advertise
     // Accept-Encoding (some servers still compress, and JMeter should show decoded body).
     byte[] responseContent = maybeDecodeCompressedContent(contentResponse);
-    // Avoid an extra stream->byte[] copy; content is already fully buffered.
+    // JMeter parity: optionally truncate stored response data while keeping full bodySize.
+    responseContent = maybeTruncateStoredResponseData(result, responseContent);
     result.setResponseData(responseContent);
 
     if (result.getEndTime() == 0) {
@@ -3629,7 +4066,12 @@ public class HTTP2JettyClient {
     result.setSuccessful(
         contentResponse.getStatus() >= 200 && contentResponse.getStatus() <= 399);
     result.setResponseHeaders(extractResponseHeaders(contentResponse, responseMessage));
-    if (result.isRedirect()) {
+    // Use the RFC 9110-correct redirect check (see Rfc9110Redirects), not result.isRedirect():
+    // JMeter 5.6.3's version misses 307 for non-GET/HEAD methods, which would otherwise leave
+    // redirectLocation unset and break HTTP2Sampler.followRedirects()/resultProcessing() for
+    // that case.
+    if (Rfc9110Redirects.useLegacyMethodHandling() ? result.isRedirect()
+        : Rfc9110Redirects.isRedirect(result.getResponseCode())) {
       result.setRedirectLocation(extractRedirectLocation(contentResponse));
     }
 
@@ -3637,9 +4079,11 @@ public class HTTP2JettyClient {
       result.setURL(contentResponse.getRequest().getURI().toURL());
     }
 
+    HttpFields sampleResultHeaders =
+        JmeterCompressionHeadersSupport.headersForSampleResult(contentResponse);
     long headerBytes =
         (long) result.getResponseHeaders().length()   // condensed length (without \r)
-            + (long) contentResponse.getHeaders().asString().length() // Add \r for each header
+            + (long) sampleResultHeaders.asString().length() // Add \r for each header
             + 1L // Add \r for initial header
             + 2L; // final \r\n before data
     result.setHeadersSize((int) headerBytes);
@@ -3647,8 +4091,9 @@ public class HTTP2JettyClient {
 
   private String extractResponseHeaders(ContentResponse contentResponse,
                                         String message) {
+    HttpFields headers = JmeterCompressionHeadersSupport.headersForSampleResult(contentResponse);
     return contentResponse.getVersion() + " " + contentResponse.getStatus() + " " + message + "\n"
-        + buildHeadersString(contentResponse.getHeaders());
+        + buildHeadersString(headers);
   }
 
   private String extractRedirectLocation(ContentResponse contentResponse) {
@@ -3720,6 +4165,33 @@ public class HTTP2JettyClient {
     }
   }
 
+  /**
+   * Matches {@code HTTPSamplerBase#readResponse}: keep at most {@link #maxBufferSize} bytes in the
+   * sample store, log the same debug line JMeter uses, set {@code bodySize} to the full decoded
+   * length, and leave the sample successful. Skipped while recording.
+   */
+  private byte[] maybeTruncateStoredResponseData(HTTPSampleResult result, byte[] content) {
+    if (content == null) {
+      return new byte[0];
+    }
+    int fullLength = content.length;
+    if (maxBufferSize <= 0 || fullLength <= maxBufferSize || isJMeterRecording()) {
+      return content;
+    }
+    // Same message as Apache JMeter HTTPSamplerBase.readResponse (debug level).
+    LOG.debug("Big response, truncating it to {} bytes", maxBufferSize);
+    result.setBodySize(fullLength);
+    return Arrays.copyOf(content, maxBufferSize);
+  }
+
+  private static boolean isJMeterRecording() {
+    try {
+      return JMeterContextService.getContext().isRecording();
+    } catch (RuntimeException e) {
+      return false;
+    }
+  }
+
   private void resetSamplerDataBeforeResultProcessing(HTTPSampleResult result) {
     if (result == null) {
       return;
@@ -3738,6 +4210,8 @@ public class HTTP2JettyClient {
     if (contentEncoding == null || contentEncoding.trim().isEmpty()) {
       return content;
     }
+    JmeterCompressionHeadersSupport.captureIfCompressed(
+        contentResponse.getRequest(), contentResponse.getHeaders());
     String encodingToken = normalizeEncodingToken(contentEncoding);
     if (encodingToken.isEmpty()) {
       return content;
@@ -3747,7 +4221,11 @@ public class HTTP2JettyClient {
     // should have handled it and re-decoding only adds CPU/alloc pressure.
     boolean skipRedundantManualDecode = Boolean.parseBoolean(
         System.getProperty(PROP_SKIP_REDUNDANT_MANUAL_DECODE, "true"));
+    // deflate is excluded from this fast path: it is never registered as a per-request Jetty
+    // decoder (see configureContentDecoders() above), so it must always go through decodeDeflate()
+    // below, which is the only place that tries both deflate variants.
     if (skipRedundantManualDecode
+        && !"deflate".equals(encodingToken)
         && requestAdvertisedEncoding(contentResponse.getRequest(), encodingToken)) {
       return content;
     }
@@ -3819,15 +4297,33 @@ public class HTTP2JettyClient {
     }
   }
 
+  /**
+   * "Content-Encoding: deflate" is ambiguous in practice: the RFC implies zlib-wrapped deflate
+   * (RFC 1950), but plenty of real servers send raw/headerless deflate (RFC 1951) under the same
+   * header. Try zlib first, then raw, before giving up - matching HttpClient4's behavior.
+   */
   private byte[] decodeDeflate(byte[] content, String contentEncoding) {
-    try (InputStream input = new InflaterInputStream(new ByteArrayInputStream(content));
+    byte[] zlibDecoded = tryInflateDeflate(content, false);
+    if (zlibDecoded != null) {
+      return zlibDecoded;
+    }
+    byte[] rawDecoded = tryInflateDeflate(content, true);
+    if (rawDecoded != null) {
+      return rawDecoded;
+    }
+    lowLevelDebug("Failed to decode deflate content ({}), keeping original bytes",
+        contentEncoding);
+    return content;
+  }
+
+  private byte[] tryInflateDeflate(byte[] content, boolean nowrap) {
+    try (InflaterInputStream input = new InflaterInputStream(
+        new ByteArrayInputStream(content), new Inflater(nowrap));
          ByteArrayOutputStream output = new ByteArrayOutputStream(content.length)) {
       copy(input, output);
       return output.toByteArray();
     } catch (IOException e) {
-      lowLevelDebug("Failed to decode deflate content ({}), keeping original bytes",
-          contentEncoding, e);
-      return content;
+      return null;
     }
   }
 

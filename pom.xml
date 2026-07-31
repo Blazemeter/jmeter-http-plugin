@@ -30,10 +30,10 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-    <jmeter.version>5.4.1</jmeter.version>
-    <jetty.version>12.1.6</jetty.version>
-    <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.6 -->
-    <brotli4j.version>1.20.0</brotli4j.version>
+    <jmeter.version>5.5</jmeter.version>
+    <jetty.version>12.1.11</jetty.version>
+    <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.11 -->
+    <brotli4j.version>1.23.0</brotli4j.version>
     <checkstyle.skip>false</checkstyle.skip>
   </properties>
   <dependencies>
@@ -50,11 +50,11 @@
       <scope>provided</scope>
     </dependency>
     <!-- Apache HttpClient for compilation (classes used in JettyCacheManager) -->
-    <!-- Using same version as JMeter 5.4.1 -->
+    <!-- Using same version as JMeter 5.5 (our minimum supported version) -->
     <dependency>
       <groupId>org.apache.httpcomponents</groupId>
       <artifactId>httpcore</artifactId>
-      <version>4.4.14</version>
+      <version>4.4.15</version>
       <scope>compile</scope>
     </dependency>
     <dependency>
@@ -66,7 +66,7 @@
     <dependency>
       <groupId>org.apache.commons</groupId>
       <artifactId>commons-lang3</artifactId>
-      <version>3.12.0</version>
+      <version>3.18.0</version>
       <scope>compile</scope>
     </dependency>
     <dependency>
@@ -189,10 +189,27 @@
       <version>2.28.2</version>
       <scope>test</scope>
     </dependency>
+    <!-- Pin byte-buddy to 1.14.18 to resolve classpath conflict:
+         mockito-core 2.28.2 pulls byte-buddy ~1.9.x which lacks ElementMatchers.namedOneOf(),
+         a method required by assertj-core 3.27.7's SoftProxies initialisation.
+         1.14.x is the last series compatible with the Mockito 2.x instrumentation API
+         while also satisfying assertj-core 3.27.x. Remove these pins when mockito is upgraded. -->
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy</artifactId>
+      <version>1.14.18</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy-agent</artifactId>
+      <version>1.14.18</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.assertj</groupId>
       <artifactId>assertj-core</artifactId>
-      <version>3.12.2</version>
+      <version>3.27.7</version>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -275,7 +292,7 @@
     <dependency>
       <groupId>com.google.guava</groupId>
       <artifactId>guava</artifactId>
-      <version>29.0-jre</version>
+      <version>32.0.0-jre</version>
       <scope>test</scope>
     </dependency>
   </dependencies>

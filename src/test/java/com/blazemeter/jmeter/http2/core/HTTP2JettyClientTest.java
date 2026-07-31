@@ -19,7 +19,11 @@ import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_BRO
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_ZSTD;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_WITH_BODY;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_302;
+import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_302_TO_ECHO;
+import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_307_TO_ECHO;
+import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_308_TO_ECHO;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_400;
+import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_401_NO_WWW_AUTHENTICATE;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_BIG_RESPONSE;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_200_DEFLATE;
 import static com.blazemeter.jmeter.http2.core.ServerBuilder.SERVER_PATH_JSON_ONLY;
@@ -34,6 +38,7 @@ import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.core.ServerBuilder.TeardownableServer;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import com.blazemeter.jmeter.http2.sampler.JMeterTestUtils;
+import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import com.google.common.io.Resources;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -73,6 +78,7 @@ import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
 import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.util.JMeterUtils;
+import org.apache.jmeter.util.SSLManager;
 import org.assertj.core.api.JUnitSoftAssertions;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.client.ContentResponse;
@@ -183,6 +189,175 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     assertThat(result.getResponseDataAsString()).isEqualTo(SERVER_RESPONSE);
   }
 
+  @Test
+  public void shouldSucceedWhenHeadMethodIsSent() throws Exception {
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.HEAD);
+    HTTPSampleResult result = sample(SERVER_PATH_200, HTTPConstants.HEAD);
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    softly.assertThat(result.getHTTPMethod()).isEqualTo(HTTPConstants.HEAD);
+    // HEAD responses must not carry a body.
+    softly.assertThat(result.getResponseDataAsString()).isEmpty();
+  }
+
+  @Test
+  public void shouldNotSendBodyWhenHeadMethodWithArguments() throws Exception {
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.HEAD);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+    HTTPSampleResult result = sample(SERVER_PATH_200, HTTPConstants.HEAD);
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    softly.assertThat(result.getResponseDataAsString()).isEmpty();
+    // HEAD is not a body method; arguments must not become a request entity.
+    softly.assertThat(result.getQueryString()).isNullOrEmpty();
+    softly.assertThat(result.getRequestHeaders()).doesNotContain("Content-Length");
+  }
+
+  @Test
+  public void shouldFollowRedirectWhenHeadMethodAndFollowRedirectEnabled() throws Exception {
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.HEAD);
+    sampler.setFollowRedirects(true);
+    HTTPSampleResult result = sample(SERVER_PATH_302, HTTPConstants.HEAD);
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    softly.assertThat(result.getSubResults().length).isGreaterThan(0);
+    softly.assertThat(result.getRedirectLocation())
+        .isEqualTo("https://localhost:" + getActivePort() + SERVER_PATH_200);
+    softly.assertThat(result.getResponseDataAsString()).isEmpty();
+  }
+
+  @Test
+  public void shouldNotResendRequestBodyWhenPostRedirectIsFollowedAsGet() throws Exception {
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.POST);
+    sampler.setFollowRedirects(true);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+    HTTPSampleResult result = sample(SERVER_PATH_302_TO_ECHO, HTTPConstants.POST);
+
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    SampleResult[] subResults = result.getSubResults();
+    softly.assertThat(subResults.length).isGreaterThan(0);
+    HTTPSampleResult followUp = (HTTPSampleResult) subResults[subResults.length - 1];
+    softly.assertThat(followUp.getHTTPMethod()).isEqualTo(HTTPConstants.GET);
+    // SERVER_PATH_302_TO_ECHO redirects to SERVER_PATH_200_WITH_BODY, which echoes back
+    // any request body it receives. JMeter core rewrites POST to GET when following a
+    // 302, so the follow-up request must not carry the original POST entity (RFC 9110
+    // section 15.4.3; matches HTTPSamplerProxy/HttpClient4 behavior).
+    softly.assertThat(followUp.getResponseDataAsString()).isEmpty();
+  }
+
+  @Test
+  public void shouldPreserveRequestBodyWhenPostRedirectIsFollowedAs307ViaAutoRedirects()
+      throws Exception {
+    // Unlike 301/302/303, RFC 9110 section 15.4.8 requires a 307 redirect to preserve the
+    // original method and body. With autoRedirects enabled, Jetty's own redirect support
+    // handles the follow-up (not JMeter's manual loop, see the *ViaFollowRedirectsOnly test
+    // below), and already implements this correctly - this test locks that in.
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.POST);
+    sampler.setFollowRedirects(true);
+    sampler.setAutoRedirects(true);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+    HTTPSampleResult result = sample(SERVER_PATH_307_TO_ECHO, HTTPConstants.POST);
+
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    softly.assertThat(result.getResponseDataAsString())
+        .isEqualTo("test1=" + TEST_ARGUMENT_1 + "&test2=" + TEST_ARGUMENT_2);
+  }
+
+  @Test
+  public void shouldPreserveRequestBodyWhenPostRedirectIsFollowedAs307ViaFollowRedirectsOnly()
+      throws Exception {
+    // With autoRedirects OFF, JMeter's own manual follow-redirects loop drives this instead of
+    // Jetty. Apache JMeter got this wrong until apache/jmeter PR #6658 (merged 2026-03-19, not
+    // yet in the 5.6.3 release this project targets): HTTPSampleResult.isRedirect() only
+    // recognized 307 as a redirect for GET/HEAD (a POST+307 was returned as-is, never followed),
+    // and HTTPSamplerBase.computeMethodForRedirect() rewrote every redirected method to GET
+    // regardless of status code, dropping the body. HTTP2Sampler.resultProcessing() and
+    // .followRedirects() port JMeter's own logic with that upstream fix applied, so this path
+    // is correct even against JMeter 5.6.3's own (buggy) inherited implementation.
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.POST);
+    sampler.setFollowRedirects(true);
+    sampler.setAutoRedirects(false);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+    HTTPSampleResult result = sample(SERVER_PATH_307_TO_ECHO, HTTPConstants.POST);
+
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    HTTPSampleResult followUp =
+        (HTTPSampleResult) result.getSubResults()[result.getSubResults().length - 1];
+    softly.assertThat(followUp.getHTTPMethod()).isEqualTo(HTTPConstants.POST);
+    softly.assertThat(followUp.getResponseDataAsString())
+        .isEqualTo("test1=" + TEST_ARGUMENT_1 + "&test2=" + TEST_ARGUMENT_2);
+  }
+
+  @Test
+  public void shouldPreserveRequestBodyWhenPostRedirectIsFollowedAs308ViaFollowRedirectsOnly()
+      throws Exception {
+    // Same fix as the 307 case above (RFC 9110 section 15.4.9): unlike 307, JMeter 5.6.3's
+    // isRedirect() already recognized 308 for any method, but computeMethodForRedirect() still
+    // rewrote it to GET, dropping the body.
+    buildStartedServer();
+    sampler.setMethod(HTTPConstants.POST);
+    sampler.setFollowRedirects(true);
+    sampler.setAutoRedirects(false);
+    sampler.addArgument("test1", TEST_ARGUMENT_1);
+    sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+    HTTPSampleResult result = sample(SERVER_PATH_308_TO_ECHO, HTTPConstants.POST);
+
+    softly.assertThat(result.isSuccessful()).isTrue();
+    softly.assertThat(result.getResponseCode()).isEqualTo("200");
+    HTTPSampleResult followUp =
+        (HTTPSampleResult) result.getSubResults()[result.getSubResults().length - 1];
+    softly.assertThat(followUp.getHTTPMethod()).isEqualTo(HTTPConstants.POST);
+    softly.assertThat(followUp.getResponseDataAsString())
+        .isEqualTo("test1=" + TEST_ARGUMENT_1 + "&test2=" + TEST_ARGUMENT_2);
+  }
+
+  @Test
+  public void shouldMatchJMeter563OriginalBehaviorWhenLegacyRedirectMethodHandlingEnabled()
+      throws Exception {
+    // Opt-out flag for users who need byte-for-byte parity with stock JMeter 5.6.3, bug
+    // included: a POST+307 is returned as-is (never followed), matching HTTPSampleResult
+    // .isRedirect()'s unfixed behavior for that status code.
+    String property = "blazemeter.http.legacyRedirectMethodHandling";
+    String previous = JMeterUtils.getProperty(property);
+    JMeterUtils.setProperty(property, "true");
+    try {
+      buildStartedServer();
+      sampler.setMethod(HTTPConstants.POST);
+      sampler.setFollowRedirects(true);
+      sampler.setAutoRedirects(false);
+      sampler.addArgument("test1", TEST_ARGUMENT_1);
+      sampler.addArgument("test2", TEST_ARGUMENT_2);
+
+      HTTPSampleResult result = sample(SERVER_PATH_307_TO_ECHO, HTTPConstants.POST);
+
+      softly.assertThat(result.getResponseCode()).isEqualTo("307");
+      softly.assertThat(result.getSubResults().length).isEqualTo(0);
+    } finally {
+      if (previous == null) {
+        JMeterUtils.getJMeterProperties().remove(property);
+      } else {
+        JMeterUtils.setProperty(property, previous);
+      }
+    }
+  }
+
   private void buildStartedServer() throws Exception {
     server = new ServerBuilder()
         .withHTTP2()
@@ -280,9 +455,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     sampler.setHeaderManager(hm);
     try {
       HTTPSampleResult result = sampleWithGet(SERVER_PATH_200_GZIP);
-      boolean hasGzipHeader = result.getResponseHeaders().contains("Content-Encoding: gzip");
-      boolean hasBody = result.getResponseData() != null && result.getResponseData().length > 0;
-      assertThat(hasGzipHeader || hasBody).isTrue();
+      assertThat(result.getResponseHeaders()).containsIgnoringCase("content-encoding: gzip");
+      assertThat(result.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
     } finally {
       if (originalEnableHttp1 == null) {
         JMeterUtils.getJMeterProperties().remove("httpJettyClient.enableHttp1");
@@ -300,8 +474,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     hm.add(new Header(HttpHeader.ACCEPT_ENCODING.asString(), "br"));
     sampler.setHeaderManager(hm);
     HTTPSampleResult result = sampleWithGet(SERVER_PATH_200_BROTLI);
-    // Verify that the request was successful and content was decompressed
     assertThat(result.isSuccessful()).isTrue();
+    assertThat(result.getResponseHeaders()).containsIgnoringCase("content-encoding: br");
     assertThat(result.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
   }
 
@@ -313,8 +487,8 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     hm.add(new Header(HttpHeader.ACCEPT_ENCODING.asString(), "zstd"));
     sampler.setHeaderManager(hm);
     HTTPSampleResult result = sampleWithGet(SERVER_PATH_200_ZSTD);
-    // Verify that the request was successful and content was decompressed
     assertThat(result.isSuccessful()).isTrue();
+    assertThat(result.getResponseHeaders()).containsIgnoringCase("content-encoding: zstd");
     assertThat(result.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
   }
 
@@ -411,7 +585,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String requestBody = TEST_ARGUMENT_1 + TEST_ARGUMENT_2;
     HTTPSampleResult httpSampleResult = buildResult(true, Code.OK,
         hostHeader(),
-        requestBody.getBytes(StandardCharsets.UTF_8), "application/octet-stream",
+        requestBody.getBytes(StandardCharsets.UTF_8), "text/plain; charset=UTF-8",
         createURL(SERVER_PATH_200_WITH_BODY), HTTPConstants.POST);
 
     validateResponse(sample(SERVER_PATH_200_WITH_BODY, HTTPConstants.POST), httpSampleResult);
@@ -586,7 +760,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
         buildResult(true, HttpStatus.Code.OK, HttpFields.build().add(HttpHeader.HOST,
                 hostHeaderValue()),
             requestBody.getBytes(StandardCharsets.UTF_8),
-        "application/octet-stream", createURL(SERVER_PATH_200_WITH_BODY),
+        "text/plain; charset=UTF-8", createURL(SERVER_PATH_200_WITH_BODY),
         HTTPConstants.DELETE);
 
     validateResponse(sample(SERVER_PATH_200_WITH_BODY, HTTPConstants.DELETE), expected);
@@ -600,6 +774,33 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
         null,
       null, createURL(SERVER_PATH_400), HTTPConstants.GET);
     validateResponse(sampleWithGet(SERVER_PATH_400), expected);
+  }
+
+  /**
+   * 401 without {@code WWW-Authenticate} is valid when the server uses a non-HTTP-Auth mechanism
+   * (token, API key, etc.). Jetty's default would throw; {@code CustomWwwAuthenticationProtocolHandler}
+   * returns the 401 like JMeter HttpClient4.
+   */
+  @Test
+  public void shouldReturn401WhenServerOmitsWwwAuthenticateHeader() throws Exception {
+    buildStartedServer();
+    HTTPSampleResult result = sampleWithGet(SERVER_PATH_401_NO_WWW_AUTHENTICATE);
+    softly.assertThat(result.getResponseCode()).isEqualTo("401");
+    softly.assertThat(result.isSuccessful()).isFalse();
+    softly.assertThat(result.getResponseDataAsString()).contains("Unauthorized");
+  }
+
+  /**
+   * Same as {@link #shouldReturn401WhenServerOmitsWwwAuthenticateHeader()} with Auth Manager
+   * configured: without a challenge header there is nothing to match, so the 401 is returned.
+   */
+  @Test
+  public void shouldReturn401WithoutWwwAuthenticateEvenWhenAuthManagerConfigured() throws Exception {
+    buildStartedServer();
+    configureAuthManager(Mechanism.BASIC);
+    HTTPSampleResult result = sampleWithGet(SERVER_PATH_401_NO_WWW_AUTHENTICATE);
+    softly.assertThat(result.getResponseCode()).isEqualTo("401");
+    softly.assertThat(result.isSuccessful()).isFalse();
   }
 
   @Test(expected = UnsupportedOperationException.class)
@@ -934,10 +1135,13 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     sampler.setImageParser(true);
     String message = "message";
     String responseCode = "300";
+    String previousCacheMode = JMeterUtils.getProperty("cache_manager.cached_resource_mode");
     JMeterUtils.setProperty("cache_manager.cached_resource_mode", "RETURN_CUSTOM_STATUS");
     JMeterUtils.setProperty("RETURN_CUSTOM_STATUS.message", message);
     JMeterUtils.setProperty("RETURN_CUSTOM_STATUS.code", responseCode);
+    JmeterCachedResourceModeSupport.refreshSnapshotFromProperties();
     configureCacheManagerToSampler(true, false);
+    try {
     HTTPSampleResult firstRequestExpected = buildResult(true, Code.OK,
       hostHeader(), null, null, createURL(SERVER_PATH_200_EMBEDDED), HTTPConstants.GET);
     firstRequestExpected.setResponseData(BASIC_HTML_TEMPLATE, StandardCharsets.UTF_8.name());
@@ -950,6 +1154,9 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     firstRequestExpected.setSentBytes(0);
     firstRequestExpected.setResponseData("", StandardCharsets.UTF_8.name());
     validateEmbeddedResultCached(sampleWithGet(SERVER_PATH_200_EMBEDDED), firstRequestExpected);
+    } finally {
+      restoreCacheResourceMode(previousCacheMode);
+    }
   }
 
   /**
@@ -965,9 +1172,12 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     buildStartedServer();
     sampler.setImageParser(true);
     String message = "message";
+    String previousCacheMode = JMeterUtils.getProperty("cache_manager.cached_resource_mode");
     JMeterUtils.setProperty("cache_manager.cached_resource_mode", "RETURN_200_CACHE");
     JMeterUtils.setProperty("RETURN_200_CACHE.message", message);
+    JmeterCachedResourceModeSupport.refreshSnapshotFromProperties();
     configureCacheManagerToSampler(true, false);
+    try {
     // First request must connect to the server
     HTTPSampleResult expected = buildResult(true, Code.OK,
       hostHeader(), null, null, createURL(SERVER_PATH_200_EMBEDDED), HTTPConstants.GET);
@@ -979,6 +1189,17 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     expected.setResponseData("", StandardCharsets.UTF_8.name());
     expected.setResponseMessage(message);
     validateEmbeddedResultCached(sampleWithGet(SERVER_PATH_200_EMBEDDED), expected);
+    } finally {
+      restoreCacheResourceMode(previousCacheMode);
+    }
+  }
+
+  private void restoreCacheResourceMode(String previousCacheMode) {
+    if (previousCacheMode == null) {
+      JMeterUtils.getJMeterProperties().remove("cache_manager.cached_resource_mode");
+    } else {
+      JMeterUtils.setProperty("cache_manager.cached_resource_mode", previousCacheMode);
+    }
   }
 
   @Test
@@ -1069,14 +1290,16 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String dashDash = "--";
     // Set body response for Arguments
     args.forEach(httpArgument -> {
-      Mutable headerParam = HttpFields.build()
-          .add("Content-Disposition", "form-data; name=\"" + httpArgument.getEncodedName() + "\"")
-          .add(HttpHeader.CONTENT_TYPE, "text/plain; charset=utf-8");
+      // Canonical HC4 header casing (not Jetty's HttpFields, which lowercases names) and an
+      // explicit Content-Transfer-Encoding, matching HTTP2JettyClient#formatMultipartPartHeaders.
+      String headerParam = "Content-Disposition: form-data; name=\""
+          + httpArgument.getEncodedName() + "\"" + newLine
+          + "Content-Type: text/plain; charset=utf-8" + newLine
+          + "Content-Transfer-Encoding: 8bit" + newLine;
       try {
-        String headerParamWithBoundary = boundary + newLine + headerParam.toString();
+        String headerParamWithBoundary = boundary + newLine + headerParam;
         output.write(headerParamWithBoundary.getBytes(StandardCharsets.US_ASCII));
-        output.write(newLine.getBytes(StandardCharsets.US_ASCII));
-        output.write(httpArgument.getEncodedValue().getBytes(StandardCharsets.UTF_8));
+        output.write(httpArgument.getValue().getBytes(StandardCharsets.UTF_8));
         output.write(newLine.getBytes(StandardCharsets.US_ASCII));
       } catch (IOException e) {
         e.printStackTrace();
@@ -1086,17 +1309,16 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     // Set body response for Files
     files.forEach(file -> {
       String fileName = Paths.get((file.getPath())).getFileName().toString();
-      Mutable headerFile = HttpFields.build()
-          .add("Content-Disposition", "form-data; name=\"" + file.getParamName()
-              + "\"; " + "filename=\"" + fileName + "\"")
-          .add(HttpHeader.CONTENT_TYPE, file.getMimeType());
+      String headerFile = "Content-Disposition: form-data; name=\"" + file.getParamName()
+          + "\"; filename=\"" + fileName + "\"" + newLine
+          + "Content-Type: " + file.getMimeType() + newLine
+          + "Content-Transfer-Encoding: binary" + newLine;
       try {
         String filePath = file.getPath();
         InputStream inputStream = Files.newInputStream(Paths.get(filePath));
         byte[] data = sampler.readResponse(expected, inputStream, 0);
-        String headerFileWithBoundary = boundary + newLine + headerFile.toString();
+        String headerFileWithBoundary = boundary + newLine + headerFile;
         output.write(headerFileWithBoundary.getBytes(StandardCharsets.US_ASCII));
-        output.write(newLine.getBytes(StandardCharsets.US_ASCII));
         output.write(data);
         output.write(newLine.getBytes(StandardCharsets.US_ASCII));
       } catch (IOException e) {
@@ -1382,40 +1604,139 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     String keyStorePasswordPropertyName = "javax.net.ssl.keyStorePassword";
     System.setProperty(keyStorePropertyName, getKeyStorePathAsUriPathWithNetSslKeyStoreFormat());
     System.setProperty(keyStorePasswordPropertyName, KEYSTORE_PASSWORD);
+    System.setProperty("javax.net.ssl.keyStoreType", "PKCS12");
+    SSLManager.reset();
     client.stop();
-    client = new HTTP2JettyClient();
+    client = new HTTP2JettyClient(false, "client-cert-test",
+        HTTP2ClientProfileConfig.builder()
+            .enableHttp1(true)
+            .enableHttp2(false)
+            .enableHttp3(false)
+            .alpnEnabled(false)
+            .build());
     client.start();
     try {
       HTTPSampleResult result = sampleWithGet();
       assertThat(result.getResponseDataAsString()).isEqualTo(SERVER_RESPONSE);
     } finally {
-      System.setProperty(keyStorePropertyName, "");
-      System.setProperty(keyStorePasswordPropertyName, "");
+      System.clearProperty(keyStorePropertyName);
+      System.clearProperty(keyStorePasswordPropertyName);
+      System.clearProperty("javax.net.ssl.keyStoreType");
+      SSLManager.reset();
     }
   }
 
   @Test
-  public void shouldGetResponseWhenBufferSizeIsSmallerOrTheSameAsMaxBufferSize() throws Exception {
+  public void shouldStoreFullBodyWhenWithinMaxBytesToStore() throws Exception {
     buildStartedServer();
-    JMeterUtils.setProperty("httpJettyClient.maxBufferSize", String.valueOf(BIG_BUFFER_SIZE));
+    JMeterUtils.setProperty(BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP,
+        String.valueOf(BIG_BUFFER_SIZE));
+    try {
+      HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+      assertThat(result.isSuccessful()).isTrue();
+      assertThat(result.getResponseData().length).isEqualTo(BIG_BUFFER_SIZE);
+      assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+    } finally {
+      clearMaxBytesToStoreProperties();
+    }
+  }
+
+  @Test
+  public void shouldTruncateStoredResponseLikeJMeterWhenPluginMaxBufferSizeExceeded()
+      throws Exception {
+    buildStartedServer();
+    int storeLimit = BIG_BUFFER_SIZE - 1;
+    JMeterUtils.setProperty(BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP,
+        String.valueOf(storeLimit));
+    try {
+      HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+      assertThat(result.isSuccessful()).isTrue();
+      assertThat(result.getResponseCode()).isEqualTo("200");
+      assertThat(result.getResponseData().length).isEqualTo(storeLimit);
+      // Full decoded length retained for throughput/size (JMeter file:// / store semantics).
+      assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+      assertThat(result.getResponseMessage()).doesNotContain("Buffering capacity");
+      // ServerBuilder marks the big body as image/jpg → binary data type like stock JMeter.
+      assertThat(result.getDataType()).isEqualTo(SampleResult.BINARY);
+      assertThat(result.getContentType()).startsWith("image/jpg");
+    } finally {
+      clearMaxBytesToStoreProperties();
+    }
+  }
+
+  @Test
+  public void shouldUseJMeterMaxBytesToStoreWhenPluginMaxBufferSizeUnset() throws Exception {
+    clearMaxBytesToStoreProperties();
+    buildStartedServer();
+    int storeLimit = BIG_BUFFER_SIZE - 1;
+    JMeterUtils.setProperty(BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST,
+        String.valueOf(storeLimit));
+    try {
+      client.loadProperties();
+      assertThat(client.getMaxBufferSize()).isEqualTo(storeLimit);
+
+      HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+      assertThat(result.isSuccessful()).isTrue();
+      assertThat(result.getResponseData().length).isEqualTo(storeLimit);
+      assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+    } finally {
+      clearMaxBytesToStoreProperties();
+    }
+  }
+
+  @Test
+  public void shouldPreferPluginMaxBufferSizeOverJMeterMaxBytesToStore() throws Exception {
+    clearMaxBytesToStoreProperties();
+    buildStartedServer();
+    int jmeterLimit = 1024;
+    int pluginLimit = BIG_BUFFER_SIZE - 1;
+    JMeterUtils.setProperty(BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST,
+        String.valueOf(jmeterLimit));
+    JMeterUtils.setProperty(BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP,
+        String.valueOf(pluginLimit));
+    try {
+      client.loadProperties();
+      assertThat(client.getMaxBufferSize()).isEqualTo(pluginLimit);
+
+      HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+      assertThat(result.isSuccessful()).isTrue();
+      assertThat(result.getResponseData().length).isEqualTo(pluginLimit);
+      assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
+    } finally {
+      clearMaxBytesToStoreProperties();
+    }
+  }
+
+  /**
+   * Regression guard: plugin default store limit {@code -1} must accept bodies larger than
+   * Jetty {@link org.eclipse.jetty.client.BufferingResponseListener}'s built-in 2 MiB default.
+   * {@link ServerBuilder#BIG_BUFFER_SIZE} is 4 MiB; if Jetty buffering were left at 2 MiB, the
+   * sample would fail with {@code Buffering capacity 2097152 exceeded}.
+   */
+  @Test
+  public void shouldGetBigResponseWhenMaxBufferSizeUsesUnlimitedPluginDefault() throws Exception {
+    clearMaxBytesToStoreProperties();
+    buildStartedServer();
+    client.loadProperties();
+    assertThat(client.getMaxBufferSize())
+        .as("plugin default must stay unlimited (-1), not Jetty's 2 MiB BufferingResponseListener "
+            + "default")
+        .isEqualTo(-1);
+
     HTTPSampleResult result = sampleWithGet(SERVER_PATH_BIG_RESPONSE);
-    //Since no text response was set, we validate the size of the response body instead.
+
+    assertThat(result.isSuccessful()).isTrue();
+    assertThat(result.getResponseData().length).isEqualTo(BIG_BUFFER_SIZE);
     assertThat(result.getBodySizeAsLong()).isEqualTo(BIG_BUFFER_SIZE);
   }
 
-  @Test(expected = IllegalArgumentException.class)
-  public void shouldThrowAnExceptionWhenBufferSizeIsBiggerThanMaxBufferSize() throws Throwable {
-    buildStartedServer();
-    JMeterUtils.setProperty("httpJettyClient.maxBufferSize", String.valueOf(BIG_BUFFER_SIZE - 1));
-    sampleWithGet(SERVER_PATH_BIG_RESPONSE);
-  }
-
-  @Test(expected = IllegalArgumentException.class)
-  public void shouldNotGetAResponseWhenBufferSizeIsBiggerThanMaxBufferSize() throws Exception {
-    buildStartedServer();
-    JMeterUtils.setProperty("httpJettyClient.maxBufferSize", String.valueOf(BIG_BUFFER_SIZE - 1));
-    //There is no response, since an exception is thrown in this case
-    sampleWithGet(SERVER_PATH_BIG_RESPONSE);
+  private static void clearMaxBytesToStoreProperties() {
+    java.util.Properties props = JMeterUtils.getJMeterProperties();
+    for (String key : BzmHttpPluginProperties.keysInResolveOrder(
+        BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP)) {
+      props.remove(key);
+    }
+    props.remove(BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST);
   }
 
   @Test
@@ -1428,13 +1749,13 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
 
     client = new HTTP2JettyClient(true, "Test");
     client.start();
-    Request httpRequest = client.sampleAsync(
-        sampler,
-        buildBaseResult(createURL(SERVER_PATH_200), HTTPConstants.GET),
-        sampler.getFutureResponseListener());
+    HTTPSampleResult result = buildBaseResult(createURL(SERVER_PATH_200), HTTPConstants.GET);
+    Request httpRequest = client.sampleAsync(sampler, result, sampler.getFutureResponseListener());
     httpRequest.send(listener);
-    ContentResponse contentResponse = listener.get();
-    assertThat(contentResponse.getContent()).isNotEmpty();
+    // Goes through sampleFromListener() -> getContent(), the single place that owns the
+    // HTTP/1.1 fallback decision (the listener no longer resolves protocol_error on its own).
+    HTTPSampleResult sampleResult = client.sampleFromListener(sampler, result, false, 0, listener);
+    assertThat(sampleResult.getResponseData()).isNotEmpty();
   }
 
   @Test

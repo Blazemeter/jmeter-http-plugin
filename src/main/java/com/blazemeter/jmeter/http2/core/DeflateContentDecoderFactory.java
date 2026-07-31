@@ -12,6 +12,14 @@ import org.eclipse.jetty.io.content.ContentSourceTransformer;
 import org.eclipse.jetty.util.BufferUtil;
 import org.eclipse.jetty.util.IO;
 
+/**
+ * Jetty's compression module ({@code org.eclipse.jetty.compression.*}) ships gzip, brotli, and
+ * zstd decoders but no deflate one, so this streams deflate content through {@link Inflater}
+ * directly. Note this only handles zlib-wrapped deflate (RFC 1950); it is not registered as a
+ * per-request decoder in {@link HTTP2JettyClient} because retrying as raw/headerless deflate
+ * (RFC 1951) requires the fully buffered response body - see
+ * {@link HTTP2JettyClient#decodeDeflate}.
+ */
 public class DeflateContentDecoderFactory extends ContentDecoder.Factory {
 
   private final ByteBufferPool bufferPool;

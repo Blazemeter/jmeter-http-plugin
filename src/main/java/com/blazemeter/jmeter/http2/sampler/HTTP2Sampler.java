@@ -6,11 +6,15 @@ import com.blazemeter.jmeter.http2.control.HTTP2Controller;
 import com.blazemeter.jmeter.http2.core.HTTP2ClientProfileConfig;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
+import com.blazemeter.jmeter.http2.core.HpackFailureDetector;
+import com.blazemeter.jmeter.http2.core.JmeterHttpClientExceptionMapper;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
+import com.blazemeter.jmeter.http2.util.Rfc9110Redirects;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.helger.commons.annotation.VisibleForTesting;
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.MalformedURLException;
 import java.net.URISyntaxException;
@@ -116,33 +120,6 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   private static final String USER_AGENT = "User-Agent"; // $NON-NLS-1$
   private static final boolean USE_JAVA_REGEX = !getPropDefault(
       "jmeter.regex.engine", "oro").equalsIgnoreCase("oro");
-  private static final String RESPONSE_PARSERS = // list of parsers
-      JMeterUtils.getProperty("HTTPResponse.parsers"); //$NON-NLS-1$
-
-  static {
-    String[] parsers =
-        JOrphanUtils.split(RESPONSE_PARSERS, " ", true); // returns empty array for null
-    for (final String parser : parsers) {
-      String classname = JMeterUtils.getProperty(parser + ".className"); //$NON-NLS-1$
-      if (classname == null) {
-        LOG.error("Cannot find .className property for {}, ensure you set property: '{}.className'",
-            parser, parser);
-        continue;
-      }
-      String typeList = JMeterUtils.getProperty(parser + ".types"); //$NON-NLS-1$
-      if (typeList != null) {
-        String[] types = JOrphanUtils.split(typeList, " ", true);
-        for (final String type : types) {
-          registerParser(type, classname);
-        }
-      } else {
-        LOG.warn(
-            "Cannot find .types property for {}, as a consequence parser " +
-                "will not be used, to make it usable, define property:'{}.types'",
-            parser, parser);
-      }
-    }
-  }
 
   private final transient Callable<HTTP2JettyClient> clientFactory;
   private final boolean dumpAtThreadEnd =
@@ -427,7 +404,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
             this.result.setIgnore();
           }
           HTTP2FutureResponseListener listener =
-              new HTTP2FutureResponseListener(client.getMaxBufferSize());
+              new HTTP2FutureResponseListener(HTTP2JettyClient.getJettyBufferingMaxLength());
           this.asyncListener = listener;
           Request req = client.sampleAsync(this, this.result, listener);
           req.send(listener); // Fire the Async
@@ -480,7 +457,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       LOG.debug("isProtocolError(cause): {}", isProtocolErrorCause);
       LOG.debug("isProtocolError(exception): {}", isProtocolErrorException);
 
-      if (isProtocolErrorCause || isProtocolErrorException) {
+      if ((isProtocolErrorCause || isProtocolErrorException)
+          && !HpackFailureDetector.indicatesHpackFailure(e)
+          && !HpackFailureDetector.indicatesHpackFailure(cause)) {
         boolean fallbackEnabled = isProtocolErrorFallbackEnabled();
         if (!fallbackEnabled) {
           LOG.warn("HTTP/2 protocol_error detected and fallback is DISABLED. "
@@ -628,7 +607,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         result.sampleEnd();
       }
     }
-    return errorResult(e, result);
+    return errorResult(
+        JmeterHttpClientExceptionMapper.forSampleResult(e, getAutoRedirects(), result.getURL()),
+        result);
   }
 
   /**
@@ -655,6 +636,58 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     embedded.setHttp1OnlyCooldownMs(getHttp1OnlyCooldownMs());
     embedded.setH2cCacheTtlMs(getH2cCacheTtlMs());
     embedded.setHttp1UpgradeEnabled(isHttp1UpgradeEnabled());
+  }
+
+  /**
+   * Builds an embedded-resource child sampler for a {@code file://} URL discovered by the HTML
+   * parser (e.g. a relative {@code href}/{@code src} resolved against a {@code file://} parent).
+   * {@code setImageParser} is enabled for {@code .html}/{@code .htm} targets so nested embedded
+   * resources (e.g. an iframe pointing at another local HTML file) are themselves parsed and
+   * downloaded, matching how a real HTTP-embedded HTML resource would recurse.
+   */
+  private HTTP2Sampler newFileEmbeddedSampler(URL url) {
+    HTTP2Sampler fileSampler = new HTTP2Sampler();
+    copyJettyProtocolSettingsToEmbeddedSampler(fileSampler);
+    String path = url.getPath();
+    boolean htmlResource = path != null
+        && (path.endsWith(".html") || path.endsWith(".htm"));
+    fileSampler.setImageParser(htmlResource);
+    fileSampler.setMethod(HTTPConstants.GET);
+    fileSampler.setProtocol(url.getProtocol());
+    fileSampler.setDomain(url.getHost());
+    fileSampler.setPort(url.getPort());
+    if (url.getQuery() == null) {
+      fileSampler.setPath(url.getPath());
+    } else {
+      fileSampler.setPath(url.getPath() + url.getQuery());
+    }
+    fileSampler.setHeaderManager(getHeaderManager());
+    fileSampler.setCookieManager(getCookieManager());
+    return fileSampler;
+  }
+
+  /** {@code file://} URLs have no HTTP-style path to label sub-results with; build one instead. */
+  private static String formatFileEmbeddedLabel(URL url, int index) {
+    String path = url.getPath();
+    if (path != null && path.startsWith("/")) {
+      path = path.substring(1);
+    }
+    return url.getProtocol() + ":" + path + "-" + index;
+  }
+
+  private static void relabelFileEmbeddedChildren(HTTPSampleResult parent) {
+    int childIndex = 0;
+    for (SampleResult child : parent.getSubResults()) {
+      if (child instanceof HTTPSampleResult) {
+        HTTPSampleResult httpChild = (HTTPSampleResult) child;
+        if (httpChild.getURL() != null
+            && "file".equalsIgnoreCase(httpChild.getURL().getProtocol())) {
+          httpChild.setSampleLabel(
+              formatFileEmbeddedLabel(httpChild.getURL(), childIndex++));
+          relabelFileEmbeddedChildren(httpChild);
+        }
+      }
+    }
   }
 
   private HTTP2JettyClient buildClient() throws Exception {
@@ -728,9 +761,118 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         : buildClient();
   }
 
+  /**
+   * JMeter 5.6.3's {@code HTTPSampleResult.isRedirect()} only recognizes a {@code 307} as a
+   * redirect for GET/HEAD, so a POST/PUT/PATCH/DELETE + 307 is returned as-is by the inherited
+   * {@code resultProcessing()} - {@link #followRedirects} below is never even reached. See
+   * {@link Rfc9110Redirects} for the fix this ports (apache/jmeter PR #6658) and why it's applied
+   * this way instead of overriding {@code HTTPSampleResult.isRedirect()} directly. This drives
+   * the follow-up itself only for that one gap, then hands off to the inherited
+   * {@code resultProcessing()} (marking {@code areFollowingRedirect=true}) for everything else
+   * (embedded resources, etc.) exactly as it would normally run. Falls back to the unfixed
+   * inherited behavior when {@link Rfc9110Redirects#useLegacyMethodHandling()}.
+   */
+  @Override
   public HTTPSampleResult resultProcessing(final boolean pAreFollowingRedirect,
                                            final int frameDepth, final HTTPSampleResult pRes) {
+    if (!Rfc9110Redirects.useLegacyMethodHandling()
+        && !pAreFollowingRedirect
+        && !pRes.isRedirect()
+        && Rfc9110Redirects.isRedirect(pRes.getResponseCode())
+        && getFollowRedirects()) {
+      HTTPSampleResult followed = followRedirects(pRes, frameDepth);
+      return super.resultProcessing(true, frameDepth, followed);
+    }
     return super.resultProcessing(pAreFollowingRedirect, frameDepth, pRes);
+  }
+
+  /**
+   * Ported from {@code HTTPSamplerBase.followRedirects} (JMeter 5.6.3) with the fix from
+   * apache/jmeter PR #6658 (see {@link Rfc9110Redirects} and {@link #resultProcessing}):
+   * {@code computeMethodForRedirect} now takes the response code into account so 307/308
+   * preserve the original method (RFC 9110 sections 15.4.8/15.4.9), instead of always rewriting
+   * to GET like 301/302/303 do. Uses {@link Rfc9110Redirects#isRedirect} instead of
+   * {@code HTTPSampleResult.isRedirect()} to decide whether to keep following a redirect chain,
+   * for the same reason {@link #resultProcessing} avoids relying on that method for 307. Falls
+   * back to the inherited, unfixed JMeter behavior when
+   * {@link Rfc9110Redirects#useLegacyMethodHandling()}.
+   */
+  @Override
+  protected HTTPSampleResult followRedirects(HTTPSampleResult res, int frameDepth) {
+    if (Rfc9110Redirects.useLegacyMethodHandling()) {
+      return super.followRedirects(res, frameDepth);
+    }
+    HTTPSampleResult totalRes = new HTTPSampleResult(res);
+    totalRes.addRawSubResult(res);
+    HTTPSampleResult lastRes = res;
+
+    int redirect;
+    for (redirect = 0; redirect < MAX_REDIRECTS; redirect++) {
+      boolean invalidRedirectUrl = false;
+      String location = lastRes.getRedirectLocation();
+      if (JMeterUtils.getPropDefault("httpsampler.redirect.removeslashdotdot", true)) {
+        location = ConversionUtils.removeSlashDotDot(location);
+      }
+      location = encodeSpaces(location);
+      String method = computeMethodForRedirect(lastRes.getHTTPMethod(), lastRes.getResponseCode());
+
+      try {
+        URL url = ConversionUtils.makeRelativeURL(lastRes.getURL(), location);
+        url = ConversionUtils.sanitizeUrl(url).toURL();
+        HTTPSampleResult tempRes = sample(url, method, true, frameDepth);
+        if (tempRes != null) {
+          lastRes = tempRes;
+        } else {
+          break;
+        }
+      } catch (MalformedURLException | URISyntaxException e) {
+        errorResult(e, lastRes);
+        invalidRedirectUrl = true;
+      }
+      if (lastRes.getSubResults() != null && lastRes.getSubResults().length > 0) {
+        for (SampleResult sub : lastRes.getSubResults()) {
+          totalRes.addSubResult(sub);
+        }
+      } else if (!invalidRedirectUrl) {
+        totalRes.addSubResult(lastRes);
+      }
+
+      if (!Rfc9110Redirects.isRedirect(lastRes.getResponseCode())) {
+        break;
+      }
+    }
+    if (redirect >= MAX_REDIRECTS) {
+      lastRes = errorResult(
+          new IOException("Exceeded maximum number of redirects: " + MAX_REDIRECTS),
+          new HTTPSampleResult(lastRes));
+      totalRes.addSubResult(lastRes);
+    }
+
+    totalRes.setSampleLabel(totalRes.getSampleLabel() + "->" + lastRes.getSampleLabel());
+    totalRes.setURL(lastRes.getURL());
+    totalRes.setHTTPMethod(lastRes.getHTTPMethod());
+    totalRes.setQueryString(lastRes.getQueryString());
+    totalRes.setRequestHeaders(lastRes.getRequestHeaders());
+    totalRes.setResponseData(lastRes.getResponseData());
+    totalRes.setResponseCode(lastRes.getResponseCode());
+    totalRes.setSuccessful(lastRes.isSuccessful());
+    totalRes.setResponseMessage(lastRes.getResponseMessage());
+    totalRes.setDataType(lastRes.getDataType());
+    totalRes.setResponseHeaders(lastRes.getResponseHeaders());
+    totalRes.setContentType(lastRes.getContentType());
+    totalRes.setDataEncoding(lastRes.getDataEncodingNoDefault());
+    return totalRes;
+  }
+
+  private String computeMethodForRedirect(String initialMethod, String responseCode) {
+    if (HTTPConstants.SC_TEMPORARY_REDIRECT.equals(responseCode)
+        || HTTPConstants.SC_PERMANENT_REDIRECT.equals(responseCode)) {
+      return initialMethod;
+    }
+    if (!HTTPConstants.HEAD.equalsIgnoreCase(initialMethod)) {
+      return HTTPConstants.GET;
+    }
+    return initialMethod;
   }
 
   static void registerParser(String contentType, String className) {
@@ -738,8 +880,50 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     PARSERS_FOR_CONTENT_TYPE.put(contentType, className);
   }
 
+  /**
+   * JMeter batch runs configure HTML parsers via {@code -q jmeter-batch.properties}, loaded after
+   * this class may already have been initialized - so register parsers lazily on first use
+   * instead of in a static block, to read whatever properties are actually in effect by then.
+   */
+  private static void ensureResponseParsersLoaded() {
+    if (!PARSERS_FOR_CONTENT_TYPE.isEmpty()) {
+      return;
+    }
+    synchronized (PARSERS_FOR_CONTENT_TYPE) {
+      if (PARSERS_FOR_CONTENT_TYPE.isEmpty()) {
+        loadResponseParsersFromProperties();
+      }
+    }
+  }
+
+  private static void loadResponseParsersFromProperties() {
+    String responseParsers = JMeterUtils.getProperty("HTTPResponse.parsers"); //$NON-NLS-1$
+    String[] parsers = JOrphanUtils.split(responseParsers, " ", true); // empty array for null
+    for (final String parser : parsers) {
+      String classname = JMeterUtils.getProperty(parser + ".className"); //$NON-NLS-1$
+      if (classname == null) {
+        LOG.error("Cannot find .className property for {}, ensure you set property: '{}.className'",
+            parser, parser);
+        continue;
+      }
+      String typeList = JMeterUtils.getProperty(parser + ".types"); //$NON-NLS-1$
+      if (typeList != null) {
+        String[] types = JOrphanUtils.split(typeList, " ", true);
+        for (final String type : types) {
+          registerParser(type, classname);
+        }
+      } else {
+        LOG.warn(
+            "Cannot find .types property for {}, as a consequence parser "
+                + "will not be used, to make it usable, define property:'{}.types'",
+            parser, parser);
+      }
+    }
+  }
+
   private LinkExtractorParser getParser(HTTPSampleResult res)
       throws LinkExtractorParseException {
+    ensureResponseParsersLoaded();
     String parserClassName =
         PARSERS_FOR_CONTENT_TYPE.get(res.getMediaType());
     if (!StringUtils.isEmpty(parserClassName)) {
@@ -757,13 +941,15 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       // see HTTPJavaImpl#getConnectionHeaders
       //': ' is used by JMeter to fill-in requestHeaders, see getConnectionHeaders
       final String userAgentPrefix = USER_AGENT + ": ";
-      String userAgentHdr = res.substring(
-          index + userAgentPrefix.length(),
-          res.indexOf(
-              '\n',
-              // '\n' is used by JMeter to fill-in requestHeaders, see getConnectionHeaders
-              index + userAgentPrefix.length() + 1));
-      return userAgentHdr.trim();
+      int valueStart = index + userAgentPrefix.length();
+      // '\n' is used by JMeter to fill-in requestHeaders, see getConnectionHeaders. When
+      // User-Agent is the last header, there's no trailing '\n' and indexOf returns -1; fall
+      // back to the end of the string instead of feeding -1 into substring().
+      int lineEnd = res.indexOf('\n', valueStart);
+      if (lineEnd < 0) {
+        lineEnd = res.length();
+      }
+      return res.substring(valueStart, lineEnd).trim();
     } else {
       if (LOG.isDebugEnabled()) {
         LOG.debug("No user agent extracted from requestHeaders:{}", res);
@@ -930,6 +1116,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
       setSyncRequest(!isConcurrentDwn); // Change default from main request based on sub request
 
+      int fileEmbeddedIndex = 0;
       while (urls.hasNext()) {
         Object binURL = urls.next(); // See catch clause below
         try {
@@ -959,6 +1146,20 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
                   errorResult(new Exception(url.toString() + " URI can not be normalized", e),
                       new HTTPSampleResult(subres)));
               setParentSampleSuccess(subres, false);
+              continue;
+            }
+
+            if ("file".equalsIgnoreCase(url.getProtocol())) {
+              HTTP2Sampler fileSampler = newFileEmbeddedSampler(url);
+              HTTPSampleResult binRes =
+                  fileSampler.sample(url, HTTPConstants.GET, false, frameDepth + 1);
+              if (binRes != null) {
+                binRes.setSampleLabel(formatFileEmbeddedLabel(url, fileEmbeddedIndex++));
+                relabelFileEmbeddedChildren(binRes);
+              }
+              subres.addSubResult(binRes);
+              setParentSampleSuccess(subres,
+                  subres.isSuccessful() && (binRes == null || binRes.isSuccessful()));
               continue;
             }
 
