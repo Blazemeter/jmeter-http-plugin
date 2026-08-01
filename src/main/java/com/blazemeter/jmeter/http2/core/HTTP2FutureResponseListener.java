@@ -33,6 +33,17 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
   private ContentResponse response;
   private Throwable failure;
   private volatile boolean cancelled;
+  /**
+   * Set once a result has been handed to this listener from the outside via
+   * {@link #completeWith}, after which callbacks from its own request are ignored. See that method.
+   */
+  private volatile boolean sealed;
+  /**
+   * Protocol label when this listener belongs to one side of a protocol race ("HTTP/3", "HTTP/2").
+   * A failure on a raced attempt is not an error: it means that protocol was not negotiated for the
+   * origin, while the competing attempt still serves the request. See {@link #onComplete}.
+   */
+  private volatile String raceProtocol;
   private long responseStart;
   private long responseEnd;
 
@@ -59,6 +70,15 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     return request;
   }
 
+  /** Marks this listener as one side of a protocol race. See {@link #raceProtocol}. */
+  public void setRaceProtocol(String raceProtocol) {
+    this.raceProtocol = raceProtocol;
+  }
+
+  public String getRaceProtocol() {
+    return raceProtocol;
+  }
+
   protected void setStart() {
     if (this.responseStart == 0) {
       this.responseStart = System.currentTimeMillis();
@@ -77,6 +97,18 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     return this.responseEnd;
   }
 
+  /**
+   * Adopts a result produced by a different request, used when a protocol race resolves in favour
+   * of a competing attempt and the winner's response is reported through this listener.
+   *
+   * <p>Seals the listener: whoever calls this then aborts the losing request, and that abort makes
+   * Jetty invoke {@link #onComplete}/{@link #onFailure} here with a CancellationException. Letting
+   * those through would overwrite {@link #failure} after the winning response was already stored,
+   * and {@link #getResult()} reports "failed after response received" whenever a failure is present
+   * - so a won race would surface as an error to anyone reading this listener afterwards. The
+   * synchronous caller never noticed because it returns the winner directly instead of reading back
+   * from here; a consumer that polls {@link #isDone()} and then calls {@link #get()} does.
+   */
   public void completeWith(ContentResponse response, long responseStart, long responseEnd) {
     this.response = response;
     this.failure = null;
@@ -85,6 +117,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     }
     this.responseEnd = responseEnd > 0 ? responseEnd : System.currentTimeMillis();
     this.onCompleteCalled = true;
+    this.sealed = true;
     this.latch.countDown();
   }
 
@@ -95,6 +128,11 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
    */
   @Override
   public void onFailure(Response response, Throwable failure) {
+    if (sealed) {
+      // Losing side of a resolved race being aborted; see completeWith.
+      lowLevelDebug("onFailure() ignored, listener already completed by a competing attempt");
+      return;
+    }
     lowLevelDebug("=== onFailure() CALLED ===");
     lowLevelDebug("Thread: {}", Thread.currentThread().getName());
     lowLevelDebug("Response: {}", response != null ? "present" : "null");
@@ -141,6 +179,11 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
 
   @Override
   public void onComplete(Result result) {
+    if (sealed) {
+      // Losing side of a resolved race being aborted; see completeWith.
+      lowLevelDebug("onComplete() ignored, listener already completed by a competing attempt");
+      return;
+    }
     // CRITICAL: Mark that onComplete was called
     onCompleteCalled = true;
     
@@ -207,17 +250,32 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     }
     
     if (failure != null) {
-      LOG.error("Request failed with exception: type={}, message={}", 
-          failure.getClass().getName(), failure.getMessage());
-      if (failure instanceof IOException) {
-        IOException ioException = (IOException) failure;
-        String message = ioException.getMessage();
-        LOG.error("IOException message: {}", message);
-        if (message != null && message.contains("protocol_error")) {
-          LOG.error("HTTP/2 protocol_error in onComplete() - ALPN negotiation likely failed");
+      if (failure instanceof CancellationException) {
+        // The losing side of a resolved protocol race, or an explicit cancel(): expected, and the
+        // winner's response is reported elsewhere. Logging it as an error filled the log with
+        // failures that are not failures, one per raced request.
+        LOG.debug("{} attempt cancelled: {}",
+            raceProtocol != null ? raceProtocol : "Request", failure.getMessage());
+      } else if (raceProtocol != null) {
+        // One side of a race failing on its own is the expected outcome when the origin does not
+        // support that protocol: the other attempt serves the request, and the race only gives up
+        // once both sides fail - at which point the caller reports the real failure. Saying "not
+        // negotiated" rather than "failed" keeps this from reading as a broken request.
+        LOG.debug("{} not negotiated for {}: {}", raceProtocol,
+            request != null ? request.getURI() : "unknown", failure.getMessage());
+      } else {
+        LOG.error("Request failed with exception: type={}, message={}",
+            failure.getClass().getName(), failure.getMessage());
+        if (failure instanceof IOException) {
+          IOException ioException = (IOException) failure;
+          String message = ioException.getMessage();
+          LOG.error("IOException message: {}", message);
+          if (message != null && message.contains("protocol_error")) {
+            LOG.error("HTTP/2 protocol_error in onComplete() - ALPN negotiation likely failed");
+          }
         }
+        lowLevelDebug("Full failure stack trace:", failure);
       }
-      lowLevelDebug("Full failure stack trace:", failure);
     }
     
     latch.countDown();
@@ -431,8 +489,21 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
       } else {
         // It is a failure caused after obtaining the response,
         // analyzing what type of failure it is, and incorporating mechanisms to manage it.
-        LOG.warn("Request failed after response received: status={}, version={}, exception={}",
-            response.getStatus(), response.getVersion(), failure.getClass().getName());
+        if (failure instanceof CancellationException) {
+          // The losing side of a protocol race ends cancelled once the winner has answered. That is
+          // the algorithm working, not a failure, and warning about it made a healthy run look
+          // broken once per raced request.
+          lowLevelDebug("{} attempt cancelled after response: status={}, version={}",
+              raceProtocol != null ? raceProtocol : "Request", response.getStatus(),
+              response.getVersion());
+        } else if (raceProtocol != null) {
+          LOG.debug("{} not negotiated after response: status={}, version={}, exception={}",
+              raceProtocol, response.getStatus(), response.getVersion(),
+              failure.getClass().getName());
+        } else {
+          LOG.warn("Request failed after response received: status={}, version={}, exception={}",
+              response.getStatus(), response.getVersion(), failure.getClass().getName());
+        }
         
         // Check if this is a protocol_error even though we have a response
         if (ProtocolErrorException.isProtocolError(failure)
