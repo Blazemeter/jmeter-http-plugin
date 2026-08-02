@@ -83,13 +83,24 @@ public class HTTP3HappyEyeballsIntegrationTest extends HTTP2TestBase {
       HTTP2JettyClient client = new HTTP2JettyClient(false, "IT-HTTP3-HE-NoRecent");
       try {
         client.start();
+        // Setup: HTTP/2 has to answer this first sample, so its Alt-Svc is cached and no HTTP/3
+        // success is recorded - both are preconditions for the halved stagger asserted below.
+        // HTTP/3 is slowed right down for it because first contact now explores HTTP/3 with the
+        // full stagger: at its normal 150ms it would answer before HTTP/2 is due to start at 200ms
+        // and win, leaving nothing cached and the delay at its base value.
+        h3DelayMs.set(1000L);
         HTTPSampleResult first = sample(client, sampler, url);
         assertThat(first.isSuccessful()).isTrue();
         assertThat(first.getResponseHeaders()).startsWith("HTTP/2");
+        h3DelayMs.set(150L);
 
         long effectiveDelay = computeHappyEyeballsDelay(client, url.toURI());
-        assertThat(effectiveDelay).isEqualTo(100L);
+        assertThat(effectiveDelay)
+            .as("with no recent HTTP/3 success the stagger is halved, so HTTP/2 starts sooner")
+            .isEqualTo(100L);
 
+        // This one is the point: with the stagger halved to 100ms, HTTP/2 starts before HTTP/3's
+        // 150ms response is due and takes the race.
         HTTPSampleResult second = sample(client, sampler, url);
         assertThat(second.isSuccessful()).isTrue();
         assertThat(second.getResponseHeaders()).startsWith("HTTP/2");
