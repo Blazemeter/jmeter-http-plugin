@@ -37,7 +37,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
   private long responseEnd;
 
   public HTTP2FutureResponseListener() {
-    this(2 * 1024 * 1024);
+    this(-1);
   }
 
   public HTTP2FutureResponseListener(int maxLength) {

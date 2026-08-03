@@ -31,6 +31,13 @@ public class HTTP2FutureResponseListenerTest extends HTTP2TestBase {
     }
 
     @Test
+    public void defaultConstructorUsesUnlimitedBufferingCapacity() {
+        // Jetty BufferingResponseListener's no-arg default is 2 MiB; plugin default must stay -1
+        // (DynamicCapacity maps that to Long.MAX_VALUE) so large responses are not rejected.
+        assertEquals(Long.MAX_VALUE, listener.getMaxLength());
+    }
+
+    @Test
     public void getRequestReturnsSetRequest() {
         assertEquals(mockRequest, listener.getRequest());
     }

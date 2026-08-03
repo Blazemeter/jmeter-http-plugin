@@ -38,6 +38,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -67,6 +68,7 @@ import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
 import org.apache.jmeter.services.FileServer;
 import org.apache.jmeter.testelement.property.JMeterProperty;
+import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.util.JMeterUtils;
 import org.brotli.dec.BrotliInputStream;
 import org.eclipse.jetty.client.AbstractAuthentication;
@@ -147,10 +149,17 @@ public class HTTP2JettyClient {
   private static final boolean ADD_CONTENT_TYPE_TO_POST_IF_MISSING = JMeterUtils.getPropDefault(
       "http.post_add_content_type_if_missing", false);
   // Matches HTTPFileImpl: caps stored response data for file:// samples, while sampleEnd's
-  // bodySize still reflects the true total bytes read.
+  // bodySize still reflects the true total bytes read. Separate from HTTP store truncation
+  // ({@link #maxBufferSize}): JMeter also keeps HTTPFileImpl's 10 MiB default distinct from
+  // HTTPSamplerBase's default of 0 for the same property name.
   private static final int MAX_FILE_SAMPLE_BYTES_TO_STORE = JMeterUtils.getPropDefault(
-      "httpsampler.max_bytes_to_store_per_request", 10 * 1024 * 1024);
+      BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST, 10 * 1024 * 1024);
   private static final int FILE_SAMPLE_BUFFER_SIZE = 4096;
+  /**
+   * Jetty {@code BufferingResponseListener} hard cap. Always unlimited so large bodies are not
+   * aborted; SampleResult store truncation uses {@link #maxBufferSize} instead (JMeter parity).
+   */
+  private static final int JETTY_BUFFERING_UNLIMITED = -1;
   private static final Pattern PORT_PATTERN = Pattern.compile("\\d+");
   private static final String MULTI_PART_SEPARATOR = "--";
   private static final String LINE_SEPARATOR = "\r\n";
@@ -190,7 +199,12 @@ public class HTTP2JettyClient {
   private static final Map<String, Http1OnlyEntry> HTTP1_ONLY_CACHE = new ConcurrentHashMap<>();
   private static final Map<String, H2cEntry> H2C_CACHE = new ConcurrentHashMap<>();
   private int requestTimeout = 0;
-  private int maxBufferSize = 21 * 1024 * 1024;
+  /**
+   * Max bytes stored in {@link HTTPSampleResult} response data ({@code <= 0} = no truncation).
+   * Resolved from plugin {@code maxBufferSize} if set, else JMeter
+   * {@code httpsampler.max_bytes_to_store_per_request} if set, else {@code -1}.
+   */
+  private int maxBufferSize = -1;
   private int maxThreads = 5;
   private boolean maxThreadsConfigured = false;
   private int minThreads = 1;
@@ -717,8 +731,17 @@ public class HTTP2JettyClient {
     return httpClient;
   }
 
+  /**
+   * Max bytes kept in the sample response data (JMeter-style store truncation). {@code <= 0} means
+   * do not truncate.
+   */
   public int getMaxBufferSize() {
     return maxBufferSize;
+  }
+
+  /** Length passed to Jetty buffering listeners; always unlimited so truncation is store-only. */
+  public static int getJettyBufferingMaxLength() {
+    return JETTY_BUFFERING_UNLIMITED;
   }
 
   public int getRequestTimeout() {
@@ -735,9 +758,7 @@ public class HTTP2JettyClient {
     byteBufferPoolFactor =
         Integer.parseInt(BzmHttpPluginProperties.getPropDefault(
             "httpJettyClient.byteBufferPoolFactor", String.valueOf(byteBufferPoolFactor)));
-    maxBufferSize =
-        Integer.parseInt(BzmHttpPluginProperties.getPropDefault("httpJettyClient.maxBufferSize",
-            String.valueOf(2 * 1024 * 1024)));
+    maxBufferSize = resolveMaxBytesToStorePerRequest();
     minThreads = Integer
         .parseInt(BzmHttpPluginProperties.getPropDefault("httpJettyClient.minThreads",
             String.valueOf(minThreads)));
@@ -867,6 +888,25 @@ public class HTTP2JettyClient {
     if (!enableHttp1) {
       protocolErrorFallbackEnabled = false;
     }
+  }
+
+  /**
+   * Plugin {@code maxBufferSize} wins when set; otherwise JMeter
+   * {@code httpsampler.max_bytes_to_store_per_request} when set; otherwise {@code -1} (no
+   * truncation). {@code <= 0} means do not truncate, matching JMeter's store semantics.
+   */
+  private static int resolveMaxBytesToStorePerRequest() {
+    if (BzmHttpPluginProperties.isDefined(BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP)) {
+      return Integer.parseInt(BzmHttpPluginProperties.getPropDefault(
+          BzmHttpPluginProperties.MAX_BUFFER_SIZE_PROP, "-1").trim());
+    }
+    Properties props = JMeterUtils.getJMeterProperties();
+    if (props != null
+        && props.containsKey(BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST)) {
+      return Integer.parseInt(JMeterUtils.getPropDefault(
+          BzmHttpPluginProperties.JMETER_MAX_BYTES_TO_STORE_PER_REQUEST, "0").trim());
+    }
+    return -1;
   }
 
   private boolean getBooleanProp(String key, Boolean overrideValue, boolean defaultValue) {
@@ -1575,8 +1615,9 @@ public class HTTP2JettyClient {
       return cacheManager.buildCachedSampleResult(result);
     }
     lowLevelDebug("=== Creating HTTP2FutureResponseListener ===");
-    lowLevelDebug("maxBufferSize: {}", maxBufferSize);
-    HTTP2FutureResponseListener listener = new HTTP2FutureResponseListener(maxBufferSize);
+    lowLevelDebug("maxBytesToStorePerRequest: {}", maxBufferSize);
+    HTTP2FutureResponseListener listener =
+        new HTTP2FutureResponseListener(JETTY_BUFFERING_UNLIMITED);
     lowLevelDebug("=== HTTP2FutureResponseListener created successfully ===");
     listener.setRequest(request);
     lowLevelDebug("=== About to call send() ===");
@@ -1881,7 +1922,8 @@ public class HTTP2JettyClient {
     java.util.concurrent.atomic.AtomicBoolean h2Started =
         new java.util.concurrent.atomic.AtomicBoolean(false);
 
-    HTTP2FutureResponseListener h2Listener = new HTTP2FutureResponseListener(maxBufferSize);
+    HTTP2FutureResponseListener h2Listener =
+        new HTTP2FutureResponseListener(JETTY_BUFFERING_UNLIMITED);
     Request h2Request = cloneRequest(h3Request, httpClientNoH3);
     h2Listener.setRequest(h2Request);
 
@@ -4007,7 +4049,8 @@ public class HTTP2JettyClient {
     // Decode compressed payloads when possible even if the request did not advertise
     // Accept-Encoding (some servers still compress, and JMeter should show decoded body).
     byte[] responseContent = maybeDecodeCompressedContent(contentResponse);
-    // Avoid an extra stream->byte[] copy; content is already fully buffered.
+    // JMeter parity: optionally truncate stored response data while keeping full bodySize.
+    responseContent = maybeTruncateStoredResponseData(result, responseContent);
     result.setResponseData(responseContent);
 
     if (result.getEndTime() == 0) {
@@ -4119,6 +4162,33 @@ public class HTTP2JettyClient {
           StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     } catch (IOException ignored) {
       // Intentional: best-effort diagnostic logging.
+    }
+  }
+
+  /**
+   * Matches {@code HTTPSamplerBase#readResponse}: keep at most {@link #maxBufferSize} bytes in the
+   * sample store, log the same debug line JMeter uses, set {@code bodySize} to the full decoded
+   * length, and leave the sample successful. Skipped while recording.
+   */
+  private byte[] maybeTruncateStoredResponseData(HTTPSampleResult result, byte[] content) {
+    if (content == null) {
+      return new byte[0];
+    }
+    int fullLength = content.length;
+    if (maxBufferSize <= 0 || fullLength <= maxBufferSize || isJMeterRecording()) {
+      return content;
+    }
+    // Same message as Apache JMeter HTTPSamplerBase.readResponse (debug level).
+    LOG.debug("Big response, truncating it to {} bytes", maxBufferSize);
+    result.setBodySize(fullLength);
+    return Arrays.copyOf(content, maxBufferSize);
+  }
+
+  private static boolean isJMeterRecording() {
+    try {
+      return JMeterContextService.getContext().isRecording();
+    } catch (RuntimeException e) {
+      return false;
     }
   }
 
