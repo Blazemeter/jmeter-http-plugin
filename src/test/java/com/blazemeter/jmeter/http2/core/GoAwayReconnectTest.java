@@ -14,9 +14,15 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.util.JMeterUtils;
+import org.eclipse.jetty.client.AbstractConnectionPool;
+import org.eclipse.jetty.client.ConnectionPool;
+import org.eclipse.jetty.client.Destination;
+import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.http2.ErrorCode;
 import org.eclipse.jetty.http2.api.Session;
 import org.eclipse.jetty.http2.server.internal.HTTP2ServerConnection;
@@ -40,13 +46,13 @@ import org.junit.Test;
  * deliberate: the server has to keep accepting, because a retry can only succeed on a fresh
  * connection.
  *
- * <p><b>What this does not cover.</b> The GOAWAY here arrives between requests, and that case is
- * absorbed by Jetty's own connection pool - measured, by disabling {@code goawayRetryEnabled} and
- * seeing the sample still succeed (the second test below pins exactly that). So these tests pin the
- * requirement, not the plugin's {@code retryAfterGoAway} path. That path is for a narrower race: a
- * GOAWAY whose {@code lastStreamId} is below a stream the client has already opened, meaning the
- * server never processed it and the request has to be replayed on a new connection. Reproducing that
- * deterministically is still open.
+ * <p><b>Sequencing matters.</b> Jetty has a known race if a new request is dispatched while a
+ * connection is still in the pool as {@code REMOTELY_CLOSED} after GOAWAY
+ * ({@code IllegalStateException: session closed}). These tests model GOAWAY <em>between</em>
+ * requests, so after sending GOAWAY they wait until the client's connection pool has dropped that
+ * connection before the next sample. That is the steady state a browser settles into; racing the
+ * next request against GOAWAY processing is a different scenario (covered by the plugin's
+ * {@code retryAfterGoAway} path, which is not what this class pins).
  */
 public class GoAwayReconnectTest extends HTTP2TestBase {
 
@@ -102,6 +108,7 @@ public class GoAwayReconnectTest extends HTTP2TestBase {
   @After
   public void tearDown() throws Exception {
     JMeterUtils.getJMeterProperties().remove(GOAWAY_RETRY_PROP);
+    System.clearProperty(GOAWAY_RETRY_PROP);
     if (client != null) {
       client.stop();
     }
@@ -118,15 +125,10 @@ public class GoAwayReconnectTest extends HTTP2TestBase {
   }
 
   /**
-   * Same scenario with the plugin's GOAWAY retry turned off, and it still succeeds. That is the
-   * measurement behind the caveat in this class: a GOAWAY between requests is handled by Jetty's
-   * connection pool, so neither test here exercises {@code retryAfterGoAway}.
-   *
-   * <p>That is also why this test is worth keeping rather than deleting the retry it makes look
-   * redundant: Jetty 11 did <em>not</em> absorb this in the pool, so the plugin's retry is what
-   * covered it. Keeping both means a future Jetty that stops absorbing it shows up here as a
-   * failure - the retry path becoming load-bearing again - instead of silently turning into failed
-   * samples in a real test run.
+   * Same scenario with the plugin's GOAWAY retry turned off. After the client has dropped the
+   * GOAWAY'd connection from its pool, Jetty opens a fresh one for the next sample - so this still
+   * succeeds without {@code retryAfterGoAway}. That path remains for the in-flight race this class
+   * deliberately does not reproduce.
    */
   @Test
   public void shouldNotFailSampleWhenServerSendsGoAwayEvenWithPluginRetryDisabled()
@@ -144,8 +146,11 @@ public class GoAwayReconnectTest extends HTTP2TestBase {
         .as("an HTTP/2 session must have been accepted, otherwise no GOAWAY can be emitted; "
             + "connections opened were %s", observedConnections)
         .isNotEmpty();
+    assertThat(clientConnectionCount())
+        .as("the first sample should leave a pooled client connection")
+        .isGreaterThan(0);
 
-    sendGoAway();
+    sendGoAwayAndAwaitClientPoolDrained();
 
     HTTPSampleResult second = sample();
 
@@ -157,11 +162,49 @@ public class GoAwayReconnectTest extends HTTP2TestBase {
         .isEqualTo("200");
   }
 
-  /** Emits GOAWAY(NO_ERROR) on every session accepted so far, as a server shedding load would. */
-  private void sendGoAway() {
+  /**
+   * Emits GOAWAY(NO_ERROR), waits for the server sessions to close, then waits until the client's
+   * pool no longer holds that connection. Only then is the next sample free of the
+   * {@code REMOTELY_CLOSED} dispatch race.
+   */
+  private void sendGoAwayAndAwaitClientPoolDrained() throws InterruptedException {
+    CountDownLatch goAwaySent = new CountDownLatch(serverSessions.size());
     for (Session session : serverSessions) {
-      session.close(ErrorCode.NO_ERROR.code, "test-goaway", Callback.NOOP);
+      session.close(ErrorCode.NO_ERROR.code, "test-goaway",
+          Callback.from(goAwaySent::countDown, failure -> goAwaySent.countDown()));
     }
+    assertThat(goAwaySent.await(5, TimeUnit.SECONDS))
+        .as("server should finish sending GOAWAY")
+        .isTrue();
+
+    long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < deadlineNanos) {
+      if (serverSessions.stream().allMatch(Session::isClosed)
+          && clientConnectionCount() == 0) {
+        return;
+      }
+      Thread.sleep(10L);
+    }
+    assertThat(serverSessions)
+        .as("all GOAWAY'd server sessions should be closed")
+        .allMatch(Session::isClosed);
+    assertThat(clientConnectionCount())
+        .as("client pool should have dropped the GOAWAY'd connection before the next sample")
+        .isZero();
+  }
+
+  private int clientConnectionCount() {
+    HttpClient httpClient = client.getHttpClient();
+    int total = 0;
+    for (Destination destination : httpClient.getDestinations()) {
+      ConnectionPool pool = destination.getConnectionPool();
+      if (pool instanceof AbstractConnectionPool) {
+        total += ((AbstractConnectionPool) pool).getConnectionCount();
+      } else if (pool != null && !pool.isEmpty()) {
+        total += 1;
+      }
+    }
+    return total;
   }
 
   private void startClient() throws Exception {
