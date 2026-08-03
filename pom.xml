@@ -36,6 +36,8 @@
     <jmeter.regression.extended.tests>HTMLParserTestFile_2,TEST_HTTPS,Http4ImplDigestAuth,Http4ImplPreemptiveBasicAuth</jmeter.regression.extended.tests>
     <jmeter.regression.external.tests>TestKeepAlive,TestRedirectionPolicies</jmeter.regression.external.tests>
     <jetty.version>12.1.11</jetty.version>
+    <!-- Matches the log4j that JMeter 5.6.x ships in lib/, which provides the API at runtime. -->
+    <log4j.version>2.22.1</log4j.version>
     <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.11 -->
     <brotli4j.version>1.23.0</brotli4j.version>
     <checkstyle.skip>false</checkstyle.skip>
@@ -198,6 +200,33 @@
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
       <version>2.0.9</version>
+    </dependency>
+    <!--
+      SLF4J provider for the *relocated* org.slf4j, bundled in the shaded jar.
+      Without it, SLF4J finds no provider for com.blazemeter.jmeter.http2.shaded.org.slf4j and
+      falls back to NOP, so every log statement in this plugin and in the shaded Jetty is silently
+      discarded at runtime (JMeter's own log4j-slf4j-impl only binds the unrelocated org.slf4j).
+      This binding talks to the unrelocated org.apache.logging.log4j API, so records end up in
+      JMeter's log4j-core and therefore in jmeter.log. Version matches the log4j that JMeter ships.
+      See the org.apache.logging.slf4j relocation below, which is required to make this work.
+    -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-slf4j2-impl</artifactId>
+      <version>${log4j.version}</version>
+    </dependency>
+    <!-- Provided by JMeter's lib/; must not be bundled or it would shadow the runtime's own. -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-api</artifactId>
+      <version>${log4j.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>${log4j.version}</version>
+      <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>org.slf4j</groupId>
@@ -368,6 +397,19 @@
                   <pattern>org.slf4j</pattern>
                   <shadedPattern>com.blazemeter.jmeter.http2.shaded.org.slf4j</shadedPattern>
                 </relocation>
+                <!--
+                  log4j-slf4j2-impl's own classes live in org.apache.logging.slf4j, the same package
+                  JMeter's log4j-slf4j-impl (the SLF4J 1.7 binding) uses. Leaving them unrelocated
+                  makes the two bindings collide on class names such as Log4jLoggerFactory, and
+                  whichever the classloader picks first may be the one compiled against the *other*
+                  SLF4J API. Relocating keeps our binding self-consistent with the relocated
+                  org.slf4j above. Note org.apache.logging.log4j (the API) is deliberately NOT
+                  relocated: it has to resolve to JMeter's log4j-core so records reach jmeter.log.
+                -->
+                <relocation>
+                  <pattern>org.apache.logging.slf4j</pattern>
+                  <shadedPattern>com.blazemeter.jmeter.http2.shaded.org.apache.logging.slf4j</shadedPattern>
+                </relocation>
                 <!-- Do not relocate com.github.luben.zstd; zstd-jni uses native linkage. -->
                 <relocation>
                   <pattern>com.github.benmanes.caffeine</pattern>
@@ -422,6 +464,16 @@
         <configuration>
           <!-- avoid issue with jdk 11+ -->
           <useSystemClassLoader>false</useSystemClassLoader>
+          <!--
+            log4j-slf4j2-impl exists only to be bundled (relocated) in the shaded jar. Tests run
+            against unshaded classes, where it lands in the same org.apache.logging.slf4j package as
+            the SLF4J 1.7 binding that JMeter pulls in, and the two disagree on constructors
+            (NoSuchMethodError on Log4jLoggerFactory while initializing JMeterUtils). Keep it off
+            the test classpath; unit tests log through slf4j-simple as before.
+          -->
+          <classpathDependencyExcludes>
+            <classpathDependencyExclude>org.apache.logging.log4j:log4j-slf4j2-impl</classpathDependencyExclude>
+          </classpathDependencyExcludes>
           <!-- Allow slf4j-simple in unit tests to enable Jetty frame logging. -->
           <excludes>
             <exclude>**/*IntegrationTest.java</exclude>
@@ -528,6 +580,11 @@
           <excludes>
             <exclude>**/regression/**</exclude>
           </excludes>
+          <!-- Same clash as in surefire above: the shaded-jar-only SLF4J binding must stay off the
+               unshaded test classpath. -->
+          <classpathDependencyExcludes>
+            <classpathDependencyExclude>org.apache.logging.log4j:log4j-slf4j2-impl</classpathDependencyExclude>
+          </classpathDependencyExcludes>
         </configuration>
         <executions>
           <execution>
