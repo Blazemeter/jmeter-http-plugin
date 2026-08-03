@@ -1448,23 +1448,81 @@ public class HTTP2JettyClient {
     return response;
   }
 
+  /**
+   * Stops every Jetty {@link HttpClient} owned by this wrapper.
+   *
+   * <p>JMeter's Stop button interrupts the worker thread before {@code threadFinished} runs. Jetty
+   * awaits selector shutdown interruptibly, so leaving the interrupt flag set turns a normal
+   * teardown into {@link InterruptedException} plus {@code ClosedSelectorException} noise on the
+   * console. Clear the flag for the duration of the stop, shut each client down independently so
+   * one failure does not skip the rest, then restore the interrupt status for the caller.
+   */
   public void stop() throws Exception {
-    httpClient.stop();
-    if (httpClientNoH3 != httpClient) {
-      httpClientNoH3.stop();
-    }
-    httpClientHttp1Only.stop();
-    httpClientH2cPrior.stop();
-    httpClientH2cUpgrade.stop();
-    clearBufferPool();
-    if (heExecutorsRegistered) {
-      int remaining = HAPPY_EYEBALLS_CLIENTS.decrementAndGet();
-      if (remaining <= 0) {
-        HAPPY_EYEBALLS_CLIENTS.set(0);
-        shutdownHappyEyeballsExecutors();
+    boolean interrupted = Thread.interrupted();
+    Exception firstFailure = null;
+    try {
+      firstFailure = stopClient(httpClient, firstFailure);
+      if (httpClientNoH3 != httpClient) {
+        firstFailure = stopClient(httpClientNoH3, firstFailure);
       }
-      heExecutorsRegistered = false;
+      firstFailure = stopClient(httpClientHttp1Only, firstFailure);
+      firstFailure = stopClient(httpClientH2cPrior, firstFailure);
+      firstFailure = stopClient(httpClientH2cUpgrade, firstFailure);
+      clearBufferPool();
+      if (heExecutorsRegistered) {
+        int remaining = HAPPY_EYEBALLS_CLIENTS.decrementAndGet();
+        if (remaining <= 0) {
+          HAPPY_EYEBALLS_CLIENTS.set(0);
+          shutdownHappyEyeballsExecutors();
+        }
+        heExecutorsRegistered = false;
+      }
+      if (firstFailure != null) {
+        throw firstFailure;
+      }
+    } finally {
+      // Also absorb interrupts that arrived mid-stop so we still restore a single, clean flag.
+      if (interrupted || Thread.interrupted()) {
+        Thread.currentThread().interrupt();
+      }
     }
+  }
+
+  private static Exception stopClient(HttpClient client, Exception firstFailure) {
+    if (client == null || !client.isRunning()) {
+      return firstFailure;
+    }
+    try {
+      client.stop();
+      return firstFailure;
+    } catch (InterruptedException e) {
+      // Keep going: remaining clients must still be stopped. The interrupt is restored in stop().
+      Thread.interrupted();
+      return firstFailure;
+    } catch (Exception e) {
+      if (isExpectedShutdownException(e)) {
+        lowLevelDebug("Ignoring expected shutdown exception while stopping {}: {}",
+            client.getName(), e.toString());
+        return firstFailure;
+      }
+      LOG.warn("Failed to stop HttpClient {}: {}", client.getName(), e.toString());
+      return firstFailure != null ? firstFailure : e;
+    }
+  }
+
+  /**
+   * Exceptions that show up when JMeter interrupts a thread mid-stop, or when a selector is already
+   * closed by a concurrent shutdown. They are not actionable connection failures.
+   */
+  public static boolean isExpectedShutdownException(Throwable throwable) {
+    for (Throwable current = throwable; current != null; current = current.getCause()) {
+      if (current instanceof InterruptedException
+          || current instanceof java.nio.channels.ClosedSelectorException
+          || current instanceof java.nio.channels.ClosedChannelException) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private void samplePrepareRequest(Request request,

@@ -1516,8 +1516,16 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     for (HTTP2JettyClient client : clients.values()) {
       try {
         client.stop();
+      } catch (InterruptedException e) {
+        // JMeter Stop interrupts the thread before threadFinished; Jetty shutdown is interruptible.
+        Thread.currentThread().interrupt();
+        LOG.debug("Interrupted while closing BlazeMeter HTTP connection (test stopped)");
       } catch (Exception e) {
-        LOG.error("Error while closing connection", e);
+        if (HTTP2JettyClient.isExpectedShutdownException(e)) {
+          LOG.debug("BlazeMeter HTTP connection closed during test stop: {}", e.toString());
+        } else {
+          LOG.error("Error while closing connection", e);
+        }
       }
     }
     clients.clear();
