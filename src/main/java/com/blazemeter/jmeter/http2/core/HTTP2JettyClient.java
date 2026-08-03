@@ -40,9 +40,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
@@ -194,7 +196,8 @@ public class HTTP2JettyClient {
   private static final Object HAPPY_EYEBALLS_LOCK = new Object();
   private static final AtomicInteger HAPPY_EYEBALLS_CLIENTS = new AtomicInteger(0);
   private static volatile ScheduledExecutorService happyEyeballsScheduler;
-  private static volatile ScheduledExecutorService happyEyeballsExecutor;
+  /** Runs the blocking response waiters of each protocol race; only needs {@code execute}. */
+  private static volatile ExecutorService happyEyeballsExecutor;
   private static final Map<String, AltSvcEntry> ALT_SVC_CACHE = new ConcurrentHashMap<>();
   private static final Map<String, Http1OnlyEntry> HTTP1_ONLY_CACHE = new ConcurrentHashMap<>();
   private static final Map<String, H2cEntry> H2C_CACHE = new ConcurrentHashMap<>();
@@ -214,7 +217,10 @@ public class HTTP2JettyClient {
   private int byteBufferPoolFactor = 4;
   private int maxConcurrentPushedStreams = 100;
   private int maxRequestsPerConnection = 100;
-  private boolean sharedThreadPoolEnabled = true;
+  // Off by default, matching httpJettyClient.sharedThreadPool; the property opts in. The field used
+  // to initialise to true, which only ever applied on a path that skipped loadProperties and made
+  // the intended default ambiguous to read.
+  private boolean sharedThreadPoolEnabled = false;
 
   // Experimental HTTP/2 SETTINGS frame configuration
   // These can be adjusted via properties to fix protocol_error with specific servers
@@ -248,6 +254,18 @@ public class HTTP2JettyClient {
   private DeflateContentDecoderFactory deflateDecoderFactory;
   private boolean decoderFactoriesInitialized = false;
   private int quicMaxIdleTimeout = 30000;
+  /**
+   * How long to wait for the QUIC handshake before giving up on HTTP/3, in milliseconds.
+   *
+   * <p>Applied by {@link #applyHttp3HandshakeTimeout}, which explains why it lands on the HTTP/3
+   * client rather than on the QUIC connector. It matters because a blocked UDP path does not fail
+   * fast on its own: without it the client keeps Jetty's default connect timeout, long enough that
+   * an HTTP/3 attempt looks like a stalled request rather than an unsupported protocol. Failing
+   * here is safe for any method, including POST - nothing was sent yet - and {@code getContent}
+   * turns it into "mark the origin broken and retry without HTTP/3". Deliberately short: the cost
+   * of being wrong is one request served over HTTP/2.
+   */
+  private int http3HandshakeTimeoutMs = 1000;
   private int quicMaxBidirectionalStreams = 100;
   private int quicMaxUnidirectionalStreams = 100;
   private long http3BrokenCooldownMs = DEFAULT_HTTP3_BROKEN_COOLDOWN_MS;
@@ -480,6 +498,11 @@ public class HTTP2JettyClient {
       try {
         ClientConnector quicConnector = createClientConnector(name + "-quic");
         quicConnector.setIdleTimeout(Duration.ofMillis(quicMaxIdleTimeout));
+        // No connect timeout here: setting one on this connector has no effect, because it is not
+        // the connector that establishes the connection. The transport below is what makes the
+        // attempt use QUIC, while the connecting is done by the main clientConnector, so the
+        // handshake deadline has to be applied to the client that owns it. See
+        // applyHttp3HandshakeTimeout.
 
         QuicheClientQuicConfiguration quicConfig =
             HTTP3ClientQuicConfiguration.configure(new QuicheClientQuicConfiguration());
@@ -522,6 +545,7 @@ public class HTTP2JettyClient {
 
     this.httpClient = new HttpClient(transport);
     configureHttpClient(this.httpClient, clientConnector);
+    applyHttp3HandshakeTimeout();
 
     if (FORCE_HTTP2_ONLY || !enableHttp3) {
       this.httpClientNoH3 = this.httpClient;
@@ -802,6 +826,9 @@ public class HTTP2JettyClient {
     quicMaxIdleTimeout = Integer
         .parseInt(BzmHttpPluginProperties.getPropDefault("httpJettyClient.quicMaxIdleTimeout",
             String.valueOf(quicMaxIdleTimeout)));
+    http3HandshakeTimeoutMs = Integer.parseInt(
+        BzmHttpPluginProperties.getPropDefault("httpJettyClient.http3HandshakeTimeoutMs",
+            String.valueOf(http3HandshakeTimeoutMs)));
     quicMaxBidirectionalStreams =
         Integer.parseInt(BzmHttpPluginProperties.getPropDefault(
             "httpJettyClient.quicMaxBidirectionalStreams",
@@ -1288,19 +1315,7 @@ public class HTTP2JettyClient {
       JmeterRequestHeadersSupport.prepareFromSampler(http11Request, (Boolean) useKeepAlive);
     }
     configureContentDecodersAndCapture(httpClientHttp1Only, http11Request);
-    Request.Content body = originalRequest.getBody();
-    if (body != null) {
-      // The original attempt may already have read some or all of this content before
-      // failing; rewind it back to the start before reuse, exactly as Jetty's own retry
-      // paths do (see AuthenticationProtocolHandler/HttpRedirector). Skipping this can send
-      // a fallback request that declares the right Content-Length but no actual body bytes,
-      // hanging the server until its idle timeout instead of failing fast.
-      if (!body.rewind()) {
-        throw new IllegalStateException(
-            "Request body for " + uri + " is not reproducible for HTTP/1.1 fallback retry");
-      }
-      http11Request.body(body);
-    }
+    copyBodyForRetry(originalRequest, http11Request, "HTTP/1.1 fallback");
     SslClientCertAliasSupport.copyFromRequest(originalRequest, http11Request);
     return http11Request;
   }
@@ -1426,9 +1441,7 @@ public class HTTP2JettyClient {
     }
     ensureHostHeader(h2cRequest, uri);
     configureContentDecodersAndCapture(httpClientH2cPrior, h2cRequest);
-    if (originalRequest.getBody() != null) {
-      h2cRequest.body(originalRequest.getBody());
-    }
+    copyBodyForRetry(originalRequest, h2cRequest, "HTTP/2 cleartext fallback");
 
     ContentResponse response = h2cRequest.send();
     updateH2cCache(h2cRequest, response);
@@ -1581,6 +1594,29 @@ public class HTTP2JettyClient {
     lowLevelDebug("Request prepared, ready to send");
     return request;
 
+  }
+
+  /**
+   * Prepares and fires an asynchronous request, returning it already in flight.
+   *
+   * <p>The caller must not send the returned request: dispatching belongs here because whether the
+   * request goes out on its own or as one side of an HTTP/3 vs HTTP/2 race is a protocol decision,
+   * and the race has to be started by whoever owns that decision. Previously the sampler called
+   * Jetty's {@code Request.send} directly, which skipped that decision: an asynchronous request
+   * selected for HTTP/3 went out with no competing attempt. The protocol fallbacks were still
+   * reached, since the second stage goes through {@link #sampleFromListener} into
+   * {@code getContent} either way - what was lost is the race.
+   */
+  public Request dispatchAsync(HTTP2Sampler sampler, HTTPSampleResult result,
+                               HTTP2FutureResponseListener listener) throws Exception {
+    Request request = sampleAsync(sampler, result, listener);
+    if (shouldUseHappyEyeballs(request)) {
+      lowLevelDebug("Dispatching async request through protocol race: {}", request.getURI());
+      startProtocolRace(request, listener);
+    } else {
+      request.send(listener);
+    }
+    return request;
   }
 
   private void errorWhenNotSupportedMethod(String method) throws UnsupportedOperationException {
@@ -1900,19 +1936,120 @@ public class HTTP2JettyClient {
     if (!fallbackEnabled || !enableHttp3 || !enableHttp2) {
       return false;
     }
+    if (http3PriorKnowledgeEnabled) {
+      // Prior knowledge asserts the origin speaks HTTP/3, so there is nothing to discover and a
+      // competing HTTP/2 attempt would be wasted work: go straight to HTTP/3, exactly like h2c
+      // prior knowledge skips the Upgrade. A failure still reaches the HTTP/1.1 fallback.
+      return false;
+    }
+    if (!isSafeToRace(request)) {
+      return false;
+    }
     Object attempted = request.getAttributes().get(ATTR_HTTP3_ATTEMPTED);
     return Boolean.TRUE.equals(attempted);
+  }
+
+  /**
+   * A protocol race that has been started but not yet resolved.
+   *
+   * <p>Splitting "start" from "wait" is what lets the asynchronous sampling path use the race at
+   * all: it cannot block on a latch, because the JMeter thread has to return and come back later to
+   * collect the result. It polls the shared listener instead, which the race resolves through
+   * {@link HTTP2FutureResponseListener#completeWith}.
+   */
+  private static final class ProtocolRace {
+    private final java.util.concurrent.CountDownLatch done;
+    private final AtomicReference<ContentResponse> winner;
+    private final AtomicReference<Throwable> failure;
+    private final java.util.concurrent.atomic.AtomicBoolean resolved;
+    private final Runnable timeoutCleanup;
+
+    private ProtocolRace(java.util.concurrent.CountDownLatch done,
+                         AtomicReference<ContentResponse> winner,
+                         AtomicReference<Throwable> failure,
+                         java.util.concurrent.atomic.AtomicBoolean resolved,
+                         Runnable timeoutCleanup) {
+      this.done = done;
+      this.winner = winner;
+      this.failure = failure;
+      this.resolved = resolved;
+      this.timeoutCleanup = timeoutCleanup;
+    }
+
+    /** Blocks for the winner. Only the synchronous path calls this. */
+    private ContentResponse await(int timeoutMs)
+        throws InterruptedException, TimeoutException, ExecutionException {
+      if (timeoutMs > 0) {
+        if (!done.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+          if (resolved.compareAndSet(false, true)) {
+            timeoutCleanup.run();
+          }
+          throw new TimeoutException();
+        }
+      } else {
+        done.await();
+      }
+      ContentResponse response = winner.get();
+      if (response != null) {
+        return response;
+      }
+      Throwable t = failure.get();
+      if (t instanceof ExecutionException) {
+        throw (ExecutionException) t;
+      }
+      if (t instanceof TimeoutException) {
+        throw (TimeoutException) t;
+      }
+      throw new ExecutionException(t);
+    }
+  }
+
+  /**
+   * Whether a request may be sent twice at once.
+   *
+   * <p>The race duplicates the whole request, so both attempts can reach the server before one is
+   * aborted, and that is only acceptable with no side effects and no body. Racing a POST could
+   * apply it twice. A body rules it out for a second reason: the clone shares the original's
+   * {@link Request.Content} instance, and one content source cannot feed two requests reading it at
+   * the same time - unlike a retry, where the body is rewound and read once (see
+   * {@link #copyBodyForRetry}).
+   */
+  private boolean isSafeToRace(Request request) {
+    String method = request.getMethod();
+    boolean idempotent = HTTPConstants.GET.equalsIgnoreCase(method)
+        || HTTPConstants.HEAD.equalsIgnoreCase(method);
+    if (!idempotent) {
+      lowLevelDebug("Not racing {} request: only GET/HEAD may be duplicated", method);
+      return false;
+    }
+    if (request.getBody() != null) {
+      lowLevelDebug("Not racing request with a body: one content source cannot feed both attempts");
+      return false;
+    }
+    return true;
   }
 
   private ContentResponse sendWithHappyEyeballs(Request h3Request,
                                                 HTTP2FutureResponseListener h3Listener)
       throws InterruptedException, TimeoutException, ExecutionException {
+    return startProtocolRace(h3Request, h3Listener)
+        .await(requestTimeout > 0 ? requestTimeout + 2000 : 0);
+  }
+
+  /**
+   * Starts an HTTP/3 and an HTTP/2 attempt for the same request and returns immediately. The first
+   * one to respond wins, its response is published on {@code h3Listener}, and the loser is aborted.
+   * The race is given up only once both attempts have failed, at which point the caller's own
+   * HTTP/1.1 fallback takes over.
+   */
+  private ProtocolRace startProtocolRace(Request h3Request,
+                                         HTTP2FutureResponseListener h3Listener)
+      throws ExecutionException {
     URI uri = h3Request.getURI();
     ensureHappyEyeballsExecutors();
     long effectiveDelayMs = computeHappyEyeballsDelayMs(uri);
     lowLevelDebug("Happy Eyeballs enabled for HTTP/3: origin={}, delayMs={}",
         originKey(uri), effectiveDelayMs);
-    int timeoutMs = requestTimeout > 0 ? requestTimeout + 2000 : 0;
     AtomicReference<ContentResponse> winner = new AtomicReference<>();
     AtomicReference<Throwable> failure = new AtomicReference<>();
     AtomicInteger failures = new AtomicInteger(0);
@@ -1926,6 +2063,10 @@ public class HTTP2JettyClient {
         new HTTP2FutureResponseListener(JETTY_BUFFERING_UNLIMITED);
     Request h2Request = cloneRequest(h3Request, httpClientNoH3);
     h2Listener.setRequest(h2Request);
+    // Both sides are raced attempts: a failure on either is "that protocol was not negotiated for
+    // this origin", not a failed request, so it must not be reported as an error.
+    h3Listener.setRaceProtocol("HTTP/3");
+    h2Listener.setRaceProtocol("HTTP/2");
 
     java.util.concurrent.atomic.AtomicReference<java.util.concurrent.ScheduledFuture<?>>
         h2StartFuture = new java.util.concurrent.atomic.AtomicReference<>();
@@ -2026,30 +2167,7 @@ public class HTTP2JettyClient {
           effectiveDelayMs, TimeUnit.MILLISECONDS));
     }
 
-    boolean completed;
-    if (timeoutMs > 0) {
-      completed = done.await(timeoutMs, TimeUnit.MILLISECONDS);
-      if (!completed) {
-        if (resolved.compareAndSet(false, true)) {
-          completeTimeoutCleanup.run();
-        }
-        throw new TimeoutException();
-      }
-    } else {
-      done.await();
-    }
-    ContentResponse response = winner.get();
-    if (response != null) {
-      return response;
-    }
-    Throwable t = failure.get();
-    if (t instanceof ExecutionException) {
-      throw (ExecutionException) t;
-    }
-    if (t instanceof TimeoutException) {
-      throw (TimeoutException) t;
-    }
-    throw new ExecutionException(t);
+    return new ProtocolRace(done, winner, failure, resolved, completeTimeoutCleanup);
   }
 
   public ContentResponse getContent(HTTP2FutureResponseListener listener)
@@ -2131,7 +2249,16 @@ public class HTTP2JettyClient {
     } catch (ExecutionException e) {
       long elapsed = System.currentTimeMillis() - getStart;
       Throwable cause = e.getCause();
-      LOG.error("Request failed after {}ms with ExecutionException", elapsed, e);
+      if (cause instanceof CancellationException) {
+        // Losing side of a resolved protocol race; the winner is reported by the race itself.
+        lowLevelDebug("Request cancelled after {}ms: {}", elapsed, cause.getMessage());
+      } else if (listener != null && listener.getRaceProtocol() != null) {
+        // A raced attempt failing on its own: the competing protocol still serves the request.
+        LOG.debug("{} attempt did not complete after {}ms: {}", listener.getRaceProtocol(),
+            elapsed, cause != null ? cause.getMessage() : e.getMessage());
+      } else {
+        LOG.error("Request failed after {}ms with ExecutionException", elapsed, e);
+      }
 
       // Check if the cause is a ProtocolErrorException
       RetryableRequestException retryable =
@@ -2409,7 +2536,26 @@ public class HTTP2JettyClient {
     JmeterCompressionHeadersSupport.installCapture(request);
   }
 
+  /**
+   * Client selection for callers with no request at hand, such as a retry after GOAWAY. Treats the
+   * request as not recoverable, so an origin is only used over HTTP/3 when it is already known to
+   * speak it, never as exploration.
+   */
   private HttpClient selectHttpClient(URI uri) {
+    return selectHttpClient(uri, false);
+  }
+
+  /**
+   * Picks the client whose protocols match what is known about the origin. Whether the attempt is
+   * <em>raced</em> against HTTP/2 is decided separately, on the built request, by
+   * {@link #shouldUseHappyEyeballs}: that changes how HTTP/3 is attempted, not whether this origin
+   * is worth attempting it on.
+   *
+   * @param recoverable whether a failure to establish the connection can be retried over another
+   *                    protocol, which is what makes exploring HTTP/3 on an unknown origin safe.
+   *                    See {@link #isRecoverableIfHttp3Fails}.
+   */
+  private HttpClient selectHttpClient(URI uri, boolean recoverable) {
     if (uri != null && "http".equalsIgnoreCase(uri.getScheme())) {
       if (enableHttp1 && isHttp1Only(uri)) {
         lowLevelDebug("HTTP/1.1-only cache hit for cleartext origin {}", originKey(uri));
@@ -2419,30 +2565,38 @@ public class HTTP2JettyClient {
         return httpClientHttp1Only;
       }
       if (!enableHttp1 && enableHttp2) {
+        // Nothing to upgrade from, so h2c is only reachable by speaking it from the first byte.
         lowLevelDebug("HTTP/1.1 disabled; using H2C prior knowledge for origin {}",
             originKey(uri));
         return httpClientH2cPrior;
       }
+      // Past this point HTTP/1.1 and HTTP/2 are either both enabled or both disabled, and the
+      // choice is between three mutually exclusive strategies for reaching h2c.
       if (http1UpgradeRequired) {
+        // Strategy 1: the user asked for the Upgrade dance. Three outcomes, in this order.
         if (!enableHttp2) {
+          // Only reachable with HTTP/1.1 disabled as well, i.e. no cleartext protocol left at all.
           LOG.warn("H2C upgrade requested but HTTP/2 is disabled; using HTTP/1.1");
           return httpClientHttp1Only;
         }
         if (shouldUseH2cPriorKnowledge(uri)) {
+          // Skip the upgrade round trip: this origin is already known to speak h2c.
           lowLevelDebug("H2C prior knowledge enabled for origin {}", originKey(uri));
           return httpClientH2cPrior;
         }
         lowLevelDebug("H2C upgrade enabled for origin {}", originKey(uri));
         return httpClientH2cUpgrade;
-      }
-      if (shouldUseH2cPriorKnowledge(uri)) {
+      } else if (shouldUseH2cPriorKnowledge(uri)) {
+        // Strategy 2: no upgrade requested, but h2c is known to work here - either configured as
+        // prior knowledge, or learned from an earlier HTTP/2 response and still cached - so it can
+        // be spoken directly, which is the one cleartext path with no negotiation overhead.
         lowLevelDebug("H2C prior knowledge enabled for origin {}", originKey(uri));
         return httpClientH2cPrior;
+      } else {
+        // Strategy 3: nothing says h2c is available here and the Upgrade was not requested, so use
+        // the default client and let it settle on HTTP/1.1.
+        return httpClientNoH3;
       }
-      if (!enableHttp2 && enableHttp1) {
-        return httpClientHttp1Only;
-      }
-      return httpClientNoH3;
     }
     if (FORCE_HTTP2_ONLY) {
       if (enableHttp1 && isHttp1Only(uri)) {
@@ -2451,7 +2605,7 @@ public class HTTP2JettyClient {
       }
       return httpClientNoH3;
     }
-    boolean attemptHttp3 = shouldAttemptHttp3(uri);
+    boolean attemptHttp3 = shouldAttemptHttp3(uri, recoverable);
     if (attemptHttp3) {
       lowLevelDebug("HTTP/3 enabled for origin {}", originKey(uri));
     } else {
@@ -2460,8 +2614,19 @@ public class HTTP2JettyClient {
     if (attemptHttp3) {
       return httpClient;
     }
-    if (!enableHttp2 && enableHttp1) {
-      return httpClientHttp1Only;
+    if (!enableHttp2) {
+      // With HTTP/2 disabled there is no race to run and no HTTP/2 client to use: go straight to
+      // HTTP/3 when it is enabled (a failure there falls back to HTTP/1.1 through the usual paths,
+      // which check enableHttp1 themselves), and only then to HTTP/1.1. Falling through to the
+      // HTTP/2 client below would have ignored the user disabling HTTP/2 - and, when HTTP/1.1 was
+      // disabled too, would have negotiated exactly the two protocols that were turned off.
+      if (enableHttp3) {
+        lowLevelDebug("HTTP/2 disabled; using HTTP/3 for origin {}", originKey(uri));
+        return httpClient;
+      }
+      if (enableHttp1) {
+        return httpClientHttp1Only;
+      }
     }
     if (enableHttp1 && isHttp1Only(uri)) {
       lowLevelDebug("HTTP/1.1-only cache hit for origin {}", originKey(uri));
@@ -2470,7 +2635,7 @@ public class HTTP2JettyClient {
     return httpClientNoH3;
   }
 
-  private boolean shouldAttemptHttp3(URI uri) {
+  private boolean shouldAttemptHttp3(URI uri, boolean recoverable) {
     if (!enableHttp3) {
       return false;
     }
@@ -2485,14 +2650,29 @@ public class HTTP2JettyClient {
     }
     AltSvcEntry entry = ALT_SVC_CACHE.get(originKey(uri));
     if (entry == null) {
-      return false;
+      // First contact. Alt-Svc can only be learnt from a response, so waiting for the cache to say
+      // yes would mean HTTP/3 is never tried at all here: explore it, as long as the attempt can be
+      // walked back.
+      //
+      // This includes requests that cannot be raced, such as a POST. Those get no concurrent HTTP/2
+      // attempt to cover them, so what makes them safe is that the handshake has its own short
+      // deadline (see applyHttp3HandshakeTimeout) and that the fallback only fires for a failure to
+      // establish the connection - the request never reached the wire, so resending it cannot
+      // repeat a side effect. The outcome is cached either way, so it is the first request to an
+      // origin that pays for the exploration, not every one.
+      return recoverable;
     }
     long now = System.currentTimeMillis();
     if (entry.expiresAt <= now) {
+      // Stale: forget it and explore again rather than trusting an answer that has expired.
       ALT_SVC_CACHE.remove(originKey(uri));
+      return recoverable;
+    }
+    if (entry.brokenUntil > now) {
+      // HTTP/3 failed here recently; stay off it until the cooldown elapses.
       return false;
     }
-    return entry.h3 && now >= entry.brokenUntil;
+    return entry.h3;
   }
 
   private boolean isHttp1Only(URI uri) {
@@ -2586,6 +2766,9 @@ public class HTTP2JettyClient {
     }
     AltSvcEntry entry = ALT_SVC_CACHE.get(originKey(uri));
     if (entry == null) {
+      // First contact still gets the full stagger, on purpose: the delay is what gives HTTP/3 a
+      // chance to win outright so no HTTP/2 path is opened at all. Starting both at once would
+      // create a second connection to every new origin, which is the cost Happy Eyeballs avoids.
       return baseDelay;
     }
     long now = System.currentTimeMillis();
@@ -2720,11 +2903,19 @@ public class HTTP2JettyClient {
       return;
     }
     String origin = originKey(uri);
+    long brokenUntil = System.currentTimeMillis() + http3BrokenCooldownMs;
     AltSvcEntry entry = ALT_SVC_CACHE.get(origin);
     if (entry == null) {
-      return;
+      // The origin never advertised Alt-Svc, so HTTP/3 was tried as exploration. Record the failure
+      // anyway: without an entry there is nothing to hold the cooldown, and every later request
+      // would explore this origin again even though HTTP/3 just failed here. Expiring the entry
+      // when the cooldown ends is what lets exploration resume by itself.
+      entry = new AltSvcEntry();
+      entry.h3 = false;
+      entry.expiresAt = brokenUntil;
+      entry.lastH3SuccessAt = 0L;
     }
-    entry.brokenUntil = System.currentTimeMillis() + http3BrokenCooldownMs;
+    entry.brokenUntil = brokenUntil;
     ALT_SVC_CACHE.put(origin, entry);
     lowLevelDebug("HTTP/3 marked broken for origin {} until {}", origin, entry.brokenUntil);
   }
@@ -2824,6 +3015,45 @@ public class HTTP2JettyClient {
     return response;
   }
 
+  /**
+   * Carries the body of an already-attempted request over to the retry that replaces it.
+   *
+   * <p>The body must be rewound first, and skipping that is not a detail: aborting an attempt also
+   * fails its body {@link Request.Content}, and a failed content source keeps handing that same
+   * exception to whoever reads it next. Reusing the instance as-is makes the retry fail instantly
+   * with the error of the attempt it was supposed to rescue, which reads exactly like the fallback
+   * itself being broken. A partially consumed body is the other half of the problem: it would send
+   * a request declaring the right Content-Length with fewer bytes behind it, hanging the server
+   * until its idle timeout. Jetty's own retry paths rewind for the same reasons (see
+   * AuthenticationProtocolHandler/HttpRedirector).
+   *
+   * <p>A body that cannot be rewound cannot be retried. Failing loudly is deliberate: sending the
+   * retry without it would silently turn the request into a different one.
+   */
+  private static void copyBodyForRetry(Request originalRequest, Request retryRequest,
+      String retryDescription) {
+    Request.Content body = originalRequest.getBody();
+    if (body == null) {
+      return;
+    }
+    if (!body.rewind()) {
+      throw new IllegalStateException("Request body for " + originalRequest.getURI()
+          + " is not reproducible for " + retryDescription + " retry");
+    }
+    retryRequest.body(body);
+  }
+
+  /**
+   * Copies a request onto another client so the same target can be attempted over a different
+   * protocol.
+   *
+   * <p>Two callers, with different constraints worth keeping in mind when changing this:
+   * {@link #startProtocolRace}, where both the original and the copy are sent at once and so
+   * {@link #isSafeToRace} has already restricted it to GET/HEAD without a body; and
+   * {@link #sendWithHttp2Only}, the HTTP/3-to-HTTP/2 fallback, which replaces a request that failed
+   * to connect and therefore has to work for any method, body included. That is why the body goes
+   * through {@link #copyBodyForRetry} rather than being handed over as-is.
+   */
   private Request cloneRequest(Request originalRequest, HttpClient client)
       throws ExecutionException {
     URI uri = originalRequest.getURI();
@@ -2852,9 +3082,7 @@ public class HTTP2JettyClient {
         });
       }
     }
-    if (originalRequest.getBody() != null) {
-      request.body(originalRequest.getBody());
-    }
+    copyBodyForRetry(originalRequest, request, "protocol fallback");
     SslClientCertAliasSupport.copyFromRequest(originalRequest, request);
     configureContentDecodersAndCapture(client, request);
     return request;
@@ -3103,7 +3331,14 @@ public class HTTP2JettyClient {
             new HappyEyeballsThreadFactory("http3-he"));
       }
       if (happyEyeballsExecutor == null || happyEyeballsExecutor.isShutdown()) {
-        happyEyeballsExecutor = Executors.newScheduledThreadPool(2,
+        // Each race parks one thread per attempt waiting for its response, so a fixed pool caps how
+        // many races can resolve at once: with two threads a single race saturates it and every
+        // further race waits in the queue until its request deadline expires, which looks exactly
+        // like both protocols timing out. Concurrent embedded-resource downloads run several races
+        // per JMeter thread, so the pool has to grow on demand. Matches how JMeter sizes its own
+        // parallel-download pool (ResourcesDownloader uses an unbounded cached pool); threads are
+        // reclaimed once idle.
+        happyEyeballsExecutor = Executors.newCachedThreadPool(
             new HappyEyeballsThreadFactory("http3-he-worker"));
       }
     }
@@ -3111,7 +3346,7 @@ public class HTTP2JettyClient {
 
   private static void shutdownHappyEyeballsExecutors() {
     ScheduledExecutorService scheduler;
-    ScheduledExecutorService executor;
+    ExecutorService executor;
     synchronized (HAPPY_EYEBALLS_LOCK) {
       scheduler = happyEyeballsScheduler;
       executor = happyEyeballsExecutor;
@@ -3122,7 +3357,7 @@ public class HTTP2JettyClient {
     shutdownExecutor(executor);
   }
 
-  private static void shutdownExecutor(ScheduledExecutorService executor) {
+  private static void shutdownExecutor(ExecutorService executor) {
     if (executor == null) {
       return;
     }
@@ -3235,7 +3470,10 @@ public class HTTP2JettyClient {
       // Force HTTP/2 when HTTP/1.1 is disabled to avoid mixed-protocol frames.
       request.version(HttpVersion.HTTP_2);
     }
-    boolean http3Attempted = enableHttp3 && client == httpClient && shouldAttemptHttp3(uri);
+    // Selecting the HTTP/3-capable client already means shouldAttemptHttp3 said yes, so re-asking
+    // here would only risk a different answer: this has no request context and would treat every
+    // first contact as "no HTTP/3", clearing the flag that arms the race for those very requests.
+    boolean http3Attempted = enableHttp3 && client == httpClient;
     request.attribute(ATTR_HTTP3_ATTEMPTED, http3Attempted);
     request.attribute(ATTR_ORIGIN_KEY, originKey(uri));
     if ("https".equalsIgnoreCase(uri.getScheme())) {
@@ -3257,7 +3495,20 @@ public class HTTP2JettyClient {
       lowLevelDebug("Cleartext request with body; using HTTP/1.1-only client for {}", uri);
       return httpClientHttp1Only;
     }
-    return selectHttpClient(uri);
+    return selectHttpClient(uri, isRecoverableIfHttp3Fails(sampler));
+  }
+
+  /**
+   * Whether a failed HTTP/3 attempt for this request could still be served over another protocol,
+   * which is the condition for exploring HTTP/3 on an origin nothing is known about yet.
+   *
+   * <p>It comes down to the body: the fallback has to hand the same body to the retry, and a body
+   * read from a file cannot be rewound, so such a request has no way back once HTTP/3 has been
+   * attempted and failed. Form and string bodies rewind fine, so an ordinary POST is recoverable
+   * and does get to explore. Requests with no body always are.
+   */
+  private boolean isRecoverableIfHttp3Fails(HTTP2Sampler sampler) {
+    return sampler.getHTTPFiles().length == 0;
   }
 
   private boolean requestAdvertisesEncoding(HTTP2Sampler sampler, String encoding) {
@@ -3289,9 +3540,39 @@ public class HTTP2JettyClient {
     return false;
   }
 
+  /**
+   * Gives HTTP/3 establishment its own short deadline, so that an origin which cannot be reached
+   * over QUIC is abandoned quickly and the request falls back instead of stalling.
+   *
+   * <p>It is applied to {@code httpClient} even though the knob is about HTTP/3, and that is not a
+   * shortcut: {@code httpClient} is the only client HTTP/3 attempts are sent on, and its connect
+   * timeout is what actually bounds the QUIC handshake. Setting it on the QUIC connector instead
+   * reads as the obvious place and does nothing - see the comment where that connector is built.
+   *
+   * <p>Measured wall clock for a failed handshake is about twice this value, because establishment
+   * is attempted more than once before the failure surfaces.
+   */
+  private void applyHttp3HandshakeTimeout() {
+    if (FORCE_HTTP2_ONLY || !enableHttp3 || http3HandshakeTimeoutMs <= 0) {
+      return;
+    }
+    httpClient.setConnectTimeout(http3HandshakeTimeoutMs);
+    lowLevelDebug("HTTP/3 handshake deadline set to {}ms on the HTTP/3 client",
+        http3HandshakeTimeoutMs);
+  }
+
+  /** Whether the HTTP/3 client's connect timeout is reserved for the handshake deadline. */
+  private boolean http3HandshakeDeadlineApplies() {
+    return !FORCE_HTTP2_ONLY && enableHttp3 && http3HandshakeTimeoutMs > 0;
+  }
+
   private void setTimeouts(HTTP2Sampler sampler, Request request) {
     if (sampler.getConnectTimeout() > 0) {
-      httpClient.setConnectTimeout(sampler.getConnectTimeout());
+      // The HTTP/3 client keeps whichever is shorter: a connect timeout configured for the sampler
+      // must not stretch the handshake deadline that keeps the fallback fast.
+      httpClient.setConnectTimeout(http3HandshakeDeadlineApplies()
+          ? Math.min(sampler.getConnectTimeout(), http3HandshakeTimeoutMs)
+          : sampler.getConnectTimeout());
       if (httpClientNoH3 != httpClient) {
         httpClientNoH3.setConnectTimeout(sampler.getConnectTimeout());
       }
