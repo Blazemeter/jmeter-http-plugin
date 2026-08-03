@@ -18,6 +18,7 @@ import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpVersion;
 import org.eclipse.jetty.server.ServerConnector;
 import org.junit.After;
+import org.junit.Before;
 import org.junit.Test;
 
 /**
@@ -30,6 +31,14 @@ public class HTTP2JettyClientH2cFallbackTest extends HTTP2TestBase {
 
   private TeardownableServer server;
   private HttpClient probeClient;
+
+  @Before
+  public void setUp() throws Exception {
+    // A leaked legacy profile (enableHttp2=false) makes the upgrade client skip h2c entirely, so
+    // the HTTP/1-only cache is never populated and this assertion fails. Shared caches can also
+    // retain stale cleartext origins across recycled ports.
+    HTTP2JettyClientTestIsolation.resetSharedClientState();
+  }
 
   @After
   public void tearDown() throws Exception {

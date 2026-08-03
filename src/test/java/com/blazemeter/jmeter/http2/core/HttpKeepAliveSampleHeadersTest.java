@@ -32,14 +32,22 @@ public class HttpKeepAliveSampleHeadersTest {
 
   @After
   public void tearDown() throws Exception {
-    if (executor != null) {
-      executor.shutdownNow();
-      executor.awaitTermination(5, TimeUnit.SECONDS);
-      executor = null;
+    try {
+      if (executor != null) {
+        executor.shutdownNow();
+        executor.awaitTermination(5, TimeUnit.SECONDS);
+        executor = null;
+      }
+    } finally {
+      // Always clear: if executor teardown throws, leaked legacy profile properties make later
+      // HTTP/2 tests negotiate HTTP/1.1 (or skip h2c upgrade caching) for the rest of the suite.
+      JMeterUtils.getJMeterProperties().remove("blazemeter.http.enableHttp2");
+      JMeterUtils.getJMeterProperties().remove("blazemeter.http.enableHttp3");
+      JMeterUtils.getJMeterProperties().remove("blazemeter.http.profile");
+      System.clearProperty("blazemeter.http.enableHttp2");
+      System.clearProperty("blazemeter.http.enableHttp3");
+      System.clearProperty("blazemeter.http.profile");
     }
-    JMeterUtils.getJMeterProperties().remove("blazemeter.http.enableHttp2");
-    JMeterUtils.getJMeterProperties().remove("blazemeter.http.enableHttp3");
-    JMeterUtils.getJMeterProperties().remove("blazemeter.http.profile");
   }
 
   @Test
