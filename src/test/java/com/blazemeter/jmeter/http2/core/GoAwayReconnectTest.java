@@ -67,6 +67,11 @@ public class GoAwayReconnectTest extends HTTP2TestBase {
 
   @Before
   public void setUp() throws Exception {
+    // Static HTTP/1-only cache entries survive across tests and are keyed by host:port. Ephemeral
+    // ports recycle in a full suite, so a prior HTTPS HTTP/1.1 sample can force this client onto
+    // HTTP/1.1 and leave no HTTP/2 session to GOAWAY. Same for leaked legacy profile properties.
+    HTTP2JettyClientTestIsolation.resetSharedClientState();
+
     // This exact combination is what actually negotiates HTTP/2; withSSL().withALPN().withHTTP2()
     // alone makes the client fall back to HTTP/1.1, which would leave no session to GOAWAY.
     server = new ServerBuilder().withHTTP2().withALPN().withHTTP2C().withSSL().buildServer();
@@ -160,8 +165,16 @@ public class GoAwayReconnectTest extends HTTP2TestBase {
   }
 
   private void startClient() throws Exception {
-    client = new HTTP2JettyClient();
-    client.loadProperties();
+    // Pin HTTP/2+ALPN regardless of any leftover suite-wide protocol properties.
+    HTTP2ClientProfileConfig profile = HTTP2ClientProfileConfig.builder()
+        .profile("browser-like-custom")
+        .enableHttp1(true)
+        .enableHttp2(true)
+        .enableHttp3(false)
+        .alpnEnabled(true)
+        .http1OnlyCacheEnabled(false)
+        .build();
+    client = new HTTP2JettyClient(false, "goaway-reconnect-test", profile);
     client.start();
   }
 
