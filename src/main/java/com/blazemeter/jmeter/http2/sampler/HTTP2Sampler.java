@@ -2,7 +2,6 @@ package com.blazemeter.jmeter.http2.sampler;
 
 import static org.apache.jmeter.util.JMeterUtils.getPropDefault;
 
-import com.blazemeter.jmeter.http2.control.HTTP2Controller;
 import com.blazemeter.jmeter.http2.core.HTTP2ClientProfileConfig;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
@@ -47,7 +46,6 @@ import org.apache.jmeter.testelement.TestElement;
 import org.apache.jmeter.testelement.ThreadListener;
 import org.apache.jmeter.testelement.property.JMeterProperty;
 import org.apache.jmeter.testelement.property.NullProperty;
-import org.apache.jmeter.threads.JMeterContext;
 import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.threads.JMeterThread;
 import org.apache.jmeter.threads.JMeterVariables;
@@ -136,7 +134,6 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   private transient List<Timer> suppressedTimers;
   private transient SamplePackage suppressedSamplePackage;
   private transient boolean profileInferenceWarningLogged;
-  private transient boolean asyncParentSampleEnabled;
 
   public HTTP2Sampler() {
     clientFactory = this::getClient;
@@ -158,14 +155,6 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
   public void setSyncRequest(boolean sync) {
     this.syncRequest = sync;
-  }
-
-  public void setAsyncParentSampleEnabled(boolean enabled) {
-    this.asyncParentSampleEnabled = enabled;
-  }
-
-  public boolean isAsyncParentSampleEnabled() {
-    return asyncParentSampleEnabled;
   }
 
   @VisibleForTesting
@@ -403,29 +392,24 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       if (!isSyncRequest()) {
         if (Objects.isNull(this.asyncListener)) {
           this.result = buildResult(url, method); // Save the main result for next step
-          if (isAsyncParentSampleEnabled()) {
-            this.result.setIgnore();
-          }
           HTTP2FutureResponseListener listener =
               new HTTP2FutureResponseListener(HTTP2JettyClient.getJettyBufferingMaxLength());
-          this.asyncListener = listener;
           // The client fires it: dispatching there is what lets an async request take part in the
           // HTTP/3 vs HTTP/2 race. Sending it from here reached the fallbacks all the same, through
           // the second stage, but went out as a lone HTTP/3 attempt with nothing racing it.
           client.dispatchAsync(this, this.result, listener);
+          // Published only once the request is really on the wire. If the dispatch throws, the
+          // controller must not be left waiting on a listener that nobody will ever complete.
+          this.asyncListener = listener;
+          // Nothing to report yet: the async controller will hand this sampler back once the
+          // response has arrived, and JMeterThread applies post-processors, assertions, listeners
+          // and the transaction nesting to the result returned on that turn.
           return null;
         } else {
           // If there is a listener, it is processed using the result it had
           try {
             this.result = sampleFromListener(
                 this.result, areFollowingRedirect, depth, this.asyncListener);
-            if (isAsyncParentSampleEnabled()) {
-              applyAsyncParentCompletionPipeline(this.result);
-              this.result.setIgnore();
-              HTTP2Controller.registerAsyncSampleResult(this, this.result, this.asyncListener);
-              return null;
-            }
-            HTTP2Controller.registerAsyncSampleResult(this, this.result, this.asyncListener);
             return this.result;
           } finally {
             restoreSuppressedPreProcessors();
@@ -440,13 +424,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       if (Objects.isNull(this.result)) {
         this.result = buildResult(url, method);
       }
-      HTTPSampleResult errorResult = buildErrorResult(e, this.result);
-      if (isAsyncParentSampleEnabled()) {
-        applyAsyncParentCompletionPipeline(errorResult);
-        errorResult.setIgnore();
-      }
-      HTTP2Controller.registerAsyncSampleResult(this, errorResult, this.asyncListener);
-      return isAsyncParentSampleEnabled() ? null : errorResult;
+      return buildErrorResult(e, this.result);
     } catch (Exception e) {
       LOG.error("BlazeMeter HTTP sample failed", e);
 
@@ -502,64 +480,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       if (Objects.isNull(this.result)) {
         this.result = buildResult(url, method);
       }
-      HTTPSampleResult errorResult = buildErrorResult(e, this.result);
-      if (isAsyncParentSampleEnabled()) {
-        applyAsyncParentCompletionPipeline(errorResult);
-        errorResult.setIgnore();
-      }
-      HTTP2Controller.registerAsyncSampleResult(this, errorResult, this.asyncListener);
-      return isAsyncParentSampleEnabled() ? null : errorResult;
-    }
-  }
-
-  /**
-   * When {@link #isAsyncParentSampleEnabled()} and this sampler returns {@code null} to JMeter,
-   * run post-processors and assertions here (same order as {@code JMeterThread}) so child elements
-   * still apply; pre-processors and timers already ran on the initial async dispatch and stay
-   * suppressed until {@link #restoreSuppressedPreProcessors()} in {@code finally}.
-   */
-  private void applyAsyncParentCompletionPipeline(HTTPSampleResult res) {
-    if (res == null || !isAsyncParentSampleEnabled()) {
-      return;
-    }
-    JMeterContext ctx = JMeterContextService.getContext();
-    SamplePackage pack = resolveSamplePackageForAsyncCompletion(ctx);
-    if (pack == null) {
-      LOG.warn("Async parent completion pipeline skipped for sampler={}: no SamplePackage",
-          getName());
-      return;
-    }
-    ctx.setCurrentSampler(this);
-    AsyncCompletionSamplePipeline.runAfterAsyncSample(res, pack, ctx);
-  }
-
-  /**
-   * Resolves the {@link SamplePackage} for the in-flight {@code JMeterThread.executeSamplePackage}
-   * call. Prefer the pack captured when pre-processors were suppressed for async completion, then
-   * {@code JMeterThread.PACKAGE_OBJECT}, then the compiler map.
-   */
-  private SamplePackage resolveSamplePackageForAsyncCompletion(JMeterContext ctx) {
-    if (suppressedSamplePackage != null) {
-      return suppressedSamplePackage;
-    }
-    if (ctx != null && ctx.getVariables() != null) {
-      Object packObj = ctx.getVariables().getObject(JMeterThread.PACKAGE_OBJECT);
-      if (packObj instanceof SamplePackage) {
-        return (SamplePackage) packObj;
-      }
-    }
-    try {
-      JMeterThread thread = ctx != null ? ctx.getThread() : null;
-      if (thread == null) {
-        return null;
-      }
-      Field compilerField = JMeterThread.class.getDeclaredField("compiler");
-      compilerField.setAccessible(true);
-      TestCompiler compiler = (TestCompiler) compilerField.get(thread);
-      return getSamplePackageFromCompiler(compiler);
-    } catch (Exception e) {
-      LOG.debug("Failed to resolve SamplePackage for async completion", e);
-      return null;
+      return buildErrorResult(e, this.result);
     }
   }
 

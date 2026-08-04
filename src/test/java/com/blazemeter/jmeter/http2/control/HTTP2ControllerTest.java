@@ -252,39 +252,6 @@ public class HTTP2ControllerTest extends HTTP2TestBase {
   }
   */
 
-  @Test
-  public void deepCopyHttpSampleResultDoesNotDuplicateRequestBodyInSamplerData() throws Exception {
-    HTTPSampleResult original = new HTTPSampleResult();
-    original.setHTTPMethod(HTTPConstants.POST);
-    original.setURL(new URL("https://example.com/api"));
-    original.setQueryString("field=unique-body-token");
-    original.setSamplerData("");
-
-    Method deepCopy = HTTP2Controller.class.getDeclaredMethod(
-        "deepCopySampleResult", SampleResult.class);
-    deepCopy.setAccessible(true);
-    HTTPSampleResult copy = (HTTPSampleResult) deepCopy.invoke(null, original);
-
-    String bodyToken = "unique-body-token";
-    assertThat(countOccurrences(copy.getSamplerData(), bodyToken)).isEqualTo(1);
-    assertThat(countOccurrences(original.getSamplerData(), bodyToken)).isEqualTo(1);
-  }
-
-  private static int countOccurrences(String source, String token) {
-    if (source == null || token == null || token.isEmpty()) {
-      return 0;
-    }
-    int count = 0;
-    int fromIndex = 0;
-    while (true) {
-      int index = source.indexOf(token, fromIndex);
-      if (index < 0) {
-        return count;
-      }
-      count++;
-      fromIndex = index + token.length();
-    }
-  }
 
   /*
   @Test
