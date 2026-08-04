@@ -92,6 +92,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       getPropDefault(
           "httpsampler.ignore_failed_embedded_resources", false); // $NON-NLS-1$
 
+  /** How often the concurrent embedded-resources drain checks a pending request for completion. */
+  private static final long EMBEDDED_POLL_INTERVAL_MILLIS = 10;
+
   private static final String HTTP1_UPGRADE_PROPERTY = "HTTP2Sampler.http1_upgrade";
   private static final String PROFILE_PROPERTY = "HTTP2Sampler.profile";
   private static final String ENABLE_HTTP3_PROPERTY = "HTTP2Sampler.enableHttp3";
@@ -406,8 +409,10 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
           HTTP2FutureResponseListener listener =
               new HTTP2FutureResponseListener(HTTP2JettyClient.getJettyBufferingMaxLength());
           this.asyncListener = listener;
-          Request req = client.sampleAsync(this, this.result, listener);
-          req.send(listener); // Fire the Async
+          // The client fires it: dispatching there is what lets an async request take part in the
+          // HTTP/3 vs HTTP/2 race. Sending it from here reached the fallbacks all the same, through
+          // the second stage, but went out as a lone HTTP/3 attempt with nothing racing it.
+          client.dispatchAsync(this, this.result, listener);
           return null;
         } else {
           // If there is a listener, it is processed using the result it had
@@ -636,6 +641,26 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     embedded.setHttp1OnlyCooldownMs(getHttp1OnlyCooldownMs());
     embedded.setH2cCacheTtlMs(getH2cCacheTtlMs());
     embedded.setHttp1UpgradeEnabled(isHttp1UpgradeEnabled());
+    copyTimeoutsToEmbeddedSampler(embedded);
+  }
+
+  /**
+   * Propagates Connect Timeout and Response Timeout to an embedded-resource child sampler.
+   *
+   * <p>JMeter builds its embedded-resource samplers with {@code base.clone()}
+   * ({@code HTTPSamplerBase.ASyncSample}), so they inherit every configured property, timeouts
+   * included. This plugin builds them from a fresh {@link HTTP2Sampler} instead, which reports 0
+   * for both - and 0 means "no timeout" in JMeter, exactly as it does here. The result was that an
+   * embedded request never received a deadline even when the user had configured one on the parent:
+   * {@code HTTP2JettyClient} only calls {@code Request.timeout(..)} for a value above 0, so a
+   * stalled resource left the polling loop in {@link #downloadPageResources} waiting forever.
+   *
+   * <p>The raw property strings are copied rather than the {@code int} values so that "unset" stays
+   * unset instead of becoming a literal "0".
+   */
+  private void copyTimeoutsToEmbeddedSampler(HTTP2Sampler embedded) {
+    embedded.setConnectTimeout(getPropertyAsString(CONNECT_TIMEOUT));
+    embedded.setResponseTimeout(getPropertyAsString(RESPONSE_TIMEOUT));
   }
 
   /**
@@ -1116,6 +1141,17 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
       setSyncRequest(!isConcurrentDwn); // Change default from main request based on sub request
 
+      // Deadline for waiting on a single embedded resource. 0 means "no timeout", the same meaning
+      // JMeter gives it everywhere else: JMeter's own drain
+      // (ResourcesDownloader.invokeAllAndAwaitTermination) has no wait timeout at all and relies
+      // purely on the per-request timeouts, so with 0 configured we wait here as long as JMeter
+      // would. With a value configured, the request itself already carries that deadline (see
+      // HTTP2JettyClient#setTimeouts and copyTimeoutsToEmbeddedSampler), and this is only the
+      // backstop for a completion that never arrives.
+      int embeddedTimeout = this.getResponseTimeout() > 0
+          ? this.getResponseTimeout()
+          : this.requestTimeout;
+
       int fileEmbeddedIndex = 0;
       while (urls.hasNext()) {
         Object binURL = urls.next(); // See catch clause below
@@ -1161,6 +1197,15 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
               setParentSampleSuccess(subres,
                   subres.isSuccessful() && (binRes == null || binRes.isSuccessful()));
               continue;
+            }
+
+            // Honour the configured parallel-download pool size. Previously every URL on the page
+            // was dispatched at once, so the setting only ever mattered for the value 1.
+            if (isConcurrentDwn) {
+              interrupted = awaitEmbeddedDownloadSlot(samplers, subres, maxConcurrentDownloads);
+              if (interrupted) {
+                break;
+              }
             }
 
             HTTP2Sampler h2s = new HTTP2Sampler();
@@ -1216,56 +1261,10 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
           break;
         }
       }
-      int embeddedTimeout = 0; // Use the same timeout for response
-      if (this.getResponseTimeout() > 0) {
-        embeddedTimeout = this.getResponseTimeout();
-      } else {
-        embeddedTimeout = this.requestTimeout;
-      }
-      long start = System.currentTimeMillis();
-
-      // IF for download concurrent embedded resources
-      if (isConcurrentDwn && !samplers.isEmpty()) {
-
-        while (!samplers.isEmpty()) {
-
-          HTTP2Sampler http2Sam = (HTTP2Sampler) samplers.get(0);
-
-          HTTP2FutureResponseListener http2FListener =
-              http2Sam.getFutureResponseListener();
-          while (!interrupted && (http2FListener != null)) {
-            if (http2FListener.isDone() || http2FListener.isCancelled()) {
-              String urlProcesed = http2FListener.getRequest().getURI().toString();
-              LOG.debug("HTTP2 Future Finished, retrying the sample with that data {}",
-                  urlProcesed);
-
-              HTTPSampleResult binRes = (HTTPSampleResult) http2Sam.sample();
-              samplers.remove(0); // Remove the sample
-              LOG.debug("OnComplete " + urlProcesed);
-
-              subres.addSubResult(binRes);
-              setParentSampleSuccess(subres,
-                  subres.isSuccessful() && (binRes == null
-                      || binRes.isSuccessful()));
-              break;
-            }
-            try {
-              Thread.sleep(10);
-            } catch (InterruptedException e) {
-              samplers.clear();
-              interrupted = true;
-            }
-            if (embeddedTimeout > 0 && (System.currentTimeMillis() - start) >= embeddedTimeout) {
-              // TODO: This doesn't stop the async execution, only allow to don't lock execution
-              LOG.debug("Timeout on Wait!");
-              subres.addSubResult(errorResult(new Exception(
-                      "Error downloading embedded resources, execution timeout"),
-                  new HTTPSampleResult(subres)));
-              setParentSampleSuccess(subres, false);
-              break;
-            }
-          }
-        }
+      // Drain whatever is still in flight, in submission order, like JMeter iterates the futures
+      // returned by ResourcesDownloader.invokeAllAndAwaitTermination.
+      while (!interrupted && isConcurrentDwn && !samplers.isEmpty()) {
+        interrupted = drainFirstEmbeddedSampler(samplers, subres, embeddedTimeout);
       }
     }
     setSyncRequest(orgSyncRequest); // Restore the default setting to main request
@@ -1274,6 +1273,171 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       Thread.currentThread().interrupt();
     }
     return res;
+  }
+
+  /**
+   * Blocks until fewer than {@code maxConcurrentDownloads} embedded requests are still in flight,
+   * so a new one can be dispatched.
+   *
+   * <p>Mirrors JMeter's {@code ResourcesDownloader.invokeAllAndAwaitTermination}, which keeps at
+   * most that many tasks running and starts the next one as soon as *any* of them completes.
+   * Waiting on the oldest request instead would leave the other slots idle for as long as it takes
+   * that one to finish, turning a slow resource into a stall for the whole page.
+   *
+   * <p>Requests that already completed stay queued: results are consumed separately, in submission
+   * order, so the reported sub-results keep matching the order the resources appear in the page.
+   *
+   * @return whether the wait was interrupted, in which case pending requests were aborted and the
+   *         queue cleared.
+   */
+  private boolean awaitEmbeddedDownloadSlot(List<TestElement> samplers, HTTPSampleResult subres,
+                                            int maxConcurrentDownloads) {
+    while (true) {
+      // Independent of slot accounting: harvest what is already finished so responses are not left
+      // buffered in the queue for the rest of the page. Never blocks on the head.
+      collectFinishedEmbeddedResults(samplers, subres);
+      if (countInFlightEmbeddedRequests(samplers) < maxConcurrentDownloads) {
+        return false;
+      }
+      try {
+        Thread.sleep(EMBEDDED_POLL_INTERVAL_MILLIS);
+      } catch (InterruptedException e) {
+        abortPendingEmbeddedRequests(samplers);
+        return true;
+      }
+    }
+  }
+
+  /**
+   * Turns the head of {@code samplers} into a sub-result and dequeues it. The caller must have
+   * established that its request finished.
+   */
+  private void consumeFirstEmbeddedSampler(List<TestElement> samplers, HTTPSampleResult subres) {
+    HTTP2Sampler embeddedSampler = (HTTP2Sampler) samplers.get(0);
+    HTTP2FutureResponseListener listener = embeddedSampler.getFutureResponseListener();
+    String processedUrl = listener != null && listener.getRequest() != null
+        ? listener.getRequest().getURI().toString()
+        : "unknown";
+    LOG.debug("Embedded resource finished, re-sampling with that data {}", processedUrl);
+    HTTPSampleResult binRes = (HTTPSampleResult) embeddedSampler.sample();
+    samplers.remove(0);
+    subres.addSubResult(binRes);
+    setParentSampleSuccess(subres,
+        subres.isSuccessful() && (binRes == null || binRes.isSuccessful()));
+  }
+
+  /**
+   * Consumes every already-finished resource at the head of the queue, without ever waiting.
+   *
+   * <p>Freeing a concurrency slot and collecting a result are deliberately separate: a slot is free
+   * as soon as its download finishes (see {@link #countInFlightEmbeddedRequests}), so a slow first
+   * resource never holds back the dispatch of the rest. But nothing used to collect until the whole
+   * page had been dispatched, which left every finished response buffered in the queue in the
+   * meantime. Draining here keeps that buffer as short as the head allows, while sub-results still
+   * come out in the order the resources appear in the page.
+   */
+  private void collectFinishedEmbeddedResults(List<TestElement> samplers,
+                                              HTTPSampleResult subres) {
+    while (!samplers.isEmpty()) {
+      HTTP2FutureResponseListener listener =
+          ((HTTP2Sampler) samplers.get(0)).getFutureResponseListener();
+      if (listener == null) {
+        // Never dispatched, so no completion can arrive: drop it rather than block the queue on it.
+        LOG.debug("Embedded resource has no pending request, dropping it from the queue");
+        samplers.remove(0);
+        continue;
+      }
+      if (!listener.isDone() && !listener.isCancelled()) {
+        return;
+      }
+      consumeFirstEmbeddedSampler(samplers, subres);
+    }
+  }
+
+  private int countInFlightEmbeddedRequests(List<TestElement> samplers) {
+    int inFlight = 0;
+    for (TestElement element : samplers) {
+      HTTP2FutureResponseListener listener =
+          ((HTTP2Sampler) element).getFutureResponseListener();
+      if (listener != null && !listener.isDone() && !listener.isCancelled()) {
+        inFlight++;
+      }
+    }
+    return inFlight;
+  }
+
+  /**
+   * Aborts whatever is still in flight and empties the queue, the way JMeter cancels the futures it
+   * submitted when the drain is interrupted (bug 51925), so a stopped test does not leak requests.
+   */
+  private void abortPendingEmbeddedRequests(List<TestElement> samplers) {
+    for (TestElement element : samplers) {
+      HTTP2FutureResponseListener listener =
+          ((HTTP2Sampler) element).getFutureResponseListener();
+      if (listener != null && !listener.isDone() && !listener.isCancelled()) {
+        listener.cancel(true);
+      }
+    }
+    samplers.clear();
+  }
+
+  /**
+   * Waits for the first still-pending embedded resource in {@code samplers}, appends its result to
+   * {@code subres} and dequeues it. Always dequeues, so the caller's loop makes progress on every
+   * call.
+   *
+   * @param embeddedTimeout how long to wait for this one resource, or 0 to wait indefinitely (see
+   *                        {@link #downloadPageResources} on why 0 matches JMeter).
+   * @return whether the wait was interrupted, in which case the queue has been cleared.
+   */
+  private boolean drainFirstEmbeddedSampler(List<TestElement> samplers, HTTPSampleResult subres,
+                                            int embeddedTimeout) {
+    HTTP2Sampler embeddedSampler = (HTTP2Sampler) samplers.get(0);
+    HTTP2FutureResponseListener listener = embeddedSampler.getFutureResponseListener();
+    if (listener == null) {
+      // The request was never dispatched (the async send threw), so no completion can ever arrive.
+      // Dequeue it: leaving it at the head made the caller re-select it forever without sleeping.
+      LOG.debug("Embedded resource has no pending request, dropping it from the queue");
+      samplers.remove(0);
+      return false;
+    }
+
+    // Measured per resource, from when its request was dispatched, so it lines up with the deadline
+    // the request itself carries. Timing from the moment this resource reaches the head of the
+    // queue instead would grant it a fresh full timeout on top of however long it already waited;
+    // timing the whole page from a single start (as this used to) went the other way and expired
+    // resources that had in fact completed normally.
+    long start = listener.getResponseStart() > 0
+        ? listener.getResponseStart()
+        : System.currentTimeMillis();
+    while (true) {
+      if (listener.isDone() || listener.isCancelled()) {
+        consumeFirstEmbeddedSampler(samplers, subres);
+        return false;
+      }
+      try {
+        Thread.sleep(EMBEDDED_POLL_INTERVAL_MILLIS);
+      } catch (InterruptedException e) {
+        abortPendingEmbeddedRequests(samplers);
+        return true;
+      }
+      if (embeddedTimeout > 0 && (System.currentTimeMillis() - start) >= embeddedTimeout) {
+        String pendingUrl = listener.getRequest() != null
+            ? listener.getRequest().getURI().toString()
+            : "unknown";
+        LOG.warn("Timeout after {}ms waiting for embedded resource {}", embeddedTimeout,
+            pendingUrl);
+        // Dequeue and abort before returning: without this the caller re-selects the same head, and
+        // aborting is what releases the underlying Jetty request instead of leaking it.
+        samplers.remove(0);
+        listener.cancel(true);
+        subres.addSubResult(errorResult(new Exception(
+                "Error downloading embedded resources, execution timeout"),
+            new HTTPSampleResult(subres)));
+        setParentSampleSuccess(subres, false);
+        return false;
+      }
+    }
   }
 
   @Override
@@ -1379,8 +1543,16 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     for (HTTP2JettyClient client : clients.values()) {
       try {
         client.stop();
+      } catch (InterruptedException e) {
+        // JMeter Stop interrupts the thread before threadFinished; Jetty shutdown is interruptible.
+        Thread.currentThread().interrupt();
+        LOG.debug("Interrupted while closing BlazeMeter HTTP connection (test stopped)");
       } catch (Exception e) {
-        LOG.error("Error while closing connection", e);
+        if (HTTP2JettyClient.isExpectedShutdownException(e)) {
+          LOG.debug("BlazeMeter HTTP connection closed during test stop: {}", e.toString());
+        } else {
+          LOG.error("Error while closing connection", e);
+        }
       }
     }
     clients.clear();

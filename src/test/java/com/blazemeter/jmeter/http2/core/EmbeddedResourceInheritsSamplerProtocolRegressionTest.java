@@ -14,7 +14,6 @@ import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
-import java.util.Map;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.samplers.SampleResult;
@@ -46,7 +45,7 @@ public class EmbeddedResourceInheritsSamplerProtocolRegressionTest extends HTTP2
 
   @Before
   public void setUp() throws Exception {
-    clearHttp1OnlyOriginCache();
+    HTTP2JettyClientTestIsolation.resetSharedClientState();
 
     serverAssetOrigin = new ServerBuilder()
         .withHTTP2()
@@ -62,6 +61,7 @@ public class EmbeddedResourceInheritsSamplerProtocolRegressionTest extends HTTP2
     warmupHttp1OnlySampler.setEnableHttp3(false);
     warmupHttp1OnlySampler.setEnableHttp1(true);
     warmupHttp1OnlySampler.setEnableHttp2(false);
+    warmupHttp1OnlySampler.setAlpnEnabled(false);
     invokeSample(warmupHttp1OnlySampler, httpsUrl(assetPort, SERVER_PATH_200));
     warmupHttp1OnlySampler.threadFinished();
 
@@ -96,6 +96,9 @@ public class EmbeddedResourceInheritsSamplerProtocolRegressionTest extends HTTP2
     h2Sampler.setEnableHttp3(false);
     h2Sampler.setEnableHttp1(false);
     h2Sampler.setEnableHttp2(true);
+    // Without an explicit ALPN flag, a leaked suite-wide alpnEnabled=false drops h2 from the
+    // transport and the embedded download never produces an HTTP/2 subsample.
+    h2Sampler.setAlpnEnabled(true);
     try {
       HTTPSampleResult pageResult =
           invokeSample(h2Sampler, httpsUrl(pagePort, SERVER_PATH_200_EMBEDDED_CROSS_ORIGIN));
@@ -150,15 +153,6 @@ public class EmbeddedResourceInheritsSamplerProtocolRegressionTest extends HTTP2
       }
     }
     return null;
-  }
-
-  @SuppressWarnings("unchecked")
-  private static void clearHttp1OnlyOriginCache() throws Exception {
-    java.lang.reflect.Field field =
-        HTTP2JettyClient.class.getDeclaredField("HTTP1_ONLY_CACHE");
-    field.setAccessible(true);
-    Map<Object, Object> map = (Map<Object, Object>) field.get(null);
-    map.clear();
   }
 
   private static void stopQuietly(TeardownableServer server) {

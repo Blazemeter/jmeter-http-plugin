@@ -1750,8 +1750,10 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     client = new HTTP2JettyClient(true, "Test");
     client.start();
     HTTPSampleResult result = buildBaseResult(createURL(SERVER_PATH_200), HTTPConstants.GET);
-    Request httpRequest = client.sampleAsync(sampler, result, sampler.getFutureResponseListener());
-    httpRequest.send(listener);
+    // dispatchAsync, not sampleAsync + Request.send: the client owns dispatching so the request can
+    // take part in the HTTP/3 vs HTTP/2 race. Sending it here instead selected HTTP/3 for this
+    // first contact and then fired it with no competing attempt, i.e. HTTP/3-only.
+    client.dispatchAsync(sampler, result, sampler.getFutureResponseListener());
     // Goes through sampleFromListener() -> getContent(), the single place that owns the
     // HTTP/1.1 fallback decision (the listener no longer resolves protocol_error on its own).
     HTTPSampleResult sampleResult = client.sampleFromListener(sampler, result, false, 0, listener);
