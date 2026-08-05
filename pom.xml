@@ -31,6 +31,10 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <jmeter.version>5.5</jmeter.version>
+    <jmeter.regression.version>5.6.3</jmeter.regression.version>
+    <jmeter.regression.tests>TEST_HTTP,ResponseDecompression,TestHeaderManager,TestCookieManager</jmeter.regression.tests>
+    <jmeter.regression.extended.tests>HTMLParserTestFile_2,TEST_HTTPS,Http4ImplDigestAuth,Http4ImplPreemptiveBasicAuth</jmeter.regression.extended.tests>
+    <jmeter.regression.external.tests>TestKeepAlive,TestRedirectionPolicies</jmeter.regression.external.tests>
     <jetty.version>12.1.11</jetty.version>
     <!-- Matches the log4j that JMeter 5.6.x ships in lib/, which provides the API at runtime. -->
     <log4j.version>2.22.1</log4j.version>
@@ -51,6 +55,18 @@
       <version>${jmeter.version}</version>
       <scope>provided</scope>
     </dependency>
+    <dependency>
+      <groupId>org.apache.jmeter</groupId>
+      <artifactId>ApacheJMeter_components</artifactId>
+      <version>${jmeter.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.jmeter</groupId>
+      <artifactId>ApacheJMeter_java</artifactId>
+      <version>${jmeter.version}</version>
+      <scope>test</scope>
+    </dependency>
     <!-- Apache HttpClient for compilation (classes used in JettyCacheManager) -->
     <!-- Using same version as JMeter 5.5 (our minimum supported version) -->
     <dependency>
@@ -64,6 +80,12 @@
       <artifactId>httpclient</artifactId>
       <version>4.5.14</version>
       <scope>compile</scope>
+    </dependency>
+    <dependency>
+      <groupId>commons-io</groupId>
+      <artifactId>commons-io</artifactId>
+      <version>2.15.1</version>
+      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.commons</groupId>
@@ -522,7 +544,14 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-checkstyle-plugin</artifactId>
-        <version>3.1.0</version>
+        <version>3.3.1</version>
+        <dependencies>
+          <dependency>
+            <groupId>com.puppycrawl.tools</groupId>
+            <artifactId>checkstyle</artifactId>
+            <version>10.17.0</version>
+          </dependency>
+        </dependencies>
         <executions>
           <execution>
             <id>validate</id>
@@ -544,9 +573,13 @@
         <artifactId>maven-failsafe-plugin</artifactId>
         <version>2.22.2</version>
         <configuration>
+          <useSystemClassLoader>false</useSystemClassLoader>
           <includes>
             <include>**/*IntegrationTest.java</include>
           </includes>
+          <excludes>
+            <exclude>**/regression/**</exclude>
+          </excludes>
           <!-- Same clash as in surefire above: the shaded-jar-only SLF4J binding must stay off the
                unshaded test classpath. -->
           <classpathDependencyExcludes>
@@ -701,6 +734,118 @@
               <publishingServerId>central</publishingServerId>
               <autoPublish>true</autoPublish>
               <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
+      <id>jmeter-regression</id>
+      <properties>
+        <checkstyle.skip>true</checkstyle.skip>
+        <skipTests>true</skipTests>
+        <jmeter.regression>true</jmeter.regression>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <skip>true</skip>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <skipTests>false</skipTests>
+              <includes>
+                <include>**/regression/**/*IntegrationTest.java</include>
+              </includes>
+              <excludes combine.self="override"/>
+              <systemPropertyVariables>
+                <jmeter.regression>${jmeter.regression}</jmeter.regression>
+                <jmeter.regression.tests>${jmeter.regression.tests}</jmeter.regression.tests>
+                <jmeter.regression.tier>${jmeter.regression.tier}</jmeter.regression.tier>
+                <jmeter.regression.version>${jmeter.regression.version}</jmeter.regression.version>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
+      <id>jmeter-regression-extended</id>
+      <properties>
+        <checkstyle.skip>true</checkstyle.skip>
+        <skipTests>true</skipTests>
+        <jmeter.regression>true</jmeter.regression>
+        <jmeter.regression.tier>extended</jmeter.regression.tier>
+        <jmeter.regression.tests>${jmeter.regression.extended.tests}</jmeter.regression.tests>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <skip>true</skip>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <skipTests>false</skipTests>
+              <includes>
+                <include>**/regression/**/*IntegrationTest.java</include>
+              </includes>
+              <excludes combine.self="override"/>
+              <systemPropertyVariables>
+                <jmeter.regression>${jmeter.regression}</jmeter.regression>
+                <jmeter.regression.tests>${jmeter.regression.tests}</jmeter.regression.tests>
+                <jmeter.regression.tier>${jmeter.regression.tier}</jmeter.regression.tier>
+                <jmeter.regression.version>${jmeter.regression.version}</jmeter.regression.version>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
+      <id>jmeter-regression-external</id>
+      <properties>
+        <checkstyle.skip>true</checkstyle.skip>
+        <skipTests>true</skipTests>
+        <jmeter.regression>true</jmeter.regression>
+        <jmeter.regression.tier>external</jmeter.regression.tier>
+        <jmeter.regression.tests>${jmeter.regression.external.tests}</jmeter.regression.tests>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <skip>true</skip>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <skipTests>false</skipTests>
+              <includes>
+                <include>**/regression/**/*IntegrationTest.java</include>
+              </includes>
+              <excludes combine.self="override"/>
+              <systemPropertyVariables>
+                <jmeter.regression>${jmeter.regression}</jmeter.regression>
+                <jmeter.regression.tests>${jmeter.regression.tests}</jmeter.regression.tests>
+                <jmeter.regression.tier>${jmeter.regression.tier}</jmeter.regression.tier>
+                <jmeter.regression.version>${jmeter.regression.version}</jmeter.regression.version>
+              </systemPropertyVariables>
             </configuration>
           </plugin>
         </plugins>

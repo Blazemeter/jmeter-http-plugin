@@ -443,6 +443,15 @@ Uses **Maven 3** from the repository root:
 
 Artifacts land under **`target/`**. Compilation uses the **`jmeter.version`** declared in **`pom.xml`**; at runtime install the packaged JAR against the JMeter build you intend to run and validate with a short smoke plan.
 
+### HTTP parity regression (JMeter 5.6.3 test plans)
+
+To compare **HttpClient4** with the migrated **BlazeMeter HTTP** sampler against Apache’s official `bin/testfiles` JMX plans, see **[docs/jmeter-regression.md](docs/jmeter-regression.md)**.
+
+```bash
+mvn -Dcheckstyle.skip=true package
+mvn -Pjmeter-regression verify
+```
+
 
 <a id="readme-license"></a>
 ## License
