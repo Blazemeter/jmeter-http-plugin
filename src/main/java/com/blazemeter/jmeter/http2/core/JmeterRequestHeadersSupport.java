@@ -78,7 +78,6 @@ final class JmeterRequestHeadersSupport {
     }
   }
 
-
   /**
    * Matches {@code HTTPHC4Impl}: when no {@code User-Agent} is configured, send a plugin default
    * unless {@code httpclient4.default_user_agent_disabled=true}.
