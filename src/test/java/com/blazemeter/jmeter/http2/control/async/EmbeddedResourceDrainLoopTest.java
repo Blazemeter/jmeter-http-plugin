@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
+import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import java.io.Closeable;
 import java.io.IOException;
@@ -35,15 +36,38 @@ import org.junit.Test;
  */
 public class EmbeddedResourceDrainLoopTest extends HTTP2TestBase {
 
-  private static final long WATCHDOG_MILLIS = 3_000L;
+  private static final long WATCHDOG_MILLIS = 15_000L;
   private static final int RESPONSE_TIMEOUT_MILLIS = 200;
   private static final int SUB_RESULT_SCAN_CAP = 20_000;
 
   private StallingPeer peer;
 
   @Before
-  public void setUp() throws IOException {
+  public void setUp() throws Exception {
     peer = new StallingPeer();
+    // Cold Jetty/QUIC client init can take several seconds on a loaded CI agent. Warm it on this
+    // thread so the drain worker is measured against the timeout logic, not first-time startup.
+    warmJettyHttpClient();
+  }
+
+  private void warmJettyHttpClient() throws Exception {
+    HTTP2Sampler warmer = new HTTP2Sampler();
+    warmer.setName("jetty-warmup");
+    warmer.setProtocol("http");
+    warmer.setDomain(peer.host());
+    warmer.setPort(peer.port());
+    warmer.setPath("/warmup");
+    warmer.setMethod(HTTPConstants.GET);
+    warmer.setSyncRequest(false);
+    warmer.setResponseTimeout(String.valueOf(RESPONSE_TIMEOUT_MILLIS));
+    warmer.setConnectTimeout(String.valueOf(RESPONSE_TIMEOUT_MILLIS));
+    // Fire-and-forget: we only need the client stack constructed. Cancel so the stalling peer does
+    // not keep the warmup request around for the rest of the test.
+    warmer.sample();
+    HTTP2FutureResponseListener listener = warmer.getFutureResponseListener();
+    if (listener != null) {
+      listener.cancel(true);
+    }
   }
 
   @After

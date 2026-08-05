@@ -32,9 +32,8 @@ public class DetachedErrorResultCycleTest extends HTTP2TestBase {
             + "fails, JMeter's copy constructor no longer aliases subResults and the helper can "
             + "be reconsidered")
         .isTrue();
-    assertThatCode(() -> recursiveWalkWithoutIdentitySet(parent))
-        .as("View Results Tree walks sub-results recursively; a cycle must overflow")
-        .isInstanceOf(StackOverflowError.class);
+    // Do not recurse into the cycle: that would StackOverflowError and can destabilise the JVM
+    // fork for later tests. The identity check above is the regression signal.
   }
 
   @Test

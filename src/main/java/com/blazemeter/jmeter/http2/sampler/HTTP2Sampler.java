@@ -1133,7 +1133,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
             // Honour the configured parallel-download pool size. Previously every URL on the page
             // was dispatched at once, so the setting only ever mattered for the value 1.
             if (isConcurrentDwn) {
-              interrupted = awaitEmbeddedDownloadSlot(samplers, subres, maxConcurrentDownloads);
+              interrupted = awaitEmbeddedDownloadSlot(samplers, subres, maxConcurrentDownloads,
+                  embeddedTimeout);
               if (interrupted) {
                 break;
               }
@@ -1222,13 +1223,27 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
    *         queue cleared.
    */
   private boolean awaitEmbeddedDownloadSlot(List<TestElement> samplers, HTTPSampleResult subres,
-                                            int maxConcurrentDownloads) {
+                                            int maxConcurrentDownloads, int embeddedTimeout) {
+    long waitStartedAt = System.currentTimeMillis();
     while (true) {
       // Independent of slot accounting: harvest what is already finished so responses are not left
       // buffered in the queue for the rest of the page. Never blocks on the head.
       collectFinishedEmbeddedResults(samplers, subres);
       if (countInFlightEmbeddedRequests(samplers) < maxConcurrentDownloads) {
         return false;
+      }
+      // Without a deadline here, a full pool of stalled requests freezes dispatch forever even when
+      // the user configured a response timeout - the drain timeout only runs after every URL has
+      // been queued, which never happens if we cannot free a slot.
+      if (embeddedTimeout > 0
+          && (System.currentTimeMillis() - waitStartedAt) >= embeddedTimeout) {
+        LOG.warn("Timeout after {}ms waiting for an embedded download slot; aborting pending "
+            + "resources", embeddedTimeout);
+        abortPendingEmbeddedRequests(samplers);
+        subres.addSubResult(detachedErrorResult(new Exception(
+            "Error downloading embedded resources, execution timeout"), subres));
+        setParentSampleSuccess(subres, false);
+        return true;
       }
       try {
         Thread.sleep(EMBEDDED_POLL_INTERVAL_MILLIS);
