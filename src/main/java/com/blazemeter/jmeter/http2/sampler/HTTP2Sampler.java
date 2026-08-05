@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Predicate;
 import java.util.regex.PatternSyntaxException;
 import org.apache.commons.lang3.StringUtils;
@@ -436,7 +437,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       }
       return buildErrorResult(e, this.result);
     } catch (Exception e) {
-      LOG.error("BlazeMeter HTTP sample failed", e);
+      logSampleFailure(e);
 
       Throwable cause = e.getCause();
       String causeInfo = cause != null
@@ -546,6 +547,29 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     return errorResult(
         JmeterHttpClientExceptionMapper.forSampleResult(e, getAutoRedirects(), result.getURL()),
         result);
+  }
+
+  /**
+   * Timeouts are expected sample outcomes under load (configured response timeout, stalled peer).
+   * They must fail the {@link SampleResult}, but must not flood {@code jmeter.log} at ERROR with a
+   * stack trace the way an unexpected plugin bug would.
+   */
+  private void logSampleFailure(Exception e) {
+    if (isExpectedSampleFailure(e)) {
+      LOG.debug("BlazeMeter HTTP sample failed", e);
+    } else {
+      LOG.error("BlazeMeter HTTP sample failed", e);
+    }
+  }
+
+  @VisibleForTesting
+  static boolean isExpectedSampleFailure(Throwable failure) {
+    for (Throwable current = failure; current != null; current = current.getCause()) {
+      if (current instanceof TimeoutException || current instanceof SocketTimeoutException) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

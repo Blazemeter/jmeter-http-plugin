@@ -2286,7 +2286,8 @@ public class HTTP2JettyClient {
     } catch (TimeoutException e) {
       long endGet = System.currentTimeMillis();
       long elapsed = endGet - getStart;
-      LOG.error("Request timeout after {}ms: {}", elapsed, e.getMessage());
+      // Timeout is a configured sample outcome; the sampler still records a failed result.
+      LOG.debug("Request timeout after {}ms: {}", elapsed, e.getMessage());
       if (originalRequest != null) {
         try {
           ContentResponse fallback =
