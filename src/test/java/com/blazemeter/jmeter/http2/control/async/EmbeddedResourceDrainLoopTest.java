@@ -1,6 +1,7 @@
 package com.blazemeter.jmeter.http2.control.async;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
@@ -115,13 +116,22 @@ public class EmbeddedResourceDrainLoopTest extends HTTP2TestBase {
     assertThat(directSubResults)
         .as("one timed-out embedded resource must produce one error sub-result, not one per poll")
         .isLessThanOrEqualTo(2);
+    assertThat(failure.get())
+        .as("timeout handling must not throw (including StackOverflowError from a cyclic "
+            + "sub-result graph)")
+        .isNull();
+    assertThatCode(() -> recursiveWalkWithoutIdentitySet(container))
+        .as("timeout error sub-results must not form a self-referential graph that overflows a "
+            + "naive tree walk (View Results Tree)")
+        .doesNotThrowAnyException();
   }
 
   /**
-   * Walks the sub-result graph with an identity set and a cap. Both are needed: the error sub-results
-   * are built with the {@code HTTPSampleResult(HTTPSampleResult)} copy constructor from the container
-   * that already holds the previous ones, so the structure is deep and self-referential enough that a
-   * plain recursive count blows its own stack, which is itself a symptom.
+   * Walks the sub-result graph with an identity set and a cap. Both are needed: before the
+   * detached-error fix, the error sub-results were built with the
+   * {@code HTTPSampleResult(HTTPSampleResult)} copy constructor from the container that already
+   * holds the previous ones, so the structure is deep and self-referential enough that a plain
+   * recursive count blows its own stack, which is itself a symptom.
    */
   private static String describeReachable(SampleResult result) {
     java.util.Set<SampleResult> seen =
@@ -146,6 +156,26 @@ public class EmbeddedResourceDrainLoopTest extends HTTP2TestBase {
       }
     }
     return seen.size() + (capped ? "+ (capped)" : "");
+  }
+
+  private static final int RECURSIVE_WALK_DEPTH_CAP = 10_000;
+
+  private static int recursiveWalkWithoutIdentitySet(SampleResult node) {
+    return recursiveWalkWithoutIdentitySet(node, 0);
+  }
+
+  private static int recursiveWalkWithoutIdentitySet(SampleResult node, int depth) {
+    if (depth > RECURSIVE_WALK_DEPTH_CAP) {
+      throw new StackOverflowError("sub-result walk exceeded depth " + RECURSIVE_WALK_DEPTH_CAP);
+    }
+    int count = 1;
+    SampleResult[] subs = node.getSubResults();
+    if (subs != null) {
+      for (SampleResult sub : subs) {
+        count += recursiveWalkWithoutIdentitySet(sub, depth + 1);
+      }
+    }
+    return count;
   }
 
   /** Exposes the protected embedded-resource download so the drain loop can be driven directly. */

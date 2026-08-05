@@ -539,6 +539,18 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   }
 
   /**
+   * Builds an error sub-result from {@code parent} without inheriting its sub-result list.
+   * {@link HTTPSampleResult#HTTPSampleResult(HTTPSampleResult)} copies {@code subResults} by
+   * reference; adding that copy back onto the parent would make the error result a child of itself
+   * and crash View Results Tree with {@link StackOverflowError} when it walks the tree.
+   */
+  HTTPSampleResult detachedErrorResult(Throwable cause, HTTPSampleResult parent) {
+    HTTPSampleResult err = new HTTPSampleResult(parent);
+    err.removeSubResults();
+    return errorResult(cause, err);
+  }
+
+  /**
    * Copies Jetty/ALPN/protocol flags from this sampler onto an embedded-resource child sampler so
    * child requests obey the same profile as the parent. Without this, a fresh {@link HTTP2Sampler}
    * falls back to default profile semantics (typically HTTP/1.1 enabled), which incorrectly applies
@@ -1011,7 +1023,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     } catch (LinkExtractorParseException e) {
       e.printStackTrace(System.err);
       // Don't break the world just because this failed:
-      res.addSubResult(errorResult(e, new HTTPSampleResult(res)));
+      res.addSubResult(detachedErrorResult(e, res));
       setParentSampleSuccess(res, false);
     }
 
@@ -1084,9 +1096,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
             try {
               url = escapeIllegalURLCharacters(url);
             } catch (Exception e) { // NOSONAR
-              subres.addSubResult(
-                  errorResult(new Exception(url.toString() + " is not a correct URI", e),
-                      new HTTPSampleResult(res)));
+              subres.addSubResult(detachedErrorResult(
+                  new Exception(url.toString() + " is not a correct URI", e), subres));
               setParentSampleSuccess(subres, false);
               continue;
             }
@@ -1099,9 +1110,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
             try {
               url = url.toURI().normalize().toURL();
             } catch (MalformedURLException | URISyntaxException e) {
-              subres.addSubResult(
-                  errorResult(new Exception(url.toString() + " URI can not be normalized", e),
-                      new HTTPSampleResult(subres)));
+              subres.addSubResult(detachedErrorResult(
+                  new Exception(url.toString() + " URI can not be normalized", e), subres));
               setParentSampleSuccess(subres, false);
               continue;
             }
@@ -1174,8 +1184,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
             }
           }
         } catch (ClassCastException e) { // NOSONAR
-          subres.addSubResult(errorResult(new Exception(binURL + " is not a correct URI", e),
-              new HTTPSampleResult(subres)));
+          subres.addSubResult(detachedErrorResult(
+              new Exception(binURL + " is not a correct URI", e), subres));
           setParentSampleSuccess(subres, false);
         }
         if (interrupted) {
@@ -1352,9 +1362,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         // aborting is what releases the underlying Jetty request instead of leaking it.
         samplers.remove(0);
         listener.cancel(true);
-        subres.addSubResult(errorResult(new Exception(
-                "Error downloading embedded resources, execution timeout"),
-            new HTTPSampleResult(subres)));
+        subres.addSubResult(detachedErrorResult(new Exception(
+            "Error downloading embedded resources, execution timeout"), subres));
         setParentSampleSuccess(subres, false);
         return false;
       }
