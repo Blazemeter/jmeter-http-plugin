@@ -1627,7 +1627,7 @@ public class HTTP2JettyClient {
     if (headerBytes > result.getSentBytes()) {
       result.setSentBytes(headerBytes);
     }
-    setResultContentResponse(result, contentResponse);
+    setResultContentResponse(sampler, result, contentResponse);
     saveCookiesInCookieManager(contentResponse, request.getURI().toURL(),
         sampler.getCookieManager());
 
@@ -1773,7 +1773,7 @@ public class HTTP2JettyClient {
     }
 
     result.sampleEnd();
-    result.setResponseData(output.toByteArray());
+    applyResponseData(sampler, result, output.toByteArray());
     result.setBodySize(totalBytes);
     result.setResponseCodeOK();
     result.setResponseMessageOK();
@@ -4409,7 +4409,32 @@ public class HTTP2JettyClient {
     }
   }
 
-  private void setResultContentResponse(HTTPSampleResult result,
+  /**
+   * Stores response bytes, or their MD5 digest when the sampler asked for it — the same contract as
+   * {@code HTTPSamplerBase.readResponse}: body becomes the hex digest and {@code bytes} keeps the
+   * original size.
+   */
+  private static void applyResponseData(HTTP2Sampler sampler, HTTPSampleResult result,
+                                        byte[] responseContent) {
+    if (responseContent == null) {
+      result.setResponseData(new byte[0]);
+      return;
+    }
+    if (sampler != null && sampler.useMD5()) {
+      try {
+        java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+        byte[] digest = md.digest(responseContent);
+        result.setBytes(responseContent.length);
+        result.setResponseData(org.apache.jorphan.util.JOrphanUtils.baToHexBytes(digest));
+        return;
+      } catch (java.security.NoSuchAlgorithmException e) {
+        LOG.error("Should not happen - could not find MD5 digest", e);
+      }
+    }
+    result.setResponseData(responseContent);
+  }
+
+  private void setResultContentResponse(HTTP2Sampler sampler, HTTPSampleResult result,
                                         ContentResponse contentResponse) throws IOException {
     if (LowLevelDebugLog.isEnabled()) {
       int headerCount = contentResponse.getHeaders() != null
@@ -4435,7 +4460,7 @@ public class HTTP2JettyClient {
     byte[] responseContent = maybeDecodeCompressedContent(contentResponse);
     // JMeter parity: optionally truncate stored response data while keeping full bodySize.
     responseContent = maybeTruncateStoredResponseData(result, responseContent);
-    result.setResponseData(responseContent);
+    applyResponseData(sampler, result, responseContent);
 
     if (result.getEndTime() == 0) {
       result.sampleEnd();

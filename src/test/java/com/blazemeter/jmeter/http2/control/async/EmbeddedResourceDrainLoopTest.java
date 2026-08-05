@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
+import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import java.io.Closeable;
 import java.io.IOException;
@@ -148,6 +149,188 @@ public class EmbeddedResourceDrainLoopTest extends HTTP2TestBase {
         .as("timeout error sub-results must not form a self-referential graph that overflows a "
             + "naive tree walk (View Results Tree)")
         .doesNotThrowAnyException();
+
+    SampleResult[] subs = container.getSubResults();
+    assertThat(subs).isNotNull();
+    HTTPSampleResult timedOutChild = null;
+    for (SampleResult sub : subs) {
+      HTTPSampleResult httpSub = (HTTPSampleResult) sub;
+      if (httpSub.getURL() != null
+          && httpSub.getURL().getPath().contains("stalls-forever.png")) {
+        timedOutChild = httpSub;
+        break;
+      }
+    }
+    assertThat(timedOutChild)
+        .as("the timed-out embedded resource must be reported under its own URL, not as a clone "
+            + "of the parent page (JMeter HC4 socket-timeout shape)")
+        .isNotNull();
+    assertThat(timedOutChild.isSuccessful()).isFalse();
+    assertThat(timedOutChild.getResponseMessage())
+        .as("timeout should surface like JMeter's socket read timeout")
+        .containsIgnoringCase("timed out");
+    assertThat(container.isSuccessful())
+        .as("the page container must be marked failed when an embedded resource times out")
+        .isFalse();
+    assertThat(container.getResponseMessage())
+        .as("parent message should aggregate failed embedded URLs like JMeter")
+        .contains("Embedded resource download error:")
+        .contains("stalls-forever.png");
+    assertThat(timedOutChild.getURL().getPath())
+        .isNotEqualTo(page.getURL().getPath());
+    assertThat(timedOutChild.getTime())
+        .as("timed-out child must report the wait until give-up, not a ~0ms sampleStart/sampleEnd "
+            + "pair; that elapsed end time is what pushes the parent container's clock forward")
+        .isGreaterThanOrEqualTo(RESPONSE_TIMEOUT_MILLIS);
+    assertThat(container.getEndTime())
+        .as("parent end time must advance to cover the embedded timeout wait (addSubResult takes "
+            + "max of child end times)")
+        .isGreaterThanOrEqualTo(timedOutChild.getEndTime());
+    assertThat(timedOutChild.getConnectTime())
+        .as("a poll-aborted attempt never completed the handshake/response, so connect stays 0 "
+            + "rather than copying the parent's connect")
+        .isZero();
+    assertThat(timedOutChild.getLatency()).isZero();
+    assertThat(timedOutChild.getSampleLabel())
+        .as("timeout child must not keep the default sampler class name; addSubResult may rename "
+            + "to parent-N when SampleResult.isRenameSampleLabel() is on")
+        .doesNotContain("bzm - HTTP Sampler");
+    assertThat(timedOutChild.getUrlAsString()).contains("stalls-forever.png");
+  }
+
+  /**
+   * When the concurrent pool is full and the slot wait times out, previously we aborted the page
+   * and never dispatched remaining URLs. JMeter keeps scheduling; we must fail only in-flight work
+   * and continue the URL list.
+   */
+  @Test
+  public void slotTimeoutMustStillDispatchRemainingEmbeddedUrls() throws Exception {
+    ProbeSampler sampler = new ProbeSampler();
+    sampler.setName("main-page");
+    sampler.setProtocol("http");
+    sampler.setDomain(peer.host());
+    sampler.setPort(peer.port());
+    sampler.setPath("/");
+    sampler.setMethod(HTTPConstants.GET);
+    sampler.setConcurrentDwn(true);
+    // Pool size 1 forces serial mode in downloadPageResources; use 2 so slot waits can fire.
+    sampler.setConcurrentPool("2");
+    sampler.setImageParser(true);
+    sampler.setResponseTimeout(String.valueOf(RESPONSE_TIMEOUT_MILLIS));
+
+    HTTPSampleResult page = new HTTPSampleResult();
+    page.setSampleLabel("main-page");
+    page.setContentType("text/html; charset=UTF-8");
+    page.setDataType(SampleResult.TEXT);
+    page.setURL(new java.net.URL("http", peer.host(), peer.port(), "/"));
+    page.sampleStart();
+    page.setResponseData(
+        "<html><body>"
+            + "<img src=\"/stall-a.png\">"
+            + "<img src=\"/stall-b.png\">"
+            + "<img src=\"/stall-c.png\">"
+            + "</body></html>",
+        StandardCharsets.UTF_8.name());
+    page.setResponseCodeOK();
+    page.setSuccessful(true);
+    page.sampleEnd();
+
+    AtomicReference<HTTPSampleResult> drained = new AtomicReference<>();
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    Thread worker = new Thread(() -> {
+      try {
+        drained.set(sampler.drainEmbeddedResources(page));
+      } catch (Throwable t) {
+        failure.set(t);
+      }
+    }, "embedded-slot-timeout");
+    worker.setDaemon(true);
+    worker.start();
+    worker.join(WATCHDOG_MILLIS);
+    boolean stillRunning = worker.isAlive();
+    if (stillRunning) {
+      worker.interrupt();
+      worker.join(2_000L);
+    }
+
+    assertThat(stillRunning).isFalse();
+    assertThat(failure.get()).isNull();
+    HTTPSampleResult container = drained.get() == null ? page : drained.get();
+    SampleResult[] subs = container.getSubResults();
+    assertThat(subs).isNotNull();
+
+    java.util.Set<String> timedOutPaths = new java.util.HashSet<>();
+    for (SampleResult sub : subs) {
+      HTTPSampleResult httpSub = (HTTPSampleResult) sub;
+      if (httpSub.getURL() != null && httpSub.getURL().getPath().startsWith("/stall-")) {
+        timedOutPaths.add(httpSub.getURL().getPath());
+        assertThat(httpSub.isSuccessful()).isFalse();
+      }
+    }
+    assertThat(timedOutPaths)
+        .as("after a slot timeout, remaining undispatched URLs must still be attempted "
+            + "(reported as failed children), not abandoned")
+        .contains("/stall-a.png", "/stall-b.png", "/stall-c.png");
+  }
+
+  /**
+   * If async dispatch fails before a listener is published, the error result must be attached
+   * immediately. Queuing a sampler with a null listener used to drop it silently in the drain.
+   */
+  @Test
+  public void failedEmbeddedDispatchWithoutListenerMustAttachErrorSubResult() throws Exception {
+    HTTP2JettyClient failingClient = org.mockito.Mockito.mock(HTTP2JettyClient.class);
+    org.mockito.Mockito.when(failingClient.getMaxBufferSize()).thenReturn(1024 * 1024);
+    org.mockito.Mockito.when(failingClient.getRequestTimeout()).thenReturn(60_000);
+    org.mockito.Mockito.when(failingClient.dispatchAsync(
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any()))
+        .thenThrow(new IOException("forced dispatch failure for regression test"));
+
+    ProbeSampler sampler = new FailingDispatchProbeSampler(failingClient);
+    sampler.setName("main-page");
+    sampler.setProtocol("http");
+    sampler.setDomain(peer.host());
+    sampler.setPort(peer.port());
+    sampler.setPath("/");
+    sampler.setMethod(HTTPConstants.GET);
+    sampler.setConcurrentDwn(true);
+    sampler.setConcurrentPool("4");
+    sampler.setImageParser(true);
+    sampler.setResponseTimeout(String.valueOf(RESPONSE_TIMEOUT_MILLIS));
+
+    HTTPSampleResult page = new HTTPSampleResult();
+    page.setSampleLabel("main-page");
+    page.setContentType("text/html; charset=UTF-8");
+    page.setDataType(SampleResult.TEXT);
+    page.setURL(new java.net.URL("http", peer.host(), peer.port(), "/"));
+    page.sampleStart();
+    page.setResponseData(
+        "<html><body><img src=\"/never-dispatched.png\"></body></html>",
+        StandardCharsets.UTF_8.name());
+    page.setResponseCodeOK();
+    page.setSuccessful(true);
+    page.sampleEnd();
+
+    HTTPSampleResult container = sampler.drainEmbeddedResources(page);
+    SampleResult[] subs = container.getSubResults();
+    assertThat(subs)
+        .as("dispatch failure must produce a visible child sample, not a silent drop")
+        .isNotNull()
+        .isNotEmpty();
+    assertThat(container.isSuccessful()).isFalse();
+    boolean sawFailure = false;
+    for (SampleResult sub : subs) {
+      if (!sub.isSuccessful()) {
+        sawFailure = true;
+        String detail = (sub.getResponseMessage() == null ? "" : sub.getResponseMessage())
+            + " "
+            + (sub.getResponseDataAsString() == null ? "" : sub.getResponseDataAsString());
+        assertThat(detail).containsIgnoringCase("forced dispatch failure");
+      }
+    }
+    assertThat(sawFailure).isTrue();
   }
 
   /**
@@ -203,12 +386,28 @@ public class EmbeddedResourceDrainLoopTest extends HTTP2TestBase {
   }
 
   /** Exposes the protected embedded-resource download so the drain loop can be driven directly. */
-  private static final class ProbeSampler extends HTTP2Sampler {
+  private static class ProbeSampler extends HTTP2Sampler {
 
     private static final long serialVersionUID = 1L;
 
     HTTPSampleResult drainEmbeddedResources(HTTPSampleResult page) {
       return downloadPageResources(page, null, 0);
+    }
+  }
+
+  private static final class FailingDispatchProbeSampler extends ProbeSampler {
+
+    private static final long serialVersionUID = 1L;
+
+    private final HTTP2JettyClient failingClient;
+
+    FailingDispatchProbeSampler(HTTP2JettyClient failingClient) {
+      this.failingClient = failingClient;
+    }
+
+    @Override
+    protected HTTP2Sampler newHttpEmbeddedSampler() {
+      return new HTTP2Sampler(() -> failingClient);
     }
   }
 

@@ -16,6 +16,7 @@ import com.helger.commons.annotation.VisibleForTesting;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.MalformedURLException;
+import java.net.SocketTimeoutException;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.util.ArrayList;
@@ -130,6 +131,12 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   private int maxBufferSize;
   private int requestTimeout;
   private HTTPSampleResult result;
+  /**
+   * Frame depth captured when an async request is dispatched, so the completion turn can call
+   * {@link #sample(URL, String, boolean, int)} with the same depth JMeter's {@code ASyncSample}
+   * passes instead of resetting to 0 via public {@link #sample()}.
+   */
+  private int pendingCompletionDepth;
   private transient List<PreProcessor> suppressedPreProcessors;
   private transient List<Timer> suppressedTimers;
   private transient SamplePackage suppressedSamplePackage;
@@ -182,7 +189,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
   @Override
   public boolean isConcurrentDwn() {
-    return getPropertyAsBoolean(CONCURRENT_DWN, true);
+    // Match JMeter: concurrent download is off unless explicitly enabled.
+    return getPropertyAsBoolean(CONCURRENT_DWN, false);
   }
 
   public void setProfile(String profile) {
@@ -392,6 +400,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       if (!isSyncRequest()) {
         if (Objects.isNull(this.asyncListener)) {
           this.result = buildResult(url, method); // Save the main result for next step
+          this.pendingCompletionDepth = depth;
           HTTP2FutureResponseListener listener =
               new HTTP2FutureResponseListener(HTTP2JettyClient.getJettyBufferingMaxLength());
           // The client fires it: dispatching there is what lets an async request take part in the
@@ -408,8 +417,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         } else {
           // If there is a listener, it is processed using the result it had
           try {
+            int completionDepth = depth > 0 ? depth : pendingCompletionDepth;
             this.result = sampleFromListener(
-                this.result, areFollowingRedirect, depth, this.asyncListener);
+                this.result, areFollowingRedirect, completionDepth, this.asyncListener);
             return this.result;
           } finally {
             restoreSuppressedPreProcessors();
@@ -551,6 +561,84 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   }
 
   /**
+   * Error sample for an embedded resource that did not finish in time, shaped like JMeter HC4's
+   * per-request socket timeout: the child's URL/label identify the resource, not the page
+   * container, and its elapsed time covers the wait until we gave up. That elapsed end time is what
+   * {@link SampleResult#addSubResult} uses to push the container's clock forward; stamping
+   * {@code sampleStart}/{@code sampleEnd} back-to-back left elapsed at ~0 and made the page look
+   * like it finished when the last fast image landed.
+   *
+   * @param startedAtMs when this resource's attempt began (dispatch / listener start), used as the
+   *                    sample start so the reported duration matches the timeout wait
+   */
+  private HTTPSampleResult embeddedTimeoutErrorResult(HTTP2Sampler embeddedSampler,
+                                                      long startedAtMs) {
+    HTTPSampleResult err = new HTTPSampleResult();
+    URL url = resolveEmbeddedResourceUrl(embeddedSampler);
+    if (url != null) {
+      err.setURL(url);
+      err.setSampleLabel(SampleResult.isRenameSampleLabel()
+          ? embeddedSampler.getName()
+          : url.toString());
+    } else if (embeddedSampler.getName() != null) {
+      err.setSampleLabel(embeddedSampler.getName());
+    }
+    err.setHTTPMethod(HTTPConstants.GET);
+    long endedAtMs = System.currentTimeMillis();
+    long elapsedMs = Math.max(0L, endedAtMs - startedAtMs);
+    // Stamp end = now, start = now - elapsed (same contract as a real timed-out HC4 sample).
+    err.setStampAndTime(endedAtMs, elapsedMs);
+    err.setConnectTime(0L);
+    err.setLatency(0L);
+    return errorResult(new SocketTimeoutException("Read timed out"), err);
+  }
+
+  private long embeddedAttemptStartMillis(HTTP2Sampler embeddedSampler) {
+    HTTP2FutureResponseListener listener = embeddedSampler.getFutureResponseListener();
+    if (listener != null && listener.getResponseStart() > 0) {
+      return listener.getResponseStart();
+    }
+    return System.currentTimeMillis();
+  }
+
+  private URL resolveEmbeddedResourceUrl(HTTP2Sampler embeddedSampler) {
+    HTTP2FutureResponseListener listener = embeddedSampler.getFutureResponseListener();
+    if (listener != null && listener.getRequest() != null
+        && listener.getRequest().getURI() != null) {
+      try {
+        return listener.getRequest().getURI().toURL();
+      } catch (IllegalArgumentException | MalformedURLException e) {
+        // Fall through to the sampler URL.
+      }
+    }
+    try {
+      return embeddedSampler.getUrl();
+    } catch (MalformedURLException e) {
+      return null;
+    }
+  }
+
+  /**
+   * Cancels every still-pending embedded request and reports each as a failed child with that
+   * resource's URL (JMeter-style), instead of a single container-cloned timeout stub.
+   */
+  private void failPendingEmbeddedRequestsWithTimeout(List<TestElement> samplers,
+                                                      HTTPSampleResult subres) {
+    List<TestElement> pending = new ArrayList<>(samplers);
+    samplers.clear();
+    for (TestElement element : pending) {
+      HTTP2Sampler embedded = (HTTP2Sampler) element;
+      long startedAtMs = embeddedAttemptStartMillis(embedded);
+      HTTP2FutureResponseListener listener = embedded.getFutureResponseListener();
+      if (listener != null && !listener.isDone() && !listener.isCancelled()) {
+        listener.cancel(true);
+      }
+      subres.addSubResult(embeddedTimeoutErrorResult(embedded, startedAtMs));
+    }
+    setParentSampleSuccess(subres, false);
+  }
+
+  /**
    * Copies Jetty/ALPN/protocol flags from this sampler onto an embedded-resource child sampler so
    * child requests obey the same profile as the parent. Without this, a fresh {@link HTTP2Sampler}
    * falls back to default profile semantics (typically HTTP/1.1 enabled), which incorrectly applies
@@ -597,11 +685,97 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   }
 
   /**
+   * Factory for HTTP(S) embedded-resource children. Tests can override to inject a failing
+   * client without changing the download loop.
+   */
+  protected HTTP2Sampler newHttpEmbeddedSampler() {
+    return new HTTP2Sampler();
+  }
+
+  /**
+   * Configures an HTTP(S) embedded-resource child the way JMeter's {@code ASyncSample} does via
+   * {@code base.clone()}: same timeouts, managers, redirects, image-parser and MD5 flags as the
+   * parent. Concurrent children get a CacheManager proxy and a cloned CookieManager so siblings do
+   * not share mutable cookie state mid-page.
+   *
+   * <p>Also copies keep-alive, content encoding, concurrent-download flags and embedded URL
+   * allow/exclude regexes so a nested HTML resource (iframe) that itself runs
+   * {@link #downloadPageResources} behaves like a JMeter clone of the parent, not a fresh sampler
+   * with defaults.
+   */
+  private void configureHttpEmbeddedSampler(HTTP2Sampler embedded, URL url,
+                                            boolean concurrent) {
+    copyJettyProtocolSettingsToEmbeddedSampler(embedded);
+    embedded.setMethod(HTTPConstants.GET);
+    embedded.setSyncRequest(!concurrent);
+    embedded.setProtocol(url.getProtocol());
+    embedded.setDomain(url.getHost() != null ? url.getHost() : "");
+    embedded.setPort(url.getPort());
+    embedded.setFollowRedirects(getFollowRedirects());
+    embedded.setAutoRedirects(getAutoRedirects());
+    embedded.setPath(pathWithQuery(url));
+    embedded.setImageParser(isImageParser());
+    embedded.setMD5(useMD5() || JMeterUtils.getPropDefault(
+        "httpsampler.embedded_resources_use_md5", false));
+    embedded.setUseKeepAlive(getUseKeepAlive());
+    embedded.setContentEncoding(getContentEncoding());
+    // Nested embeds (child parses HTML) must keep the parent's parallel-download and URL filter
+    // settings; the {@code concurrent} parameter only controls this child's sync vs async send.
+    embedded.setConcurrentDwn(isConcurrentDwn());
+    embedded.setConcurrentPool(getConcurrentPool());
+    embedded.setEmbeddedUrlRE(getEmbeddedUrlRE());
+    embedded.setEmbeddedUrlExcludeRE(getEmbededUrlExcludeRE());
+
+    embedded.setProxyHost(getProxyHost());
+    embedded.setProxyPortInt(String.valueOf(getProxyPortInt()));
+    embedded.setProxyScheme(getProxyScheme());
+    embedded.setProxyUser(getProxyUser());
+    embedded.setProxyPass(getProxyPass());
+
+    embedded.setHeaderManager(getHeaderManager());
+    embedded.setAuthManager(getAuthManager());
+    if (getCacheManager() != null) {
+      embedded.setCacheManager(getCacheManager().createCacheManagerProxy());
+    }
+    if (getCookieManager() != null) {
+      if (concurrent) {
+        embedded.setCookieManager((org.apache.jmeter.protocol.http.control.CookieManager)
+            getCookieManager().clone());
+      } else {
+        embedded.setCookieManager(getCookieManager());
+      }
+    }
+  }
+
+  private static String pathWithQuery(URL url) {
+    if (url.getQuery() == null) {
+      return url.getPath();
+    }
+    return url.getPath() + "?" + url.getQuery();
+  }
+
+  private void mergeEmbeddedCookiesIntoParent(HTTP2Sampler embedded) {
+    org.apache.jmeter.protocol.http.control.CookieManager parent = getCookieManager();
+    org.apache.jmeter.protocol.http.control.CookieManager child = embedded.getCookieManager();
+    if (parent == null || child == null || parent == child) {
+      return;
+    }
+    for (JMeterProperty property : child.getCookies()) {
+      parent.add((org.apache.jmeter.protocol.http.control.Cookie) property.getObjectValue());
+    }
+  }
+
+  /**
    * Builds an embedded-resource child sampler for a {@code file://} URL discovered by the HTML
    * parser (e.g. a relative {@code href}/{@code src} resolved against a {@code file://} parent).
    * {@code setImageParser} is enabled for {@code .html}/{@code .htm} targets so nested embedded
    * resources (e.g. an iframe pointing at another local HTML file) are themselves parsed and
    * downloaded, matching how a real HTTP-embedded HTML resource would recurse.
+   *
+   * <p>{@code file://} embeds are always completed inline (synchronously), even when concurrent
+   * download is enabled: there is no HTTP transport to race, and Jetty async dispatch does not
+   * apply. JMeter's {@code ASyncSample} still runs them on the pool thread via
+   * {@code HTTPFileImpl}; content and nesting match, only the pool scheduling differs.
    */
   private HTTP2Sampler newFileEmbeddedSampler(URL url) {
     HTTP2Sampler fileSampler = new HTTP2Sampler();
@@ -612,15 +786,13 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     fileSampler.setImageParser(htmlResource);
     fileSampler.setMethod(HTTPConstants.GET);
     fileSampler.setProtocol(url.getProtocol());
-    fileSampler.setDomain(url.getHost());
+    fileSampler.setDomain(url.getHost() != null ? url.getHost() : "");
     fileSampler.setPort(url.getPort());
-    if (url.getQuery() == null) {
-      fileSampler.setPath(url.getPath());
-    } else {
-      fileSampler.setPath(url.getPath() + url.getQuery());
-    }
+    fileSampler.setPath(pathWithQuery(url));
     fileSampler.setHeaderManager(getHeaderManager());
     fileSampler.setCookieManager(getCookieManager());
+    fileSampler.setMD5(useMD5() || JMeterUtils.getPropDefault(
+        "httpsampler.embedded_resources_use_md5", false));
     return fileSampler;
   }
 
@@ -1074,16 +1246,10 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
       setSyncRequest(!isConcurrentDwn); // Change default from main request based on sub request
 
-      // Deadline for waiting on a single embedded resource. 0 means "no timeout", the same meaning
-      // JMeter gives it everywhere else: JMeter's own drain
-      // (ResourcesDownloader.invokeAllAndAwaitTermination) has no wait timeout at all and relies
-      // purely on the per-request timeouts, so with 0 configured we wait here as long as JMeter
-      // would. With a value configured, the request itself already carries that deadline (see
-      // HTTP2JettyClient#setTimeouts and copyTimeoutsToEmbeddedSampler), and this is only the
-      // backstop for a completion that never arrives.
-      int embeddedTimeout = this.getResponseTimeout() > 0
-          ? this.getResponseTimeout()
-          : this.requestTimeout;
+      // Deadline for waiting on a single embedded resource. 0 means "no timeout", matching JMeter
+      // (ResourcesDownloader has no wait timeout and relies on per-request socket timeouts only).
+      // Do not fall back to a Jetty client field that may still hold a previous sampler's timeout.
+      int embeddedTimeout = getResponseTimeout();
 
       int fileEmbeddedIndex = 0;
       while (urls.hasNext()) {
@@ -1140,48 +1306,30 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
               }
             }
 
-            HTTP2Sampler h2s = new HTTP2Sampler();
-            copyJettyProtocolSettingsToEmbeddedSampler(h2s);
-            h2s.setMethod("GET");
-            h2s.setSyncRequest(!isConcurrentDwn);
-            h2s.setProtocol(url.getProtocol());
-            h2s.setDomain(url.getHost());
-            h2s.setPort(url.getPort());
-            h2s.setFollowRedirects(true);
-            h2s.setAutoRedirects(true);
-            if (url.getQuery() == null) {
-              h2s.setPath(url.getPath());
-            } else {
-              h2s.setPath(url.getPath() + url.getQuery());
-            }
-
-            // Set proxy
-            h2s.setProxyHost(this.getProxyHost());
-            h2s.setProxyPortInt(String.valueOf(this.getProxyPortInt()));
-            h2s.setProxyScheme(this.getProxyScheme());
-            h2s.setProxyUser(this.getProxyUser());
-            h2s.setProxyPass(this.getProxyPass());
-            // Set Managers
-            h2s.setHeaderManager(getHeaderManager());
-            h2s.setAuthManager(this.getAuthManager());
-            h2s.setCookieManager(this.getCookieManager());
+            HTTP2Sampler h2s = newHttpEmbeddedSampler();
+            configureHttpEmbeddedSampler(h2s, url, isConcurrentDwn);
 
             HTTPSampleResult binRes = h2s.sample(
                 url, HTTPConstants.GET, false, frameDepth + 1);
 
             if (isConcurrentDwn) {
-              // if concurrent download emb. resources, add to a list for async gets later
-              samplers.add(h2s);
+              if (h2s.getFutureResponseListener() == null) {
+                // Dispatch never started (or failed before publishing a listener): attach the error
+                // result now. Queuing a sampler with a null listener used to drop it silently in
+                // the drain loop.
+                if (binRes != null) {
+                  subres.addSubResult(binRes);
+                  setParentSampleSuccess(subres,
+                      subres.isSuccessful() && binRes.isSuccessful());
+                }
+              } else {
+                samplers.add(h2s);
+              }
             } else {
               // default: serial download embedded resources
               subres.addSubResult(binRes);
               setParentSampleSuccess(subres,
                   subres.isSuccessful() && (binRes == null || binRes.isSuccessful()));
-              try {
-                Thread.sleep(10);
-              } catch (InterruptedException e) {
-                interrupted = true;
-              }
             }
           }
         } catch (ClassCastException e) { // NOSONAR
@@ -1237,13 +1385,14 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       // been queued, which never happens if we cannot free a slot.
       if (embeddedTimeout > 0
           && (System.currentTimeMillis() - waitStartedAt) >= embeddedTimeout) {
-        LOG.warn("Timeout after {}ms waiting for an embedded download slot; aborting pending "
-            + "resources", embeddedTimeout);
-        abortPendingEmbeddedRequests(samplers);
-        subres.addSubResult(detachedErrorResult(new Exception(
-            "Error downloading embedded resources, execution timeout"), subres));
-        setParentSampleSuccess(subres, false);
-        return true;
+        LOG.warn("Timeout after {}ms waiting for an embedded download slot; failing in-flight "
+            + "resources and freeing slots so remaining URLs can still be dispatched",
+            embeddedTimeout);
+        // Fail only what is already in flight. Returning false (not interrupted) lets the URL loop
+        // continue — JMeter keeps scheduling until the list is exhausted rather than abandoning
+        // undispatched embeds.
+        failPendingEmbeddedRequestsWithTimeout(samplers, subres);
+        return false;
       }
       try {
         Thread.sleep(EMBEDDED_POLL_INTERVAL_MILLIS);
@@ -1260,13 +1409,23 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
    */
   private void consumeFirstEmbeddedSampler(List<TestElement> samplers, HTTPSampleResult subres) {
     HTTP2Sampler embeddedSampler = (HTTP2Sampler) samplers.get(0);
-    HTTP2FutureResponseListener listener = embeddedSampler.getFutureResponseListener();
-    String processedUrl = listener != null && listener.getRequest() != null
-        ? listener.getRequest().getURI().toString()
-        : "unknown";
-    LOG.debug("Embedded resource finished, re-sampling with that data {}", processedUrl);
-    HTTPSampleResult binRes = (HTTPSampleResult) embeddedSampler.sample();
+    URL processedUrl = resolveEmbeddedResourceUrl(embeddedSampler);
+    LOG.debug("Embedded resource finished, re-sampling with that data {}",
+        processedUrl != null ? processedUrl : "unknown");
+    // Call sample(url, …, depth) directly — not public sample() — so the label stays the URL (or
+    // rename policy) and frame depth matches what was used at dispatch, as JMeter's ASyncSample
+    // does.
+    HTTPSampleResult binRes;
+    if (processedUrl != null) {
+      binRes = embeddedSampler.sample(processedUrl, HTTPConstants.GET, false,
+          embeddedSampler.pendingCompletionDepth > 0
+              ? embeddedSampler.pendingCompletionDepth
+              : 1);
+    } else {
+      binRes = (HTTPSampleResult) embeddedSampler.sample();
+    }
     samplers.remove(0);
+    mergeEmbeddedCookiesIntoParent(embeddedSampler);
     subres.addSubResult(binRes);
     setParentSampleSuccess(subres,
         subres.isSuccessful() && (binRes == null || binRes.isSuccessful()));
@@ -1374,11 +1533,12 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         LOG.warn("Timeout after {}ms waiting for embedded resource {}", embeddedTimeout,
             pendingUrl);
         // Dequeue and abort before returning: without this the caller re-selects the same head, and
-        // aborting is what releases the underlying Jetty request instead of leaking it.
+        // aborting is what releases the underlying Jetty request instead of leaking it. Report the
+        // failure against this resource's URL (as JMeter does for a socket timeout), not as a clone
+        // of the page container.
         samplers.remove(0);
         listener.cancel(true);
-        subres.addSubResult(detachedErrorResult(new Exception(
-            "Error downloading embedded resources, execution timeout"), subres));
+        subres.addSubResult(embeddedTimeoutErrorResult(embeddedSampler, start));
         setParentSampleSuccess(subres, false);
         return false;
       }
