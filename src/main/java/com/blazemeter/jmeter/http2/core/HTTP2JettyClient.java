@@ -2314,8 +2314,15 @@ public class HTTP2JettyClient {
         // A raced attempt failing on its own: the competing protocol still serves the request.
         LOG.debug("{} attempt did not complete after {}ms: {}", listener.getRaceProtocol(),
             elapsed, cause != null ? cause.getMessage() : e.getMessage());
+      } else if (isHttp3ExplorationConnectTimeout(cause, originalRequest)) {
+        // First-contact (or re-exploration) timeout: learning that this origin does not speak
+        // HTTP/3 is expected negotiation, not a failed sample.
+        LOG.debug("HTTP/3 exploration connect timeout after {}ms; will mark origin broken and "
+            + "fall back", elapsed);
       } else {
-        LOG.error("Request failed after {}ms with ExecutionException", elapsed, e);
+        // Internal transport detail; raise the logger to DEBUG to diagnose. Sample failure is
+        // still surfaced through the returned/thrown exception and JMeter result.
+        LOG.debug("Request failed after {}ms with ExecutionException", elapsed, e);
       }
 
       // Check if the cause is a ProtocolErrorException
@@ -2987,6 +2994,44 @@ public class HTTP2JettyClient {
       return msg.contains("connect timeout");
     }
     return isHttp3ConnectTimeout(cause.getCause());
+  }
+
+  /**
+   * Connect timeout on an HTTP/3 attempt that was only exploring whether the origin speaks QUIC.
+   * Distinct from a timeout where HTTP/3 was already indicated (cached Alt-Svc or prior knowledge):
+   * both are logged at debug, but exploration gets a dedicated message before the broken-origin
+   * fallback below.
+   */
+  private boolean isHttp3ExplorationConnectTimeout(Throwable cause, Request request) {
+    if (!isHttp3ConnectTimeout(cause) || request == null) {
+      return false;
+    }
+    if (!Boolean.TRUE.equals(request.getAttributes().get(ATTR_HTTP3_ATTEMPTED))) {
+      return false;
+    }
+    return !isHttp3Expected(request.getURI());
+  }
+
+  /**
+   * Whether HTTP/3 was already indicated for this origin, as opposed to a first-contact (or stale)
+   * exploration. Prior knowledge counts as indicated even with an empty Alt-Svc cache.
+   */
+  private boolean isHttp3Expected(URI uri) {
+    if (http3PriorKnowledgeEnabled) {
+      return true;
+    }
+    if (uri == null || !altSvcCacheEnabled) {
+      return false;
+    }
+    AltSvcEntry entry = ALT_SVC_CACHE.get(originKey(uri));
+    if (entry == null) {
+      return false;
+    }
+    long now = System.currentTimeMillis();
+    if (entry.expiresAt <= now || entry.brokenUntil > now) {
+      return false;
+    }
+    return entry.h3;
   }
 
   RetryableRequestException findRetryableRequestException(Throwable cause) {

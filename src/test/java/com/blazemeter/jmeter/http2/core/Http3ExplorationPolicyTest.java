@@ -3,6 +3,8 @@ package com.blazemeter.jmeter.http2.core;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
@@ -11,11 +13,13 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.URI;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
+import org.eclipse.jetty.client.Request;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -178,6 +182,52 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
     assertTrue(shouldAttemptHttp3(TLS_URI, true));
   }
 
+  // --- logging policy: exploration vs indicated HTTP/3 ---------------------------------------
+
+  @Test
+  public void shouldNotTreatFirstContactAsExpectedHttp3() throws Exception {
+    assertFalse(isHttp3Expected(TLS_URI));
+  }
+
+  @Test
+  public void shouldTreatCachedAltSvcAsExpectedHttp3() throws Exception {
+    cacheAltSvc(true, TimeUnit.MINUTES.toMillis(10), 0L);
+
+    assertTrue(isHttp3Expected(TLS_URI));
+  }
+
+  @Test
+  public void shouldTreatPriorKnowledgeAsExpectedHttp3WithoutCache() throws Exception {
+    setBoolean(client, "http3PriorKnowledgeEnabled", true);
+
+    assertTrue(isHttp3Expected(TLS_URI));
+  }
+
+  @Test
+  public void shouldNotTreatBrokenCooldownAsExpectedHttp3() throws Exception {
+    cacheAltSvc(true, TimeUnit.MINUTES.toMillis(10), TimeUnit.MINUTES.toMillis(5));
+
+    assertFalse(isHttp3Expected(TLS_URI));
+  }
+
+  @Test
+  public void shouldClassifyConnectTimeoutAsExplorationOnFirstContact() throws Exception {
+    Request request = mockRequestWithHttp3Attempted(TLS_URI);
+    Throwable cause = new java.net.SocketTimeoutException("connect timeout");
+
+    assertTrue(isHttp3ExplorationConnectTimeout(cause, request));
+  }
+
+  @Test
+  public void shouldNotClassifyConnectTimeoutAsExplorationWhenHttp3WasIndicated()
+      throws Exception {
+    cacheAltSvc(true, TimeUnit.MINUTES.toMillis(10), 0L);
+    Request request = mockRequestWithHttp3Attempted(TLS_URI);
+    Throwable cause = new java.net.SocketTimeoutException("connect timeout");
+
+    assertFalse(isHttp3ExplorationConnectTimeout(cause, request));
+  }
+
   // --- helpers --------------------------------------------------------------------------------
 
   private Object resolveClientForRequest(HTTP2Sampler sampler, HTTPSampleResult result)
@@ -199,6 +249,29 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
         "shouldAttemptHttp3", URI.class, boolean.class);
     m.setAccessible(true);
     return (boolean) m.invoke(client, uri, recoverable);
+  }
+
+  private boolean isHttp3Expected(URI uri) throws Exception {
+    Method m = HTTP2JettyClient.class.getDeclaredMethod("isHttp3Expected", URI.class);
+    m.setAccessible(true);
+    return (boolean) m.invoke(client, uri);
+  }
+
+  private boolean isHttp3ExplorationConnectTimeout(Throwable cause, Request request)
+      throws Exception {
+    Method m = HTTP2JettyClient.class.getDeclaredMethod(
+        "isHttp3ExplorationConnectTimeout", Throwable.class, Request.class);
+    m.setAccessible(true);
+    return (boolean) m.invoke(client, cause, request);
+  }
+
+  private Request mockRequestWithHttp3Attempted(URI uri) {
+    Request request = mock(Request.class);
+    Map<String, Object> attributes = new HashMap<>();
+    attributes.put("bzm.http3.attempted", Boolean.TRUE);
+    when(request.getURI()).thenReturn(uri);
+    when(request.getAttributes()).thenReturn(attributes);
+    return request;
   }
 
   private void cacheAltSvc(boolean h3, long expiresInMs, long brokenForMs) throws Exception {
