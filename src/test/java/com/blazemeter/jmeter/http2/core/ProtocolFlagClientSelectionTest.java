@@ -44,15 +44,17 @@ public class ProtocolFlagClientSelectionTest extends HTTP2TestBase {
   }
 
   /**
-   * With HTTP/2 off and HTTP/3 on there is no race to run and no HTTP/2 client to fall through to:
-   * the request has to go out on HTTP/3, and only a failure there may fall back to HTTP/1.1.
+   * With HTTP/2 off and HTTP/3 on, first contact still uses HTTP/1.1 so Alt-Svc can be learned
+   * (Chromium-like). HTTP/3 is selected only after the cache says h3, or with prior knowledge /
+   * HTTP/3-only.
    */
   @Test
-  public void shouldUseHttp3ForTlsWhenHttp2DisabledAndHttp3Enabled() throws Exception {
+  public void shouldUseHttp1ForTlsWhenHttp2DisabledAndHttp3EnabledWithoutAltSvc() throws Exception {
     HTTP2JettyClient client = new HTTP2JettyClient();
     setFlags(client, true, false, true);
 
-    assertSame(field(client, "httpClient"),
+    assertSame("first contact with HTTP/2 off must use HTTP/1.1 to learn Alt-Svc",
+        field(client, "httpClientHttp1Only"),
         selectHttpClient(client, URI.create("https://example.com/x")));
   }
 
@@ -61,6 +63,7 @@ public class ProtocolFlagClientSelectionTest extends HTTP2TestBase {
   public void shouldUseHttp3ForTlsWhenOnlyHttp3Enabled() throws Exception {
     HTTP2JettyClient client = new HTTP2JettyClient();
     setFlags(client, false, false, true);
+    setField(client, "http3PriorKnowledgeEnabled", true);
 
     assertSame(field(client, "httpClient"),
         selectHttpClient(client, URI.create("https://example.com/x")));

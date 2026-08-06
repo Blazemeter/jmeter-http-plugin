@@ -3,6 +3,7 @@ package com.blazemeter.jmeter.http2.core;
 import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.charset.Charset;
 import java.nio.charset.IllegalCharsetNameException;
 import java.nio.charset.StandardCharsets;
@@ -13,11 +14,14 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.eclipse.jetty.client.AbstractResponseListener;
 import org.eclipse.jetty.client.BufferingResponseListener;
 import org.eclipse.jetty.client.ContentResponse;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.client.Response;
 import org.eclipse.jetty.client.Result;
+import org.eclipse.jetty.util.BufferUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,6 +50,13 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
   private volatile String raceProtocol;
   private long responseStart;
   private long responseEnd;
+  /**
+   * {@link #releaseTransportBuffers()} is invoked from several completion paths (wrapper build,
+   * sealed HE abort {@code onFailure}/{@code onComplete}, {@code cancel}, sample materialisation).
+   * Jetty may also have released the accumulator already on abort — a second {@code clear()} then
+   * throws {@code IllegalStateException: Already released} and poisons the sample.
+   */
+  private final AtomicBoolean transportBuffersReleased = new AtomicBoolean();
 
   public HTTP2FutureResponseListener() {
     this(-1);
@@ -118,6 +129,9 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     this.responseEnd = responseEnd > 0 ? responseEnd : System.currentTimeMillis();
     this.onCompleteCalled = true;
     this.sealed = true;
+    // Drop any partial body this listener may have buffered for its own (losing) attempt — the
+    // adopted response already carries the winner's bytes.
+    releaseTransportBuffers();
     this.latch.countDown();
   }
 
@@ -131,6 +145,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     if (sealed) {
       // Losing side of a resolved race being aborted; see completeWith.
       lowLevelDebug("onFailure() ignored, listener already completed by a competing attempt");
+      releaseTransportBuffers();
       return;
     }
     lowLevelDebug("=== onFailure() CALLED ===");
@@ -182,6 +197,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     if (sealed) {
       // Losing side of a resolved race being aborted; see completeWith.
       lowLevelDebug("onComplete() ignored, listener already completed by a competing attempt");
+      releaseTransportBuffers();
       return;
     }
     // CRITICAL: Mark that onComplete was called
@@ -245,8 +261,14 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
       // In Jetty 12, ContentResponse is abstract - create a wrapper implementation
       response = new ContentResponseWrapper(httpResponse, getContent(),
           getMediaType(), getEncoding());
+      // Wrapper owns the body bytes now; drop Jetty's accumulator / cached content array so a
+      // still-referenced listener (async controller wait, HE race) does not keep a second copy.
+      releaseTransportBuffers();
     } else {
+      // Failure / cancel with no response: Jetty may still hold a partial accumulator (common for
+      // Happy-Eyeballs losers aborted via request.abort rather than listener.cancel).
       lowLevelDebug("Response is null in onComplete()");
+      releaseTransportBuffers();
     }
     
     if (failure != null) {
@@ -373,7 +395,46 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     if (request != null) {
       request.abort(new CancellationException());
     }
+    releaseTransportBuffers();
     return true;
+  }
+
+  /**
+   * Called once the sample has been materialised into a
+   * {@link org.apache.jmeter.samplers.SampleResult} so this listener can drop the Jetty request
+   * graph (attributes, body, conversation). The SampleResult already owns its own body copy; the
+   * {@link ContentResponse} wrapper (and its link back to Jetty's {@link Response}/{@link Request})
+   * must not stay pinned on this listener.
+   */
+  public void releaseAfterSampleMaterialised() {
+    releaseTransportBuffers();
+    this.request = null;
+    this.response = null;
+  }
+
+  /**
+   * Drops Jetty {@link AbstractResponseListener}'s cached {@code content} byte[] after the body has
+   * been copied into {@link ContentResponseWrapper} / SampleResult. That field is a full second
+   * copy of the response under unlimited buffering.
+   *
+   * <p>Do <strong>not</strong> {@code release()} the {@code accumulator}
+   * {@link org.eclipse.jetty.io.RetainableByteBuffer}: it is owned by Jetty's listener /
+   * {@code ByteBufferPool}. Returning it to the pool while connections may still reference it
+   * corrupts pooled buffers and collapses throughput (protocol errors, repeated HTTP/3
+   * exploration, multi-second samples). Jetty releases the accumulator with the exchange; we only
+   * drop the Java {@code content} duplicate and null request/response links.
+   */
+  private void releaseTransportBuffers() {
+    if (!transportBuffersReleased.compareAndSet(false, true)) {
+      return;
+    }
+    try {
+      Field contentField = AbstractResponseListener.class.getDeclaredField("content");
+      contentField.setAccessible(true);
+      contentField.set(this, BufferUtil.EMPTY_BYTES);
+    } catch (ReflectiveOperationException e) {
+      lowLevelDebug("Could not clear BufferingResponseListener.content", e);
+    }
   }
 
   @Override
