@@ -47,6 +47,7 @@ public class AuthStoreMemoryLeakRegressionTest extends HTTP2TestBase {
   private String originalEnableHttp1Property;
   private String originalEnableHttp2Property;
   private String originalEnableHttp3Property;
+  private String originalAuthPreemptiveProperty;
 
   @BeforeClass
   public static void setupClass() {
@@ -59,11 +60,16 @@ public class AuthStoreMemoryLeakRegressionTest extends HTTP2TestBase {
     originalEnableHttp1Property = JMeterUtils.getProperty("httpJettyClient.enableHttp1");
     originalEnableHttp2Property = JMeterUtils.getProperty("httpJettyClient.enableHttp2");
     originalEnableHttp3Property = JMeterUtils.getProperty("httpJettyClient.enableHttp3");
+    originalAuthPreemptiveProperty = JMeterUtils.getProperty("httpJettyClient.auth.preemptive");
     JMeterUtils.setProperty("httpJettyClient.sharedThreadPool", "false");
     // Server is HTTP/1.1 only — keep HE/HTTP3 off so 40 samples are not burned on QUIC races.
     JMeterUtils.setProperty("httpJettyClient.enableHttp1", "true");
     JMeterUtils.setProperty("httpJettyClient.enableHttp2", "false");
     JMeterUtils.setProperty("httpJettyClient.enableHttp3", "false");
+    // This test counts Jetty's Authentication list. Preemptive mode registers Results instead,
+    // leaving authentications empty (0) — and another unit test can leave preemptive=true in the
+    // shared JMeter properties (filesystem run order differs on Linux CI vs Windows).
+    JMeterUtils.setProperty("httpJettyClient.auth.preemptive", "false");
     HTTP2JettyClientTestIsolation.resetSharedClientState();
 
     server = new ServerBuilder().withHTTP1().withSSL().withBasicAuth().buildServer();
@@ -109,6 +115,7 @@ public class AuthStoreMemoryLeakRegressionTest extends HTTP2TestBase {
     restoreProperty("httpJettyClient.enableHttp1", originalEnableHttp1Property);
     restoreProperty("httpJettyClient.enableHttp2", originalEnableHttp2Property);
     restoreProperty("httpJettyClient.enableHttp3", originalEnableHttp3Property);
+    restoreProperty("httpJettyClient.auth.preemptive", originalAuthPreemptiveProperty);
   }
 
   private static void restoreProperty(String key, String originalValue) {
@@ -129,10 +136,12 @@ public class AuthStoreMemoryLeakRegressionTest extends HTTP2TestBase {
           .isTrue();
     }
 
-    int authentications = countAuthentications(mainHttpClient(client));
+    // H1-only profile samples via httpClientHttp1Only; registration fans out to every store.
+    int authentications = countAuthentications(http1OnlyClient(client));
     assertThat(authentications)
         .as("after %d samples the Jetty auth list must stay at the configured Auth Manager size, "
-            + "not grow per iteration (pre-fix it grew unboundedly)", SAMPLE_COUNT)
+            + "not grow per iteration (pre-fix it grew unboundedly). Size 0 usually means "
+            + "httpJettyClient.auth.preemptive was left true by another test.", SAMPLE_COUNT)
         .isEqualTo(1);
   }
 
@@ -143,8 +152,8 @@ public class AuthStoreMemoryLeakRegressionTest extends HTTP2TestBase {
     return result;
   }
 
-  private static HttpClient mainHttpClient(HTTP2JettyClient client) throws Exception {
-    Field field = HTTP2JettyClient.class.getDeclaredField("httpClient");
+  private static HttpClient http1OnlyClient(HTTP2JettyClient client) throws Exception {
+    Field field = HTTP2JettyClient.class.getDeclaredField("httpClientHttp1Only");
     field.setAccessible(true);
     return (HttpClient) field.get(client);
   }

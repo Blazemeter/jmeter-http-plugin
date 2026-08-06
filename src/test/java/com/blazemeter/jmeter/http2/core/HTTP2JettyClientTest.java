@@ -984,6 +984,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
 
   @Test
   public void shouldReturnSuccessBasicAuthSampleResultWhenHeaderIsSet() throws Exception {
+    String previousPreemptive = JMeterUtils.getProperty("httpJettyClient.auth.preemptive");
     server = new ServerBuilder()
         .withHTTP1()
         .withSSL()
@@ -994,12 +995,20 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     Mutable httpFields = hostHeader()
         .add(HttpHeader.AUTHORIZATION,
             "Basic " + base64Encode(AUTH_USERNAME + ":" + AUTH_PASSWORD));
-    JMeterUtils.setProperty("httpJettyClient.auth.preemptive", "true");
-    configureAuthManager(Mechanism.BASIC);
-    HTTPSampleResult expected = buildResult(true, Code.OK,
-      httpFields, null, null, createURL(SERVER_PATH_200), HTTPConstants.GET);
-    expected.setResponseData(SERVER_RESPONSE, StandardCharsets.UTF_8.name());
-    validateResponse(sampleWithGet(), expected);
+    try {
+      JMeterUtils.setProperty("httpJettyClient.auth.preemptive", "true");
+      configureAuthManager(Mechanism.BASIC);
+      HTTPSampleResult expected = buildResult(true, Code.OK,
+          httpFields, null, null, createURL(SERVER_PATH_200), HTTPConstants.GET);
+      expected.setResponseData(SERVER_RESPONSE, StandardCharsets.UTF_8.name());
+      validateResponse(sampleWithGet(), expected);
+    } finally {
+      if (previousPreemptive == null) {
+        JMeterUtils.getJMeterProperties().remove("httpJettyClient.auth.preemptive");
+      } else {
+        JMeterUtils.setProperty("httpJettyClient.auth.preemptive", previousPreemptive);
+      }
+    }
   }
 
   private String base64Encode(String input) {
