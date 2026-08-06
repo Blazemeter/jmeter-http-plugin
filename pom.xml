@@ -37,7 +37,7 @@
     <jmeter.regression.external.tests>TestKeepAlive,TestRedirectionPolicies</jmeter.regression.external.tests>
     <jetty.version>12.1.11</jetty.version>
     <!-- Matches the log4j that JMeter 5.6.x ships in lib/, which provides the API at runtime. -->
-    <log4j.version>2.22.1</log4j.version>
+    <log4j.version>2.25.4</log4j.version>
     <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.11 -->
     <brotli4j.version>1.23.0</brotli4j.version>
     <checkstyle.skip>false</checkstyle.skip>
