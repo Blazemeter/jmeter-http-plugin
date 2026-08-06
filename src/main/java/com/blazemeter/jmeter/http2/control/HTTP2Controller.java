@@ -4,16 +4,23 @@ import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import java.io.Serializable;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import org.apache.jmeter.control.Controller;
 import org.apache.jmeter.control.NextIsNullException;
 import org.apache.jmeter.control.TransactionController;
+import org.apache.jmeter.control.TransactionSampler;
 import org.apache.jmeter.samplers.Sampler;
 import org.apache.jmeter.testelement.TestElement;
 import org.apache.jmeter.testelement.property.JMeterProperty;
 import org.apache.jmeter.testelement.property.PropertyIterator;
+import org.apache.jmeter.threads.JMeterContextService;
+import org.apache.jmeter.threads.JMeterThread;
+import org.apache.jmeter.threads.SamplePackage;
+import org.apache.jmeter.threads.TestCompiler;
 import org.apache.jmeter.util.JMeterUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -140,9 +147,86 @@ public class HTTP2Controller extends TransactionController implements Serializab
   @Override
   public Sampler next() {
     if (isGenerateParentSample()) {
-      return super.next();
+      Sampler next = super.next();
+      // Only after the controller has finished the parent transaction (next == null). Releasing
+      // while still returning the done TransactionSampler is pointless: JMeterThread calls
+      // configureTransactionSampler(done) next and puts that same instance back on the package.
+      // Releasing on the following null turn is what sticks — and runs after listeners/assertions
+      // in doEndTransactionSampler (same sequencing as JMeter PR #6386's TestCompiler.done() hook).
+      if (next == null) {
+        releaseCompletedParentTransactionSample();
+      }
+      return next;
     }
     return nextWithoutTransactionBookkeeping();
+  }
+
+  /**
+   * Same workaround as JMeter PR #6386: when the parent transaction has finished, replace the
+   * completed {@link TransactionSampler} in this controller's {@link SamplePackage} with a fresh
+   * one so the finished sample tree is no longer reachable from the compiler map.
+   *
+   * <p>Uses the public {@link TransactionSampler} / {@link SamplePackage} API; the map itself is
+   * private on {@link TestCompiler}, so it is reached by reflection (there is no public accessor
+   * in 5.5–5.6.3).
+   *
+   * <p>Safe wrt listeners/assertions: callers must invoke this only after
+   * {@code JMeterThread.doEndTransactionSampler} has notified listeners (i.e. on the controller
+   * {@code next()} that returns {@code null} after a done parent). Does not clear
+   * {@code previousResult} — scripts using {@code ${prev}} keep working, same as upstream PR #6386.
+   *
+   * <p>If a future JMeter already applied #6386, {@code pack.getSampler()} is no longer done and
+   * this becomes a no-op.
+   */
+  void releaseCompletedParentTransactionSample() {
+    if (!isGenerateParentSample()) {
+      return;
+    }
+    try {
+      SamplePackage pack = transactionSamplePackage();
+      if (pack == null) {
+        return;
+      }
+      replaceDoneTransactionSampler(pack);
+    } catch (Exception e) {
+      LOG.debug("Could not release completed parent transaction sample for '{}'", getName(), e);
+    }
+  }
+
+  /**
+   * @return {@code true} when a completed transaction sampler was replaced
+   */
+  boolean replaceDoneTransactionSampler(SamplePackage pack) {
+    Sampler sampler = pack.getSampler();
+    if (!(sampler instanceof TransactionSampler)) {
+      return false;
+    }
+    TransactionSampler transactionSampler = (TransactionSampler) sampler;
+    if (!transactionSampler.isTransactionDone()) {
+      return false;
+    }
+    // Public constructor used by TestCompiler.saveTransactionControllerConfigs and by PR #6386.
+    pack.setSampler(new TransactionSampler(this, transactionSampler.getName()));
+    return true;
+  }
+
+  private SamplePackage transactionSamplePackage() throws ReflectiveOperationException {
+    JMeterThread thread = JMeterContextService.getContext().getThread();
+    if (thread == null) {
+      return null;
+    }
+    Field compilerField = JMeterThread.class.getDeclaredField("compiler");
+    compilerField.setAccessible(true);
+    TestCompiler compiler = (TestCompiler) compilerField.get(thread);
+    if (compiler == null) {
+      return null;
+    }
+    Field mapField = TestCompiler.class.getDeclaredField("transactionControllerConfigMap");
+    mapField.setAccessible(true);
+    @SuppressWarnings("unchecked")
+    Map<TransactionController, SamplePackage> map =
+        (Map<TransactionController, SamplePackage>) mapField.get(compiler);
+    return map == null ? null : map.get(this);
   }
 
   /**
@@ -410,6 +494,9 @@ public class HTTP2Controller extends TransactionController implements Serializab
       if (listener != null && !listener.isDone()) {
         listener.cancel(true);
       }
+      // Done-but-not-collected listeners still hold ContentResponseWrapper / request graph until
+      // the next sample() completion turn — which never comes after an aborted iteration.
+      pending.clearPendingSampleState();
     }
     http2SamplesSync.clear();
   }

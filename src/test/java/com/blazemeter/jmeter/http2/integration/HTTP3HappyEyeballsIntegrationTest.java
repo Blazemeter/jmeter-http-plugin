@@ -83,11 +83,8 @@ public class HTTP3HappyEyeballsIntegrationTest extends HTTP2TestBase {
       HTTP2JettyClient client = new HTTP2JettyClient(false, "IT-HTTP3-HE-NoRecent");
       try {
         client.start();
-        // Setup: HTTP/2 has to answer this first sample, so its Alt-Svc is cached and no HTTP/3
-        // success is recorded - both are preconditions for the halved stagger asserted below.
-        // HTTP/3 is slowed right down for it because first contact now explores HTTP/3 with the
-        // full stagger: at its normal 150ms it would answer before HTTP/2 is due to start at 200ms
-        // and win, leaving nothing cached and the delay at its base value.
+        // Setup: first contact is HTTP/2 (TCP-first / Alt-Svc discovery). Slow HTTP/3 so it cannot
+        // race-win this sample before Alt-Svc is cached from the HTTP/2 response.
         h3DelayMs.set(1000L);
         HTTPSampleResult first = sample(client, sampler, url);
         assertThat(first.isSuccessful()).isTrue();
@@ -166,8 +163,8 @@ public class HTTP3HappyEyeballsIntegrationTest extends HTTP2TestBase {
       HTTP2JettyClient client = new HTTP2JettyClient(false, "IT-HTTP3-HE-Recent");
       try {
         client.start();
-        // Phase A: establish Alt-Svc and force one confirmed H3 success first. No protocol is
-        // asserted on this first sample: first contact with an unknown origin explores HTTP/3, so
+        // Phase A: establish Alt-Svc over HTTP/2 first (TCP-first discovery). No protocol is
+        // asserted on this first sample beyond success; then force one confirmed H3 success.
         // either side of the race may win it. The warmup loop below is what guarantees the
         // confirmed HTTP/3 success this test needs.
         HTTPSampleResult first = sample(client, sampler, url);

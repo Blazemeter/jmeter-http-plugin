@@ -65,28 +65,22 @@ import org.slf4j.LoggerFactory;
 
 public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListener, ThreadListener {
 
-  private static class OwnInheritableThreadLocal
-      extends InheritableThreadLocal<Map<HTTP2ClientKey, HTTP2JettyClient>> {
+  private static class OwnThreadLocal
+      extends ThreadLocal<Map<HTTP2ClientKey, HTTP2JettyClient>> {
     @Override
     protected Map<HTTP2ClientKey, HTTP2JettyClient> initialValue() {
       return new HashMap<>();
-    }
-
-    @Override
-    protected Map<HTTP2ClientKey, HTTP2JettyClient> childValue(
-        Map<HTTP2ClientKey, HTTP2JettyClient> parentValue) {
-      return parentValue;
     }
   }
 
   public static final String SYNC_REQUEST = "HTTP2Sampler.sync_request";
   private static final Logger LOG = LoggerFactory.getLogger(HTTP2Sampler.class);
   /*
-  private static final ThreadLocal<Map<HTTP2ClientKey, HTTP2JettyClient>> CONNECTIONS =
-      ThreadLocal
-          .withInitial(HashMap::new);
-  */
-  private static final OwnInheritableThreadLocal CONNECTIONS = new OwnInheritableThreadLocal();
+   * Previously an InheritableThreadLocal: Jetty / Happy-Eyeballs pool threads inherited the
+   * parent's map and could keep clients reachable after the JMeter thread's closeConnections().
+   * Sampling must stay on the JMeter thread, so a plain ThreadLocal is enough.
+   */
+  private static final OwnThreadLocal CONNECTIONS = new OwnThreadLocal();
 
   private static final boolean IGNORE_FAILED_EMBEDDED_RESOURCES =
       getPropDefault(
@@ -423,12 +417,30 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
                 this.result, areFollowingRedirect, completionDepth, this.asyncListener);
             return this.result;
           } finally {
+            // Drop the buffering listener (unlimited body accumulator) as soon as the sample is
+            // materialised — waiting until the next iterationStart pinned large responses across
+            // the whole loop for every async sampler. Clear the field too: the returned reference
+            // is enough for JMeterThread; keeping this.result until iterationStart pinned every
+            // completed async body for the rest of the controller iteration.
+            if (this.asyncListener != null) {
+              this.asyncListener.releaseAfterSampleMaterialised();
+            }
+            this.asyncListener = null;
+            this.result = null;
+            this.pendingCompletionDepth = 0;
             restoreSuppressedPreProcessors();
           }
         }
       } else {
-        this.result = buildResult(url, method);
-        return client.sample(this, this.result, areFollowingRedirect, depth);
+        HTTPSampleResult sampleResult = buildResult(url, method);
+        this.result = sampleResult;
+        try {
+          return client.sample(this, sampleResult, areFollowingRedirect, depth);
+        } finally {
+          // Sync path: JMeterThread keeps the returned SampleResult; holding this.result until
+          // iterationStart only duplicates that pin across the rest of the iteration.
+          this.result = null;
+        }
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -1571,12 +1583,35 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
   @Override
   public void iterationStart(LoopIterationEvent iterEvent) {
-    this.asyncListener = null;
-    restoreSuppressedPreProcessors();
+    // Per-sample fields only. With same_user_on_next_iteration=true the Jetty clients in
+    // CONNECTIONS, Alt-Svc / H1-only / H2C caches, auth fingerprints and buffer pools must survive
+    // across iterations — recreating them every loop would dominate fast iterations. New-user
+    // resets go through clearUserStores() below (JMeter clears CookieManager itself).
+    clearPendingSampleState();
     JMeterVariables jMeterVariables = JMeterContextService.getContext().getVariables();
     if (!jMeterVariables.isSameUserOnNextIteration()) {
       clearUserStores();
     }
+  }
+
+  /**
+   * Drops any in-flight or completed-but-uncollected async listener / result retained on this
+   * sampler. Used from iteration boundaries, thread end, and controller abort paths so a discarded
+   * exchange cannot keep an unlimited Jetty body (or SampleResult) alive until the next sample.
+   */
+  public void clearPendingSampleState() {
+    if (this.asyncListener != null) {
+      if (!this.asyncListener.isDone() && !this.asyncListener.isCancelled()) {
+        // Must abort the exchange; only releasing buffers on a live request races Jetty I/O.
+        this.asyncListener.cancel(true);
+      } else {
+        this.asyncListener.releaseAfterSampleMaterialised();
+      }
+    }
+    this.asyncListener = null;
+    this.result = null;
+    this.pendingCompletionDepth = 0;
+    restoreSuppressedPreProcessors();
   }
 
   /**
@@ -1685,6 +1720,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       }
     }
     clients.clear();
+    // Drop the ThreadLocal entry itself so the empty map is not retained until the next get().
+    CONNECTIONS.remove();
   }
 
   private void dump() {
@@ -1701,11 +1738,13 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   @Override
   public void testEnded() {
     super.testEnded();
+    HTTP2JettyClient.clearStaticProtocolCaches();
     System.gc(); // Force free memory
   }
 
   @Override
   public void threadFinished() {
+    clearPendingSampleState();
     if (dumpAtThreadEnd) {
       dump();
     }
@@ -1718,10 +1757,13 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       try {
         client.clearCookies();
         client.clearAuthenticationResults();
+        client.clearAuthentications();
+        client.clearBufferPool();
       } catch (Exception e) {
         LOG.error("Error while cleaning user store", e);
       }
     }
+    HTTP2JettyClient.pruneExpiredProtocolCaches();
   }
 
   private static final class HTTP2ClientKey {

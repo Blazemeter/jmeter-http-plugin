@@ -138,6 +138,25 @@ public class SslClientCertAliasSupportTest extends HTTP2TestBase {
     }
   }
 
+  @Test
+  public void clearEngineRemovesAliasBinding() throws Exception {
+    JMeterJettySslContextFactory factory = new JMeterJettySslContextFactory();
+    factory.start();
+    try {
+      SSLEngine engine = factory.getSslContext().createSSLEngine();
+      int before = SslClientCertAliasContext.engineAliasCountForTests();
+      SslClientCertAliasContext.bindEngine(engine, KEY_ALIAS);
+      assertThat(SslClientCertAliasContext.resolveFromEngine(engine)).isEqualTo(KEY_ALIAS);
+      assertThat(SslClientCertAliasContext.engineAliasCountForTests()).isEqualTo(before + 1);
+
+      SslClientCertAliasContext.clearEngine(engine);
+      assertThat(SslClientCertAliasContext.resolveFromEngine(engine)).isNull();
+      assertThat(SslClientCertAliasContext.engineAliasCountForTests()).isEqualTo(before);
+    } finally {
+      factory.stop();
+    }
+  }
+
   private static void restoreProperty(String key, String value) {
     if (value == null) {
       System.clearProperty(key);
