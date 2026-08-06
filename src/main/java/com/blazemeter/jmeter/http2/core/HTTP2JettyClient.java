@@ -35,9 +35,11 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
@@ -74,6 +76,7 @@ import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.util.JMeterUtils;
 import org.brotli.dec.BrotliInputStream;
 import org.eclipse.jetty.client.AbstractAuthentication;
+import org.eclipse.jetty.client.Authentication;
 import org.eclipse.jetty.client.AuthenticationStore;
 import org.eclipse.jetty.client.BasicAuthentication;
 import org.eclipse.jetty.client.BytesRequestContent;
@@ -162,6 +165,14 @@ public class HTTP2JettyClient {
    * aborted; SampleResult store truncation uses {@link #maxBufferSize} instead (JMeter parity).
    */
   private static final int JETTY_BUFFERING_UNLIMITED = -1;
+  private static final long DEFAULT_BYTE_BUFFER_POOL_MAX_MEMORY = 64L * 1024 * 1024;
+  /**
+   * Max reusable {@link java.util.zip.Inflater}s kept by the gzip decoder pool. Jetty's default
+   * capacity is far larger than a JMeter thread needs; with one pool per {@code HTTP2JettyClient}
+   * (and several clients per thread) a 1024-slot pool retained an oversized high-water mark for the
+   * whole thread lifetime.
+   */
+  private static final int GZIP_INFLATER_POOL_CAPACITY = 32;
   private static final Pattern PORT_PATTERN = Pattern.compile("\\d+");
   private static final String MULTI_PART_SEPARATOR = "--";
   private static final String LINE_SEPARATOR = "\r\n";
@@ -201,6 +212,16 @@ public class HTTP2JettyClient {
   private static final Map<String, AltSvcEntry> ALT_SVC_CACHE = new ConcurrentHashMap<>();
   private static final Map<String, Http1OnlyEntry> HTTP1_ONLY_CACHE = new ConcurrentHashMap<>();
   private static final Map<String, H2cEntry> H2C_CACHE = new ConcurrentHashMap<>();
+  /**
+   * Origins currently exploring HTTP/3 for the first time. Without this, concurrent embeds
+   * (pool=100) stampede QUIC handshakes to the same host and each pays the full handshake timeout.
+   */
+  private static final Set<String> HTTP3_EXPLORE_IN_FLIGHT = ConcurrentHashMap.newKeySet();
+  /**
+   * Soft cap for process-wide protocol caches. Crawl / CDN tests can touch tens of thousands of
+   * origins; TTL alone only removes an entry when that origin is read again.
+   */
+  private static final int PROTOCOL_CACHE_SOFT_MAX = 10_000;
   private int requestTimeout = 0;
   /**
    * Max bytes stored in {@link HTTPSampleResult} response data ({@code <= 0} = no truncation).
@@ -252,6 +273,11 @@ public class HTTP2JettyClient {
   // Kept initialized for the disableDeflateDecoder diagnostic toggle, but no longer registered
   // per-request; see the comment in configureContentDecoders() below.
   private DeflateContentDecoderFactory deflateDecoderFactory;
+  /** Started with the gzip factory; must be stopped with the client or Inflaters stay pooled. */
+  private InflaterPool gzipInflaterPool;
+  private BrotliCompression brotliCompression;
+  private ZstandardCompression zstdCompression;
+  private GzipCompression gzipCompression;
   private boolean decoderFactoriesInitialized = false;
   private int quicMaxIdleTimeout = 30000;
   /**
@@ -286,6 +312,11 @@ public class HTTP2JettyClient {
   private boolean http1OnlyCacheEnabled = true;
   private boolean h2cCacheEnabled = true;
   private boolean heExecutorsRegistered = false;
+  /**
+   * Fingerprints of Auth Manager rows already pushed into Jetty stores. Avoids relying solely on
+   * {@code findAuthentication} (realm/URI matching quirks) and prevents per-sample list growth.
+   */
+  private final Set<String> registeredAuthFingerprints = ConcurrentHashMap.newKeySet();
 
   public HTTP2JettyClient(boolean http1UpgradeRequired, String name) {
     this(http1UpgradeRequired, name, null);
@@ -296,8 +327,9 @@ public class HTTP2JettyClient {
     loadProperties(profileConfig);
     lowLevelDebug(PLUGIN_BUILD_TAG);
 
-    // Create buffer pool first (needed for both TCP and QUIC connectors)
-    this.bufferPool = new ArrayByteBufferPool();
+    // Create buffer pool first (needed for both TCP and QUIC connectors). Cap retained pooled
+    // memory so continuous high-throughput runs do not keep growing the high-water mark forever.
+    this.bufferPool = createByteBufferPool();
     ensureDecoderFactoriesInitialized();
 
     ClientConnector clientConnector = createClientConnector(name);
@@ -730,8 +762,24 @@ public class HTTP2JettyClient {
   }
 
   public void clearBufferPool() {
-    // ByteBufferPool doesn't have a clear() method in Jetty 12
-    // The pool is managed automatically by Jetty
+    if (bufferPool != null) {
+      bufferPool.clear();
+    }
+  }
+
+  /**
+   * Caps how much pooled buffer memory Jetty may retain. Without a cap, {@code ArrayByteBufferPool}
+   * keeps the high-water mark for the JVM lifetime of the client under continuous load.
+   */
+  private ByteBufferPool createByteBufferPool() {
+    long maxHeap = Long.parseLong(BzmHttpPluginProperties.getPropDefault(
+        "httpJettyClient.byteBufferPoolMaxHeapMemory",
+        String.valueOf(DEFAULT_BYTE_BUFFER_POOL_MAX_MEMORY)));
+    long maxDirect = Long.parseLong(BzmHttpPluginProperties.getPropDefault(
+        "httpJettyClient.byteBufferPoolMaxDirectMemory",
+        String.valueOf(DEFAULT_BYTE_BUFFER_POOL_MAX_MEMORY)));
+    int factor = Math.max(1, byteBufferPoolFactor) * 1024;
+    return new ArrayByteBufferPool(0, factor, 65536, Integer.MAX_VALUE, maxHeap, maxDirect);
   }
 
   /**
@@ -1449,6 +1497,48 @@ public class HTTP2JettyClient {
   }
 
   /**
+   * Drops process-wide protocol-negotiation caches. Entries expire on read after TTL, but origins
+   * never touched again would otherwise stay until the JVM exits.
+   */
+  public static void clearStaticProtocolCaches() {
+    ALT_SVC_CACHE.clear();
+    HTTP1_ONLY_CACHE.clear();
+    H2C_CACHE.clear();
+    HTTP3_EXPLORE_IN_FLIGHT.clear();
+  }
+
+  /**
+   * Removes expired Alt-Svc / HTTP/1.1-only / H2C entries. If a cache is still over
+   * {@link #PROTOCOL_CACHE_SOFT_MAX} after that, drops arbitrary overflow entries so growth cannot
+   * track every distinct origin for the whole test duration.
+   */
+  public static void pruneExpiredProtocolCaches() {
+    long now = System.currentTimeMillis();
+    ALT_SVC_CACHE.entrySet().removeIf(e -> {
+      AltSvcEntry entry = e.getValue();
+      return entry.expiresAt <= now && entry.brokenUntil <= now;
+    });
+    HTTP1_ONLY_CACHE.entrySet().removeIf(e -> e.getValue().expiresAt <= now);
+    H2C_CACHE.entrySet().removeIf(e -> e.getValue().expiresAt <= now);
+    trimProtocolCache(ALT_SVC_CACHE);
+    trimProtocolCache(HTTP1_ONLY_CACHE);
+    trimProtocolCache(H2C_CACHE);
+  }
+
+  private static <V> void trimProtocolCache(Map<String, V> cache) {
+    int overflow = cache.size() - PROTOCOL_CACHE_SOFT_MAX;
+    if (overflow <= 0) {
+      return;
+    }
+    Iterator<String> keys = cache.keySet().iterator();
+    while (overflow > 0 && keys.hasNext()) {
+      keys.next();
+      keys.remove();
+      overflow--;
+    }
+  }
+
+  /**
    * Stops every Jetty {@link HttpClient} owned by this wrapper.
    *
    * <p>JMeter's Stop button interrupts the worker thread before {@code threadFinished} runs. Jetty
@@ -1468,6 +1558,7 @@ public class HTTP2JettyClient {
       firstFailure = stopClient(httpClientHttp1Only, firstFailure);
       firstFailure = stopClient(httpClientH2cPrior, firstFailure);
       firstFailure = stopClient(httpClientH2cUpgrade, firstFailure);
+      stopCompressionResources();
       clearBufferPool();
       if (heExecutorsRegistered) {
         int remaining = HAPPY_EYEBALLS_CLIENTS.decrementAndGet();
@@ -1498,7 +1589,7 @@ public class HTTP2JettyClient {
     } catch (InterruptedException e) {
       // Keep going: remaining clients must still be stopped. The interrupt is restored in stop().
       Thread.interrupted();
-      return firstFailure;
+      return firstFailure == null ? e : firstFailure;
     } catch (Exception e) {
       if (isExpectedShutdownException(e)) {
         lowLevelDebug("Ignoring expected shutdown exception while stopping {}: {}",
@@ -1507,6 +1598,40 @@ public class HTTP2JettyClient {
       }
       LOG.warn("Failed to stop HttpClient {}: {}", client.getName(), e.toString());
       return firstFailure != null ? firstFailure : e;
+    }
+  }
+
+  /**
+   * Stops gzip/brotli/zstd {@link LifeCycle} helpers created for content decoding. They are not
+   * children of the {@link HttpClient} beans, so {@code client.stop()} alone left Inflater pools
+   * and compression components running until GC — and even then native/pooled state could linger.
+   */
+  private void stopCompressionResources() {
+    stopLifeCycleQuietly(gzipInflaterPool);
+    gzipInflaterPool = null;
+    stopLifeCycleQuietly(gzipCompression);
+    gzipCompression = null;
+    stopLifeCycleQuietly(brotliCompression);
+    brotliCompression = null;
+    stopLifeCycleQuietly(zstdCompression);
+    zstdCompression = null;
+    brotliDecoderFactory = null;
+    zstdDecoderFactory = null;
+    gzipDecoderFactory = null;
+    deflateDecoderFactory = null;
+    decoderFactoriesInitialized = false;
+  }
+
+  private static void stopLifeCycleQuietly(LifeCycle lifeCycle) {
+    if (lifeCycle == null) {
+      return;
+    }
+    try {
+      if (lifeCycle.isRunning()) {
+        lifeCycle.stop();
+      }
+    } catch (Exception e) {
+      LOG.debug("Error stopping compression resource {}", lifeCycle.getClass().getSimpleName(), e);
     }
   }
 
@@ -2424,9 +2549,9 @@ public class HTTP2JettyClient {
       lowLevelDebug("Brotli decoder disabled by blazemeter.http.disableBrotliDecoder");
     } else {
       try {
-        BrotliCompression brotli = new BrotliCompression();
-        brotli.setByteBufferPool(bufferPool);
-        brotliDecoderFactory = new CompressionContentDecoderFactory(brotli);
+        brotliCompression = new BrotliCompression();
+        brotliCompression.setByteBufferPool(bufferPool);
+        brotliDecoderFactory = new CompressionContentDecoderFactory(brotliCompression);
         lowLevelDebug("Initialized Brotli content decoder factory");
       } catch (Throwable t) {
         LOG.warn("Brotli decoder not available; skipping factory initialization", t);
@@ -2439,9 +2564,9 @@ public class HTTP2JettyClient {
       lowLevelDebug("Zstd decoder disabled by blazemeter.http.disableZstdDecoder");
     } else {
       try {
-        ZstandardCompression zstd = new ZstandardCompression();
-        zstd.setByteBufferPool(bufferPool);
-        zstdDecoderFactory = new CompressionContentDecoderFactory(zstd);
+        zstdCompression = new ZstandardCompression();
+        zstdCompression.setByteBufferPool(bufferPool);
+        zstdDecoderFactory = new CompressionContentDecoderFactory(zstdCompression);
         lowLevelDebug("Initialized Zstandard content decoder factory");
       } catch (Throwable t) {
         LOG.warn("Zstandard decoder not available; skipping factory initialization", t);
@@ -2454,19 +2579,18 @@ public class HTTP2JettyClient {
       lowLevelDebug("Gzip decoder disabled by blazemeter.http.disableGzipDecoder");
     } else {
       try {
-        GzipCompression gzip = new GzipCompression();
-        gzip.setByteBufferPool(bufferPool);
-        // Ensure inflater pool is initialized; missing pool can trigger NPE and stream cancel.
-        InflaterPool inflaterPool = new InflaterPool(1024, true);
+        gzipCompression = new GzipCompression();
+        gzipCompression.setByteBufferPool(bufferPool);
+        // Cap capacity: one pool per HTTP2JettyClient; 1024 slots × many clients retained a huge
+        // high-water mark for the thread lifetime after gzip traffic.
+        gzipInflaterPool = new InflaterPool(GZIP_INFLATER_POOL_CAPACITY, true);
         try {
-          if (inflaterPool instanceof LifeCycle) {
-            ((LifeCycle) inflaterPool).start();
-          }
+          gzipInflaterPool.start();
         } catch (Exception e) {
           lowLevelDebug("Failed to start InflaterPool", e);
         }
-        gzip.setInflaterPool(inflaterPool);
-        gzipDecoderFactory = new CompressionContentDecoderFactory(gzip);
+        gzipCompression.setInflaterPool(gzipInflaterPool);
+        gzipDecoderFactory = new CompressionContentDecoderFactory(gzipCompression);
         lowLevelDebug("Initialized Gzip content decoder factory");
       } catch (Throwable t) {
         LOG.warn("Gzip decoder not available; skipping factory initialization", t);
@@ -2617,9 +2741,9 @@ public class HTTP2JettyClient {
    * {@link #shouldUseHappyEyeballs}: that changes how HTTP/3 is attempted, not whether this origin
    * is worth attempting it on.
    *
-   * @param recoverable whether a failure to establish the connection can be retried over another
-   *                    protocol, which is what makes exploring HTTP/3 on an unknown origin safe.
-   *                    See {@link #isRecoverableIfHttp3Fails}.
+   * @param recoverable reserved for connection-retry policy (e.g. future HTTPS RR discovery). TCP
+   *                    protocols learn {@code Alt-Svc} first; HTTP/3 is not speculative-explored
+   *                    on unknown origins. See {@link #shouldAttemptHttp3}.
    */
   private HttpClient selectHttpClient(URI uri, boolean recoverable) {
     if (uri != null && "http".equalsIgnoreCase(uri.getScheme())) {
@@ -2674,24 +2798,19 @@ public class HTTP2JettyClient {
     boolean attemptHttp3 = shouldAttemptHttp3(uri, recoverable);
     if (attemptHttp3) {
       lowLevelDebug("HTTP/3 enabled for origin {}", originKey(uri));
-    } else {
-      lowLevelDebug("HTTP/3 not enabled for origin {}", originKey(uri));
-    }
-    if (attemptHttp3) {
       return httpClient;
     }
+    lowLevelDebug("HTTP/3 not enabled for origin {}", originKey(uri));
     if (!enableHttp2) {
-      // With HTTP/2 disabled there is no race to run and no HTTP/2 client to use: go straight to
-      // HTTP/3 when it is enabled (a failure there falls back to HTTP/1.1 through the usual paths,
-      // which check enableHttp1 themselves), and only then to HTTP/1.1. Falling through to the
-      // HTTP/2 client below would have ignored the user disabling HTTP/2 - and, when HTTP/1.1 was
-      // disabled too, would have negotiated exactly the two protocols that were turned off.
-      if (enableHttp3) {
-        lowLevelDebug("HTTP/2 disabled; using HTTP/3 for origin {}", originKey(uri));
-        return httpClient;
-      }
+      // Chromium-like: with HTTP/2 off, prefer HTTP/1.1 so Alt-Svc can still be learned before
+      // any HTTP/3 attempt. H3-only (no H1/H2) already forced prior knowledge above, so
+      // shouldAttemptHttp3 would have returned true.
       if (enableHttp1) {
         return httpClientHttp1Only;
+      }
+      if (enableHttp3) {
+        lowLevelDebug("No TCP protocol left; using HTTP/3 for origin {}", originKey(uri));
+        return httpClient;
       }
     }
     if (enableHttp1 && isHttp1Only(uri)) {
@@ -2701,6 +2820,18 @@ public class HTTP2JettyClient {
     return httpClientNoH3;
   }
 
+  /**
+   * Whether this request may use the HTTP/3-capable client.
+   *
+   * <p>Matches Chromium's discovery model when a TCP protocol is available: the first contact goes
+   * over HTTP/2 (or HTTP/1.1 if HTTP/2 is disabled) so {@code Alt-Svc} can be learned; HTTP/3 is
+   * used only after the cache says the origin supports it (and is not in a broken cooldown). Blind
+   * QUIC exploration on unknown origins is not done — that is what made POSTs pay a handshake
+   * timeout against sites that never speak HTTP/3.
+   *
+   * <p>Exception: {@code http3PriorKnowledge} (also auto-enabled when only HTTP/3 is configured)
+   * asserts the origin speaks HTTP/3 up front, so there is nothing to learn over TCP first.
+   */
   private boolean shouldAttemptHttp3(URI uri, boolean recoverable) {
     if (!enableHttp3) {
       return false;
@@ -2716,23 +2847,18 @@ public class HTTP2JettyClient {
     }
     AltSvcEntry entry = ALT_SVC_CACHE.get(originKey(uri));
     if (entry == null) {
-      // First contact. Alt-Svc can only be learnt from a response, so waiting for the cache to say
-      // yes would mean HTTP/3 is never tried at all here: explore it, as long as the attempt can be
-      // walked back.
-      //
-      // This includes requests that cannot be raced, such as a POST. Those get no concurrent HTTP/2
-      // attempt to cover them, so what makes them safe is that the handshake has its own short
-      // deadline (see applyHttp3HandshakeTimeout) and that the fallback only fires for a failure to
-      // establish the connection - the request never reached the wire, so resending it cannot
-      // repeat a side effect. The outcome is cached either way, so it is the first request to an
-      // origin that pays for the exploration, not every one.
-      return recoverable;
+      // Unknown origin: stay on HTTP/2 or HTTP/1.1 until Alt-Svc (or prior knowledge) says h3.
+      // {@code recoverable} is unused here on purpose — Chromium does not speculative-explore
+      // QUIC just because a failure could be retried.
+      return false;
     }
     long now = System.currentTimeMillis();
     if (entry.expiresAt <= now) {
-      // Stale: forget it and explore again rather than trusting an answer that has expired.
-      ALT_SVC_CACHE.remove(originKey(uri));
-      return recoverable;
+      // Stale: drop it and rediscover via TCP on a later response — do not re-open QUIC blindly.
+      String origin = originKey(uri);
+      ALT_SVC_CACHE.remove(origin);
+      HTTP3_EXPLORE_IN_FLIGHT.remove(origin);
+      return false;
     }
     if (entry.brokenUntil > now) {
       // HTTP/3 failed here recently; stay off it until the cooldown elapses.
@@ -2815,6 +2941,10 @@ public class HTTP2JettyClient {
       return;
     }
     ALT_SVC_CACHE.put(origin, entry);
+    HTTP3_EXPLORE_IN_FLIGHT.remove(origin);
+    if (ALT_SVC_CACHE.size() > PROTOCOL_CACHE_SOFT_MAX) {
+      pruneExpiredProtocolCaches();
+    }
     lowLevelDebug("Alt-Svc cached for origin {} (h3={}, expiresAt={})",
         origin, entry.h3, entry.expiresAt);
   }
@@ -2901,6 +3031,7 @@ public class HTTP2JettyClient {
     entry.lastH3SuccessAt = System.currentTimeMillis();
     entry.brokenUntil = 0L;
     ALT_SVC_CACHE.put(origin, entry);
+    HTTP3_EXPLORE_IN_FLIGHT.remove(origin);
   }
 
   private void updateHttp1OnlyCache(Request request, Response response) {
@@ -2936,6 +3067,9 @@ public class HTTP2JettyClient {
     Http1OnlyEntry entry = new Http1OnlyEntry();
     entry.expiresAt = System.currentTimeMillis() + http1OnlyCooldownMs;
     HTTP1_ONLY_CACHE.put(origin, entry);
+    if (HTTP1_ONLY_CACHE.size() > PROTOCOL_CACHE_SOFT_MAX) {
+      pruneExpiredProtocolCaches();
+    }
     lowLevelDebug("HTTP/1.1-only cache set for origin {} until {}", origin, entry.expiresAt);
   }
 
@@ -2956,6 +3090,9 @@ public class HTTP2JettyClient {
       H2cEntry entry = new H2cEntry();
       entry.expiresAt = System.currentTimeMillis() + h2cCacheTtlMs;
       H2C_CACHE.put(origin, entry);
+      if (H2C_CACHE.size() > PROTOCOL_CACHE_SOFT_MAX) {
+        pruneExpiredProtocolCaches();
+      }
       lowLevelDebug("H2C cache set for origin {} until {}", origin, entry.expiresAt);
     } else if (version != null) {
       if (H2C_CACHE.remove(origin) != null) {
@@ -2983,6 +3120,7 @@ public class HTTP2JettyClient {
     }
     entry.brokenUntil = brokenUntil;
     ALT_SVC_CACHE.put(origin, entry);
+    HTTP3_EXPLORE_IN_FLIGHT.remove(origin);
     lowLevelDebug("HTTP/3 marked broken for origin {} until {}", origin, entry.brokenUntil);
   }
 
@@ -3214,6 +3352,11 @@ public class HTTP2JettyClient {
     client.setMaxRequestsQueuedPerDestination(maxRequestsQueuedPerDestination);
     client.setMaxConnectionsPerDestination(maxConnectionsPerDestination);
     client.setStrictEventOrdering(strictEventOrdering);
+    // JMeter owns cookies via CookieManager (or HeaderManager). Jetty's default store would keep
+    // every Set-Cookie for the client lifetime — and with no CookieManager (common in demos) that
+    // grows across iterations on every protocol-variant HttpClient. Empty matches HC4's model where
+    // the jar is external to the transport.
+    client.setHttpCookieStore(new HttpCookieStore.Empty());
     if (removeIdleDestinations) {
       client.setDestinationIdleTimeout(idleTimeout);
     }
@@ -3493,12 +3636,13 @@ public class HTTP2JettyClient {
 
   private void setAuthManager(HTTP2Sampler sampler) {
     AuthManager authManager = sampler.getAuthManager();
-    if (authManager != null) {
-      StreamSupport.stream(authManager.getAuthObjects().spliterator(), false)
-          .map(j -> (Authorization) j.getObjectValue())
-          .filter(auth -> isSupportedMechanism(auth) && !StringUtils.isEmpty(auth.getURL()))
-          .forEach(this::addAuthenticationToJettyClient);
+    if (authManager == null) {
+      return;
     }
+    StreamSupport.stream(authManager.getAuthObjects().spliterator(), false)
+        .map(j -> (Authorization) j.getObjectValue())
+        .filter(auth -> isSupportedMechanism(auth) && !StringUtils.isEmpty(auth.getURL()))
+        .forEach(this::addAuthenticationToJettyClient);
   }
 
   private boolean isSupportedMechanism(Authorization auth) {
@@ -3508,37 +3652,62 @@ public class HTTP2JettyClient {
   }
 
   private void addAuthenticationToJettyClient(Authorization auth) {
-    AuthenticationStore authenticationStore = httpClient.getAuthenticationStore();
-    AuthenticationStore authenticationStoreNoH3 = httpClientNoH3.getAuthenticationStore();
-    AuthenticationStore authenticationStoreHttp1 = httpClientHttp1Only.getAuthenticationStore();
-    AuthenticationStore authenticationStoreH2c = httpClientH2cPrior.getAuthenticationStore();
-    AuthenticationStore authenticationStoreH2cUpgrade =
-        httpClientH2cUpgrade.getAuthenticationStore();
     String authName = auth.getMechanism().name();
     if (authName.equals(AuthManager.Mechanism.BASIC.name())
         && BzmHttpPluginProperties.getPropDefault("httpJettyClient.auth.preemptive", false)) {
       BasicAuthentication.BasicResult result =
           new BasicAuthentication.BasicResult(URI.create(auth.getURL()), auth.getUser(),
               auth.getPass());
-      authenticationStore.addAuthenticationResult(result);
-      authenticationStoreNoH3.addAuthenticationResult(result);
-      authenticationStoreHttp1.addAuthenticationResult(result);
-      authenticationStoreH2c.addAuthenticationResult(result);
-      authenticationStoreH2cUpgrade.addAuthenticationResult(result);
-    } else {
-      AbstractAuthentication authentication =
-          authName.equals(AuthManager.Mechanism.BASIC.name()) ? new BasicAuthentication(
-              URI.create(auth.getURL()), auth.getRealm(), auth.getUser(), auth.getPass())
-              :
-              new DigestAuthentication(URI.create(auth.getURL()), auth.getRealm(),
-                  auth.getUser(),
-                  auth.getPass());
-      authenticationStore.addAuthentication(authentication);
-      authenticationStoreNoH3.addAuthentication(authentication);
-      authenticationStoreHttp1.addAuthentication(authentication);
-      authenticationStoreH2c.addAuthentication(authentication);
-      authenticationStoreH2cUpgrade.addAuthentication(authentication);
+      // Results are keyed by URI (Map.put replaces); safe to re-register every sample.
+      forEachAuthenticationStore(store -> store.addAuthenticationResult(result));
+      return;
     }
+
+    String fingerprint = authFingerprint(auth);
+    if (!registeredAuthFingerprints.add(fingerprint)) {
+      return;
+    }
+
+    URI uri = URI.create(auth.getURL());
+    String realm = auth.getRealm();
+    if (realm == null || realm.isEmpty()) {
+      // Blank JMeter realm must match any challenge realm; "" would only match "".
+      realm = Authentication.ANY_REALM;
+    }
+    AbstractAuthentication authentication =
+        authName.equals(AuthManager.Mechanism.BASIC.name())
+            ? new BasicAuthentication(uri, realm, auth.getUser(), auth.getPass())
+            : new DigestAuthentication(uri, realm, auth.getUser(), auth.getPass());
+    forEachAuthenticationStore(store -> store.addAuthentication(authentication));
+  }
+
+  private static String authFingerprint(Authorization auth) {
+    URI uri = URI.create(auth.getURL());
+    String realm = auth.getRealm();
+    if (realm == null || realm.isEmpty()) {
+      realm = Authentication.ANY_REALM;
+    }
+    return auth.getMechanism().name() + '|'
+        + Objects.toString(uri.getScheme(), "") + '|'
+        + Objects.toString(uri.getHost(), "") + '|'
+        + uri.getPort() + '|'
+        + Objects.toString(uri.getPath(), "") + '|'
+        + realm + '|'
+        + Objects.toString(auth.getUser(), "");
+  }
+
+  private void forEachHttpClient(java.util.function.Consumer<HttpClient> action) {
+    action.accept(httpClient);
+    if (httpClientNoH3 != httpClient) {
+      action.accept(httpClientNoH3);
+    }
+    action.accept(httpClientHttp1Only);
+    action.accept(httpClientH2cPrior);
+    action.accept(httpClientH2cUpgrade);
+  }
+
+  private void forEachAuthenticationStore(java.util.function.Consumer<AuthenticationStore> action) {
+    forEachHttpClient(client -> action.accept(client.getAuthenticationStore()));
   }
 
   private static class RequestContext {
@@ -3603,13 +3772,9 @@ public class HTTP2JettyClient {
   }
 
   /**
-   * Whether a failed HTTP/3 attempt for this request could still be served over another protocol,
-   * which is the condition for exploring HTTP/3 on an origin nothing is known about yet.
-   *
-   * <p>It comes down to the body: the fallback has to hand the same body to the retry, and a body
-   * read from a file cannot be rewound, so such a request has no way back once HTTP/3 has been
-   * attempted and failed. Form and string bodies rewind fine, so an ordinary POST is recoverable
-   * and does get to explore. Requests with no body always are.
+   * Whether a failed HTTP/3 attempt for this request could still be served over another protocol.
+   * Used when deciding fallback after an indicated HTTP/3 failure (cached Alt-Svc / prior
+   * knowledge). File bodies cannot be rewound for a retry; form/string bodies can.
    */
   private boolean isRecoverableIfHttp3Fails(HTTP2Sampler sampler) {
     return sampler.getHTTPFiles().length == 0;
@@ -3962,33 +4127,11 @@ public class HTTP2JettyClient {
     if (cookieManager == null) {
       return null;
     }
-    HttpCookieStore cookieStore = httpClient.getHttpCookieStore();
-    if (cookieStore != null) {
-      URI uri = request.getURI();
-      if (cookieManager.getCookieCount() == 0) {
-        if (!cookieStore.match(uri).isEmpty()) {
-          cookieStore.clear();
-          lowLevelDebug("Cleared Jetty cookie store because JMeter CookieManager is empty");
-        }
-      } else {
-        Set<String> jmeterCookieNames = new HashSet<>();
-        for (JMeterProperty property : cookieManager.getCookies()) {
-          Cookie cookie = (Cookie) property.getObjectValue();
-          if (cookie != null) {
-            jmeterCookieNames.add(cookie.getName());
-          }
-        }
-        if (!jmeterCookieNames.isEmpty()) {
-          for (HttpCookie cookie : cookieStore.match(uri)) {
-            if (jmeterCookieNames.contains(cookie.getName())) {
-              cookieStore.remove(uri, cookie);
-              lowLevelDebug("Removed cookie '{}' from Jetty store because JMeter overrides it",
-                  cookie.getName());
-            }
-          }
-        }
-      }
-    }
+    URI uri = request.getURI();
+    // Keep every protocol-variant Jetty client in sync with the JMeter CookieManager. Previously
+    // only the main client was cleaned; H2C / HTTP/1-only / no-H3 clients kept accumulating
+    // Set-Cookie entries across iterations when those transports were used.
+    forEachHttpClient(client -> syncJettyCookieStoreWithJmeter(client, uri, cookieManager));
     String cookieString = cookieManager.getCookieHeaderForURL(url);
     if (cookieString != null) {
       HttpFields headers = request.getHeaders();
@@ -3997,6 +4140,38 @@ public class HTTP2JettyClient {
       }
     }
     return cookieString;
+  }
+
+  private void syncJettyCookieStoreWithJmeter(HttpClient client, URI uri,
+                                              CookieManager cookieManager) {
+    HttpCookieStore cookieStore = client.getHttpCookieStore();
+    if (cookieStore == null) {
+      return;
+    }
+    if (cookieManager.getCookieCount() == 0) {
+      if (!cookieStore.match(uri).isEmpty()) {
+        cookieStore.clear();
+        lowLevelDebug("Cleared Jetty cookie store because JMeter CookieManager is empty");
+      }
+      return;
+    }
+    Set<String> jmeterCookieNames = new HashSet<>();
+    for (JMeterProperty property : cookieManager.getCookies()) {
+      Cookie cookie = (Cookie) property.getObjectValue();
+      if (cookie != null) {
+        jmeterCookieNames.add(cookie.getName());
+      }
+    }
+    if (jmeterCookieNames.isEmpty()) {
+      return;
+    }
+    for (HttpCookie cookie : cookieStore.match(uri)) {
+      if (jmeterCookieNames.contains(cookie.getName())) {
+        cookieStore.remove(uri, cookie);
+        lowLevelDebug("Removed cookie '{}' from Jetty store because JMeter overrides it",
+            cookie.getName());
+      }
+    }
   }
 
   private void setProxy(String host, int port, String protocol) {
@@ -4534,14 +4709,26 @@ public class HTTP2JettyClient {
   public void clearCookies() {
     // In Jetty 12, getCookieStore() was replaced by getHttpCookieStore()
     // removeAll() was replaced by clear()
-    HttpCookieStore cookieStore = httpClient.getHttpCookieStore();
-    if (cookieStore != null) {
-      cookieStore.clear();
-    }
+    forEachHttpClient(client -> {
+      HttpCookieStore cookieStore = client.getHttpCookieStore();
+      if (cookieStore != null) {
+        cookieStore.clear();
+      }
+    });
   }
 
   public void clearAuthenticationResults() {
-    httpClient.getAuthenticationStore().clearAuthenticationResults();
+    forEachAuthenticationStore(AuthenticationStore::clearAuthenticationResults);
+  }
+
+  /**
+   * Drops configured authentications from every Jetty client in this wrapper (main + protocol
+   * variants). Used on new-user iteration reset together with
+   * {@link #clearAuthenticationResults()}.
+   */
+  public void clearAuthentications() {
+    forEachAuthenticationStore(AuthenticationStore::clearAuthentications);
+    registeredAuthFingerprints.clear();
   }
 
   public String dump() {

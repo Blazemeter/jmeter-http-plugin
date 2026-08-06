@@ -838,12 +838,6 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     softly.assertThat(result.getUrlAsString()).isEqualTo(createURL(path).toString());
   }
 
-  private void addJettyCookie(URI uri, String name, String value) {
-    HttpCookieStore cookieStore = client.getHttpClient().getHttpCookieStore();
-    assertNotNull(cookieStore);
-    cookieStore.add(uri, HttpCookie.from(name, value));
-  }
-
   private boolean hasJettyCookie(URI uri, String name) {
     HttpCookieStore cookieStore = client.getHttpClient().getHttpCookieStore();
     assertNotNull(cookieStore);
@@ -901,34 +895,17 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
   }
 
   @Test
-  public void shouldRemoveJettyCookieWhenJMeterOverridesValue() throws Exception {
+  public void jettyCookieStoreDoesNotRetainSetCookies() throws Exception {
+    // Transport cookie jar is Empty: JMeter CookieManager (or HeaderManager) owns cookies. A Default
+    // store used to keep every Set-Cookie on each protocol-variant HttpClient for the thread life.
     buildStartedServer();
-    CookieManager cookieManager = new CookieManager();
-    cookieManager.testStarted(HOST_NAME);
-    cookieManager.add(new Cookie("SOME_NAME", "NEW_VALUE", HOST_NAME, "/", true, 0));
-    sampler.setCookieManager(cookieManager);
-
-    URI uri = createURL(SERVER_PATH_200).toURI();
-    addJettyCookie(uri, "SOME_NAME", "OLD_VALUE");
-    assertThat(hasJettyCookie(uri, "SOME_NAME")).isTrue();
-
-    sampleWithGet(SERVER_PATH_200);
-
+    URI uri = createURL(SERVER_PATH_SET_COOKIES).toURI();
+    HttpCookieStore store = client.getHttpClient().getHttpCookieStore();
+    assertThat(store).isInstanceOf(HttpCookieStore.Empty.class);
+    assertThat(store.add(uri, HttpCookie.from("SOME_NAME", "OLD_VALUE"))).isFalse();
     assertThat(hasJettyCookie(uri, "SOME_NAME")).isFalse();
-  }
 
-  @Test
-  public void shouldClearJettyStoreWhenJMeterCookieManagerIsEmpty() throws Exception {
-    buildStartedServer();
-    CookieManager cookieManager = new CookieManager();
-    cookieManager.testStarted(HOST_NAME);
-    sampler.setCookieManager(cookieManager);
-
-    URI uri = createURL(SERVER_PATH_200).toURI();
-    addJettyCookie(uri, "SOME_NAME", "OLD_VALUE");
-    assertThat(hasJettyCookie(uri, "SOME_NAME")).isTrue();
-
-    sampleWithGet(SERVER_PATH_200);
+    sampleWithGet(SERVER_PATH_SET_COOKIES);
 
     assertThat(hasJettyCookie(uri, "SOME_NAME")).isFalse();
   }
@@ -1004,6 +981,7 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
 
   @Test
   public void shouldReturnSuccessBasicAuthSampleResultWhenHeaderIsSet() throws Exception {
+    String previousPreemptive = JMeterUtils.getProperty("httpJettyClient.auth.preemptive");
     server = new ServerBuilder()
         .withHTTP1()
         .withSSL()
@@ -1014,12 +992,20 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
     Mutable httpFields = hostHeader()
         .add(HttpHeader.AUTHORIZATION,
             "Basic " + base64Encode(AUTH_USERNAME + ":" + AUTH_PASSWORD));
-    JMeterUtils.setProperty("httpJettyClient.auth.preemptive", "true");
-    configureAuthManager(Mechanism.BASIC);
-    HTTPSampleResult expected = buildResult(true, Code.OK,
-      httpFields, null, null, createURL(SERVER_PATH_200), HTTPConstants.GET);
-    expected.setResponseData(SERVER_RESPONSE, StandardCharsets.UTF_8.name());
-    validateResponse(sampleWithGet(), expected);
+    try {
+      JMeterUtils.setProperty("httpJettyClient.auth.preemptive", "true");
+      configureAuthManager(Mechanism.BASIC);
+      HTTPSampleResult expected = buildResult(true, Code.OK,
+          httpFields, null, null, createURL(SERVER_PATH_200), HTTPConstants.GET);
+      expected.setResponseData(SERVER_RESPONSE, StandardCharsets.UTF_8.name());
+      validateResponse(sampleWithGet(), expected);
+    } finally {
+      if (previousPreemptive == null) {
+        JMeterUtils.getJMeterProperties().remove("httpJettyClient.auth.preemptive");
+      } else {
+        JMeterUtils.setProperty("httpJettyClient.auth.preemptive", previousPreemptive);
+      }
+    }
   }
 
   private String base64Encode(String input) {

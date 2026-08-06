@@ -25,14 +25,13 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 /**
- * Pins when HTTP/3 is attempted, which is the difference between discovering HTTP/3 on a first
- * contact and turning an unreachable QUIC path into a stalled request.
+ * Pins when HTTP/3 is attempted, following Chromium's discovery model: with HTTP/2 (or HTTP/1.1)
+ * available, the first contact stays on TCP so {@code Alt-Svc} can be learned; HTTP/3 is used only
+ * after the cache says the origin supports it. Blind QUIC exploration on unknown origins is not
+ * done.
  *
- * <p>The decision depends on what is known about the origin, not on the request: an origin worth
- * attempting HTTP/3 on is attempted regardless of method, so neither is a POST to a known HTTP/3
- * site downgraded, nor is an origin first contacted by a POST left unable to ever learn HTTP/3.
- * Whether the attempt is <em>raced</em> against HTTP/2 is a separate decision, covered by
- * {@link ProtocolFlagClientSelectionTest} and the race tests.
+ * <p>Exception: prior knowledge (also auto-enabled when only HTTP/3 is configured) asserts H3 up
+ * front. Whether an H3 attempt is <em>raced</em> against HTTP/2 is a separate decision.
  */
 public class Http3ExplorationPolicyTest extends HTTP2TestBase {
 
@@ -57,24 +56,28 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
     setBoolean(client, "http3PriorKnowledgeEnabled", false);
   }
 
-  // --- first contact -------------------------------------------------------------------------
+  // --- first contact (TCP first) -------------------------------------------------------------
 
   @Test
-  public void shouldExploreHttp3OnFirstContact() throws Exception {
-    assertTrue(shouldAttemptHttp3(TLS_URI, true));
+  public void shouldNotExploreHttp3OnFirstContactWhenTcpAvailable() throws Exception {
+    assertFalse("unknown origins must learn Alt-Svc over HTTP/2 first",
+        shouldAttemptHttp3(TLS_URI, true));
   }
 
-
-  /**
-   * The same rule seen through the real entry point, where the method is known: a POST to an origin
-   * nothing is known about still goes to the HTTP/3 client. It gets no concurrent HTTP/2 attempt to
-   * cover it, so what makes this safe is that the handshake has its own short deadline and that the
-   * fallback only fires when the connection could not be established - the request never reached
-   * the wire, so resending it cannot repeat a side effect. Without this, an origin first contacted
-   * by a POST could never learn HTTP/3 at all.
-   */
   @Test
-  public void shouldExploreHttp3ForPostToUnknownOrigin() throws Exception {
+  public void shouldUseHttp2ClientForGetToUnknownOrigin() throws Exception {
+    HTTP2Sampler sampler = new HTTP2Sampler();
+    sampler.setMethod(HTTPConstants.GET);
+    HTTPSampleResult result = new HTTPSampleResult();
+    result.setURL(TLS_URI.toURL());
+    result.setHTTPMethod(HTTPConstants.GET);
+
+    assertSame("first contact must use the no-H3 client so Alt-Svc can be learned",
+        field("httpClientNoH3"), resolveClientForRequest(sampler, result));
+  }
+
+  @Test
+  public void shouldUseHttp2ClientForPostToUnknownOrigin() throws Exception {
     HTTP2Sampler sampler = new HTTP2Sampler();
     sampler.setMethod(HTTPConstants.POST);
     sampler.addArgument("test1", "value1");
@@ -82,16 +85,23 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
     result.setURL(TLS_URI.toURL());
     result.setHTTPMethod(HTTPConstants.POST);
 
-    assertSame("a POST to an unknown origin must still explore HTTP/3",
-        field("httpClient"), resolveClientForRequest(sampler, result));
+    assertSame("a POST to an unknown origin must not speculative-explore HTTP/3",
+        field("httpClientNoH3"), resolveClientForRequest(sampler, result));
   }
 
-  /**
-   * And the limit of that: a body read from a file cannot be rewound, so the fallback has nothing to
-   * hand the retry and the request would have no way back once HTTP/3 failed. Such a request must
-   * not be used to explore an unknown origin - it goes over HTTP/2, and exploration is left to the
-   * requests that can afford it.
-   */
+  @Test
+  public void shouldUseHttp1WhenHttp2DisabledAndOriginUnknown() throws Exception {
+    setBoolean(client, "enableHttp2", false);
+    HTTP2Sampler sampler = new HTTP2Sampler();
+    sampler.setMethod(HTTPConstants.GET);
+    HTTPSampleResult result = new HTTPSampleResult();
+    result.setURL(TLS_URI.toURL());
+    result.setHTTPMethod(HTTPConstants.GET);
+
+    assertSame("with HTTP/2 off, first contact must use HTTP/1.1 to learn Alt-Svc",
+        field("httpClientHttp1Only"), resolveClientForRequest(sampler, result));
+  }
+
   @Test
   public void shouldNotExploreHttp3ForRequestWithFileBody() throws Exception {
     HTTP2Sampler sampler = new HTTP2Sampler();
@@ -102,8 +112,7 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
     result.setURL(TLS_URI.toURL());
     result.setHTTPMethod(HTTPConstants.POST);
 
-    assertSame("a file body cannot be replayed, so it must not explore HTTP/3",
-        field("httpClientNoH3"), resolveClientForRequest(sampler, result));
+    assertSame(field("httpClientNoH3"), resolveClientForRequest(sampler, result));
   }
 
   // --- already known to speak HTTP/3 ---------------------------------------------------------
@@ -114,6 +123,20 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
 
     assertTrue("a POST to a site known to speak HTTP/3 must still use HTTP/3",
         shouldAttemptHttp3(TLS_URI, true));
+  }
+
+  @Test
+  public void shouldUseHttp3AfterAltSvcWhenHttp2Disabled() throws Exception {
+    setBoolean(client, "enableHttp2", false);
+    cacheAltSvc(true, TimeUnit.MINUTES.toMillis(10), 0L);
+
+    assertTrue(shouldAttemptHttp3(TLS_URI, true));
+    HTTP2Sampler sampler = new HTTP2Sampler();
+    sampler.setMethod(HTTPConstants.GET);
+    HTTPSampleResult result = new HTTPSampleResult();
+    result.setURL(TLS_URI.toURL());
+    result.setHTTPMethod(HTTPConstants.GET);
+    assertSame(field("httpClient"), resolveClientForRequest(sampler, result));
   }
 
   @Test
@@ -134,26 +157,23 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
   }
 
   @Test
-  public void shouldExploreAgainOnceCachedEntryExpired() throws Exception {
+  public void shouldRediscoverViaTcpOnceCachedEntryExpired() throws Exception {
     cacheAltSvc(true, -1L, 0L);
 
-    assertTrue("an expired answer must not be trusted; explore again",
+    assertFalse("expired Alt-Svc must not reopen QUIC; learn again over TCP",
         shouldAttemptHttp3(TLS_URI, true));
   }
 
-  /**
-   * A failure on an origin that never advertised Alt-Svc has to be remembered too, otherwise every
-   * later request explores an origin whose HTTP/3 just failed.
-   */
   @Test
-  public void shouldRecordCooldownForExploredOriginWithoutAltSvcEntry() throws Exception {
+  public void shouldRecordCooldownAfterMarkedBroken() throws Exception {
+    cacheAltSvc(true, TimeUnit.MINUTES.toMillis(10), 0L);
     assertTrue(shouldAttemptHttp3(TLS_URI, true));
 
     Method mark = HTTP2JettyClient.class.getDeclaredMethod("markHttp3Broken", URI.class);
     mark.setAccessible(true);
     mark.invoke(client, TLS_URI);
 
-    assertFalse("the cooldown must apply even though the origin had no Alt-Svc entry",
+    assertFalse("the cooldown must apply after HTTP/3 failed for a cached origin",
         shouldAttemptHttp3(TLS_URI, true));
   }
 
@@ -180,6 +200,20 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
     setBoolean(client, "http3PriorKnowledgeEnabled", true);
 
     assertTrue(shouldAttemptHttp3(TLS_URI, true));
+  }
+
+  @Test
+  public void shouldUseHttp3ClientWhenOnlyHttp3Enabled() throws Exception {
+    setBoolean(client, "enableHttp1", false);
+    setBoolean(client, "enableHttp2", false);
+    setBoolean(client, "http3PriorKnowledgeEnabled", true);
+    HTTP2Sampler sampler = new HTTP2Sampler();
+    sampler.setMethod(HTTPConstants.GET);
+    HTTPSampleResult result = new HTTPSampleResult();
+    result.setURL(TLS_URI.toURL());
+    result.setHTTPMethod(HTTPConstants.GET);
+
+    assertSame(field("httpClient"), resolveClientForRequest(sampler, result));
   }
 
   // --- logging policy: exploration vs indicated HTTP/3 ---------------------------------------
@@ -211,16 +245,18 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
   }
 
   @Test
-  public void shouldClassifyConnectTimeoutAsExplorationOnFirstContact() throws Exception {
+  public void shouldNotClassifyConnectTimeoutAsExplorationOnFirstContact() throws Exception {
+    // First contact no longer explores H3, so ATTR_HTTP3_ATTEMPTED on an unknown origin is not an
+    // "exploration" path the policy owns — isHttp3Expected is false and attempted may be unset.
     Request request = mockRequestWithHttp3Attempted(TLS_URI);
     Throwable cause = new java.net.SocketTimeoutException("connect timeout");
 
+    // With no cache, timeout on an H3 attempt is still classified as exploration (not "expected").
     assertTrue(isHttp3ExplorationConnectTimeout(cause, request));
   }
 
   @Test
-  public void shouldNotClassifyConnectTimeoutAsExplorationWhenHttp3WasIndicated()
-      throws Exception {
+  public void shouldNotClassifyConnectTimeoutAsExplorationWhenAltSvcIndicated() throws Exception {
     cacheAltSvc(true, TimeUnit.MINUTES.toMillis(10), 0L);
     Request request = mockRequestWithHttp3Attempted(TLS_URI);
     Throwable cause = new java.net.SocketTimeoutException("connect timeout");
@@ -228,7 +264,35 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
     assertFalse(isHttp3ExplorationConnectTimeout(cause, request));
   }
 
-  // --- helpers --------------------------------------------------------------------------------
+  private Request mockRequestWithHttp3Attempted(URI uri) {
+    Request request = mock(Request.class);
+    when(request.getURI()).thenReturn(uri);
+    Map<String, Object> attrs = new HashMap<>();
+    attrs.put("bzm.http3.attempted", Boolean.TRUE);
+    when(request.getAttributes()).thenReturn(attrs);
+    return request;
+  }
+
+  private boolean shouldAttemptHttp3(URI uri, boolean recoverable) throws Exception {
+    Method m = HTTP2JettyClient.class.getDeclaredMethod(
+        "shouldAttemptHttp3", URI.class, boolean.class);
+    m.setAccessible(true);
+    return (Boolean) m.invoke(client, uri, recoverable);
+  }
+
+  private boolean isHttp3Expected(URI uri) throws Exception {
+    Method m = HTTP2JettyClient.class.getDeclaredMethod("isHttp3Expected", URI.class);
+    m.setAccessible(true);
+    return (Boolean) m.invoke(client, uri);
+  }
+
+  private boolean isHttp3ExplorationConnectTimeout(Throwable cause, Request request)
+      throws Exception {
+    Method m = HTTP2JettyClient.class.getDeclaredMethod(
+        "isHttp3ExplorationConnectTimeout", Throwable.class, Request.class);
+    m.setAccessible(true);
+    return (Boolean) m.invoke(client, cause, request);
+  }
 
   private Object resolveClientForRequest(HTTP2Sampler sampler, HTTPSampleResult result)
       throws Exception {
@@ -244,34 +308,10 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
     return f.get(client);
   }
 
-  private boolean shouldAttemptHttp3(URI uri, boolean recoverable) throws Exception {
-    Method m = HTTP2JettyClient.class.getDeclaredMethod(
-        "shouldAttemptHttp3", URI.class, boolean.class);
-    m.setAccessible(true);
-    return (boolean) m.invoke(client, uri, recoverable);
-  }
-
-  private boolean isHttp3Expected(URI uri) throws Exception {
-    Method m = HTTP2JettyClient.class.getDeclaredMethod("isHttp3Expected", URI.class);
-    m.setAccessible(true);
-    return (boolean) m.invoke(client, uri);
-  }
-
-  private boolean isHttp3ExplorationConnectTimeout(Throwable cause, Request request)
-      throws Exception {
-    Method m = HTTP2JettyClient.class.getDeclaredMethod(
-        "isHttp3ExplorationConnectTimeout", Throwable.class, Request.class);
-    m.setAccessible(true);
-    return (boolean) m.invoke(client, cause, request);
-  }
-
-  private Request mockRequestWithHttp3Attempted(URI uri) {
-    Request request = mock(Request.class);
-    Map<String, Object> attributes = new HashMap<>();
-    attributes.put("bzm.http3.attempted", Boolean.TRUE);
-    when(request.getURI()).thenReturn(uri);
-    when(request.getAttributes()).thenReturn(attributes);
-    return request;
+  private void setBoolean(HTTP2JettyClient target, String name, boolean value) throws Exception {
+    Field f = HTTP2JettyClient.class.getDeclaredField(name);
+    f.setAccessible(true);
+    f.setBoolean(target, value);
   }
 
   private void cacheAltSvc(boolean h3, long expiresInMs, long brokenForMs) throws Exception {
@@ -301,16 +341,9 @@ public class Http3ExplorationPolicyTest extends HTTP2TestBase {
   }
 
   @SuppressWarnings("unchecked")
-  private static Map<String, Object> altSvcCache() throws Exception {
+  private Map<String, Object> altSvcCache() throws Exception {
     Field f = HTTP2JettyClient.class.getDeclaredField("ALT_SVC_CACHE");
     f.setAccessible(true);
     return (Map<String, Object>) f.get(null);
-  }
-
-  private static void setBoolean(HTTP2JettyClient client, String name, boolean value)
-      throws Exception {
-    Field f = HTTP2JettyClient.class.getDeclaredField(name);
-    f.setAccessible(true);
-    f.setBoolean(client, value);
   }
 }
