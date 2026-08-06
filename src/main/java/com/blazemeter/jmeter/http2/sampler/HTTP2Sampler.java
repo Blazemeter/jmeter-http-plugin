@@ -15,6 +15,7 @@ import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.helger.commons.annotation.VisibleForTesting;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.net.ConnectException;
 import java.net.MalformedURLException;
 import java.net.SocketTimeoutException;
 import java.net.URISyntaxException;
@@ -387,6 +388,11 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
                                     int depth) {
     LOG.trace("=== sample() ENTRY ===");
     LOG.trace("URL: {}, method: {}, depth: {}", url, method, depth);
+    // Keep a local handle to the prepared result across path-local finally blocks that clear
+    // {@code this.result}. Those finallys must drop the field pin for GC, but the outer catch
+    // still needs the same object (cookies / request headers already applied) for errorResult —
+    // otherwise connect failures rebuild a blank result and assertions on "Cookie Data:" fail.
+    HTTPSampleResult preparedResult = null;
     try {
       HTTP2JettyClient client = clientFactory.call();
       LOG.trace("=== Client obtained, proceeding with request ===");
@@ -395,6 +401,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       if (!isSyncRequest()) {
         if (Objects.isNull(this.asyncListener)) {
           this.result = buildResult(url, method); // Save the main result for next step
+          preparedResult = this.result;
           this.pendingCompletionDepth = depth;
           HTTP2FutureResponseListener listener =
               new HTTP2FutureResponseListener(HTTP2JettyClient.getJettyBufferingMaxLength());
@@ -411,10 +418,12 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
           return null;
         } else {
           // If there is a listener, it is processed using the result it had
+          preparedResult = this.result;
           try {
             int completionDepth = depth > 0 ? depth : pendingCompletionDepth;
             this.result = sampleFromListener(
                 this.result, areFollowingRedirect, completionDepth, this.asyncListener);
+            preparedResult = this.result;
             return this.result;
           } finally {
             // Drop the buffering listener (unlimited body accumulator) as soon as the sample is
@@ -433,6 +442,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         }
       } else {
         HTTPSampleResult sampleResult = buildResult(url, method);
+        preparedResult = sampleResult;
         this.result = sampleResult;
         try {
           return client.sample(this, sampleResult, areFollowingRedirect, depth);
@@ -444,10 +454,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      if (Objects.isNull(this.result)) {
-        this.result = buildResult(url, method);
-      }
-      return buildErrorResult(e, this.result);
+      return buildErrorResult(e, resolveErrorResult(preparedResult, url, method));
     } catch (Exception e) {
       logSampleFailure(e);
 
@@ -480,13 +487,11 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
           try {
             // Get the client and request details for fallback
             HTTP2JettyClient client = clientFactory.call();
-            if (Objects.isNull(this.result)) {
-              this.result = buildResult(url, method);
-            }
+            HTTPSampleResult fallbackBase = resolveErrorResult(preparedResult, url, method);
 
             // Retry with HTTP/1.1 only
             LOG.info("Retrying request with HTTP/1.1 only: {}", url);
-            HTTPSampleResult fallbackResult = client.retryWithHTTP11Only(this, this.result);
+            HTTPSampleResult fallbackResult = client.retryWithHTTP11Only(this, fallbackBase);
 
             if (fallbackResult != null && fallbackResult.isSuccessful()) {
               LOG.info("HTTP/1.1 fallback succeeded: status={}", fallbackResult.getResponseCode());
@@ -500,11 +505,19 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         }
       }
 
-      if (Objects.isNull(this.result)) {
-        this.result = buildResult(url, method);
-      }
-      return buildErrorResult(e, this.result);
+      return buildErrorResult(e, resolveErrorResult(preparedResult, url, method));
     }
+  }
+
+  private HTTPSampleResult resolveErrorResult(HTTPSampleResult preparedResult, URL url,
+                                              String method) {
+    if (preparedResult != null) {
+      return preparedResult;
+    }
+    if (this.result != null) {
+      return this.result;
+    }
+    return buildResult(url, method);
   }
 
   private boolean isProtocolErrorFallbackEnabled() {
@@ -577,7 +590,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   @VisibleForTesting
   static boolean isExpectedSampleFailure(Throwable failure) {
     for (Throwable current = failure; current != null; current = current.getCause()) {
-      if (current instanceof TimeoutException || current instanceof SocketTimeoutException) {
+      if (current instanceof TimeoutException || current instanceof SocketTimeoutException
+          || current instanceof ConnectException) {
         return true;
       }
     }
