@@ -879,12 +879,9 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
   @Test
   public void shouldUseCookiesFromFirstRequestOnSecondRequestWhenSecondRequestIsSent()
       throws Exception {
-    server = new ServerBuilder()
-        .withHTTP1()
-        .withSSL()
-        .buildServer();
-    server.start();
-    syncServerPort();
+    // Must match client ALPN: an HTTP/1.1-only server against the default H2/H3 client causes
+    // protocol_error + fallback; that path is flaky on Linux CI (ExecutionException on sample 2).
+    buildStartedServer();
     CookieManager cookieManager = new CookieManager();
     cookieManager.testStarted(HOST_NAME);
     sampler.setCookieManager(cookieManager);
