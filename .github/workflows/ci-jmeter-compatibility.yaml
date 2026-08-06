@@ -43,19 +43,35 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.jmeter
-          key: jmeter-${{ runner.os }}-${{ hashFiles('pom.xml', 'src/test/resources/jmeter/**') }}
+          key: jmeter-${{ runner.os }}-${{ hashFiles('pom.xml', 'src/test/resources/jmeter/**', 'src/test/resources/jmeter-regression/**') }}
           restore-keys: |
             jmeter-${{ runner.os }}-
 
       - name: Build project and jmeter-test bundle
         run: xvfb-run -a mvn -U --batch-mode clean install
 
+      - name: Run JMeter HTTP parity regression (all tiers)
+        run: >-
+          xvfb-run -a mvn -Pjmeter-regression
+          -Dcheckstyle.skip=true
+          -DskipTests
+          -Djmeter.regression.tier=all
+          -Djmeter.regression.tolerateExternalServiceDrift=true
+          --batch-mode
+          verify
+
       - name: Run compatibility matrix on Java 17
         working-directory: target/jmeter-test
         env:
           JMETER_PATH_BASE: ${{ github.workspace }}/.jmeter
         run: |
-          JMETER_VERSION=5.6.3 JMETER_PATH=$JMETER_PATH_BASE/5.6.3 sh testJMeter.sh
+          # Verify the built plugin jar loads and runs against every JMeter version we claim
+          # to support: 5.5 (minimum) through 5.6.3 (latest), regardless of which version the
+          # jar itself was compiled against (jmeter.version in pom.xml is provided-scope).
+          for JMETER_VERSION in 5.5 5.6.3; do
+            echo "=== Compatibility check against JMeter $JMETER_VERSION ==="
+            JMETER_VERSION=$JMETER_VERSION JMETER_PATH=$JMETER_PATH_BASE/$JMETER_VERSION sh testJMeter.sh
+          done
 
       - name: Upload compatibility artifacts on failure
         if: failure()

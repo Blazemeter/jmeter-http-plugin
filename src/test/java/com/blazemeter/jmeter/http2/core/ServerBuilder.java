@@ -81,7 +81,19 @@ public class ServerBuilder {
   public static final String SERVER_PATH_200_FILE_SENT = "/test/file";
   public static final String SERVER_PATH_BIG_RESPONSE = "/test/big-response";
   public static final String SERVER_PATH_400 = "/test/400";
+  /**
+   * 401 without {@code WWW-Authenticate}: common for app-level auth (JWT, API key, etc.), not an
+   * HTTP Auth challenge. Used to assert Jetty does not fail the exchange (JMeter HttpClient4 parity).
+   */
+  public static final String SERVER_PATH_401_NO_WWW_AUTHENTICATE = "/test/401-no-www-authenticate";
   public static final String SERVER_PATH_302 = "/test/302";
+  /** Redirects to {@link #SERVER_PATH_200_WITH_BODY}, which echoes back whatever body it received. */
+  public static final String SERVER_PATH_302_TO_ECHO = "/test/302-to-echo";
+  /** Same as {@link #SERVER_PATH_302_TO_ECHO} but with a 307, which RFC 9110 requires to
+   *  preserve the original method and body (unlike 301/302/303). */
+  public static final String SERVER_PATH_307_TO_ECHO = "/test/307-to-echo";
+  /** Same as {@link #SERVER_PATH_307_TO_ECHO} but with a 308 (also method/body-preserving). */
+  public static final String SERVER_PATH_308_TO_ECHO = "/test/308-to-echo";
   public static final String SERVER_PATH_200_WITH_BODY = "/test/body";
   public static final String SERVER_PATH_JSON_ONLY = "/test/json-only";
   public static final String SERVER_PATH_DELETE_DATA = "/test/delete";
@@ -106,6 +118,8 @@ public class ServerBuilder {
   private final TeardownableServer server = new TeardownableServer();
   private final HttpConfiguration httpsConfig = new HttpConfiguration();
   private boolean withSSL;
+  private String serverKeyStorePathOverride;
+  private String serverKeyStoreTypeOverride;
   private HTTP2ServerConnectionFactory http2ConnectionFactory;
   private HttpConnectionFactory http1ConnectionFactory;
   private HTTP2CServerConnectionFactory http2cConnectionFactory;
@@ -136,6 +150,15 @@ public class ServerBuilder {
 
   public ServerBuilder withSSL() {
     this.withSSL = true;
+    return this;
+  }
+
+  /**
+   * Uses a filesystem keystore for the server TLS certificate (e.g. an untrusted JKS in tests).
+   */
+  public ServerBuilder withServerKeyStorePath(String keyStorePath, String keyStoreType) {
+    this.serverKeyStorePathOverride = keyStorePath;
+    this.serverKeyStoreTypeOverride = keyStoreType;
     return this;
   }
 
@@ -244,7 +267,13 @@ public class ServerBuilder {
 
   private SslContextFactory.Server buildServerSslContextFactory() {
     SslContextFactory.Server sslContextFactory = new SslContextFactory.Server();
-    sslContextFactory.setKeyStorePath(getKeyStorePathAsUriPathInSSLContextFactoryFormat());
+    if (serverKeyStorePathOverride != null) {
+      sslContextFactory.setKeyStorePath(
+          SslStorePathResolver.toJettyFileUri(serverKeyStorePathOverride));
+      sslContextFactory.setKeyStoreType(serverKeyStoreTypeOverride);
+    } else {
+      sslContextFactory.setKeyStorePath(getKeyStorePathAsUriPathInSSLContextFactoryFormat());
+    }
     sslContextFactory.setKeyStorePassword(KEYSTORE_PASSWORD);
     return sslContextFactory;
   }
@@ -276,7 +305,10 @@ public class ServerBuilder {
           case SERVER_PATH_200:
             resp.setStatus(HttpStatus.OK_200);
             resp.setContentType(MimeTypes.MIME_TEXT_HTML + ";" + StandardCharsets.UTF_8.name());
-            resp.getWriter().write(SERVER_RESPONSE);
+            // HEAD must not include a response body (RFC 9110).
+            if (!"HEAD".equalsIgnoreCase(req.getMethod())) {
+              resp.getWriter().write(SERVER_RESPONSE);
+            }
             break;
           case SERVER_PATH_SLOW:
             try {
@@ -289,10 +321,31 @@ public class ServerBuilder {
           case SERVER_PATH_400:
             resp.setStatus(HttpStatus.BAD_REQUEST_400);
             break;
+          case SERVER_PATH_401_NO_WWW_AUTHENTICATE:
+            // App-level unauthorized: no WWW-Authenticate (not an HTTP Auth challenge).
+            resp.setStatus(HttpStatus.UNAUTHORIZED_401);
+            resp.setContentType("text/plain; charset=utf-8");
+            resp.getWriter().write("Unauthorized");
+            break;
           case SERVER_PATH_302:
             resp.addHeader(HTTPConstants.HEADER_LOCATION,
                 "https://localhost:" + req.getLocalPort() + SERVER_PATH_200);
             resp.setStatus(HttpStatus.FOUND_302);
+            break;
+          case SERVER_PATH_302_TO_ECHO:
+            resp.addHeader(HTTPConstants.HEADER_LOCATION,
+                "https://localhost:" + req.getLocalPort() + SERVER_PATH_200_WITH_BODY);
+            resp.setStatus(HttpStatus.FOUND_302);
+            break;
+          case SERVER_PATH_307_TO_ECHO:
+            resp.addHeader(HTTPConstants.HEADER_LOCATION,
+                "https://localhost:" + req.getLocalPort() + SERVER_PATH_200_WITH_BODY);
+            resp.setStatus(HttpStatus.TEMPORARY_REDIRECT_307);
+            break;
+          case SERVER_PATH_308_TO_ECHO:
+            resp.addHeader(HTTPConstants.HEADER_LOCATION,
+                "https://localhost:" + req.getLocalPort() + SERVER_PATH_200_WITH_BODY);
+            resp.setStatus(HttpStatus.PERMANENT_REDIRECT_308);
             break;
           case SERVER_PATH_200_WITH_BODY:
             String bodyRequest = req.getReader().lines().collect(Collectors.joining());
@@ -398,8 +451,8 @@ public class ServerBuilder {
             resp.setStatus(HttpStatus.OK_200);
             break;
           case SERVER_PATH_BIG_RESPONSE:
-            resp.getOutputStream().write(new byte[(int) BIG_BUFFER_SIZE]);
             resp.setContentType("image/jpg");
+            resp.getOutputStream().write(new byte[(int) BIG_BUFFER_SIZE]);
             break;
         }
       }

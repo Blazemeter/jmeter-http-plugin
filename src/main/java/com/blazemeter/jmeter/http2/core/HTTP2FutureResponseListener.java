@@ -3,7 +3,7 @@ package com.blazemeter.jmeter.http2.core;
 import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
 
 import java.io.IOException;
-import java.net.URI;
+import java.lang.reflect.Field;
 import java.nio.charset.Charset;
 import java.nio.charset.IllegalCharsetNameException;
 import java.nio.charset.StandardCharsets;
@@ -14,14 +14,14 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.eclipse.jetty.client.AbstractResponseListener;
 import org.eclipse.jetty.client.BufferingResponseListener;
 import org.eclipse.jetty.client.ContentResponse;
-import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.client.Response;
 import org.eclipse.jetty.client.Result;
-import org.eclipse.jetty.http.HttpFields;
-import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.util.BufferUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,15 +34,32 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
   private volatile boolean onCompleteCalled = false;
   private final CountDownLatch latch = new CountDownLatch(1);
   private Request request;
-  private HttpClient fallbackHttp1Client;
   private ContentResponse response;
   private Throwable failure;
   private volatile boolean cancelled;
+  /**
+   * Set once a result has been handed to this listener from the outside via
+   * {@link #completeWith}, after which callbacks from its own request are ignored. See that method.
+   */
+  private volatile boolean sealed;
+  /**
+   * Protocol label when this listener belongs to one side of a protocol race ("HTTP/3", "HTTP/2").
+   * A failure on a raced attempt is not an error: it means that protocol was not negotiated for the
+   * origin, while the competing attempt still serves the request. See {@link #onComplete}.
+   */
+  private volatile String raceProtocol;
   private long responseStart;
   private long responseEnd;
+  /**
+   * {@link #releaseTransportBuffers()} is invoked from several completion paths (wrapper build,
+   * sealed HE abort {@code onFailure}/{@code onComplete}, {@code cancel}, sample materialisation).
+   * Jetty may also have released the accumulator already on abort — a second {@code clear()} then
+   * throws {@code IllegalStateException: Already released} and poisons the sample.
+   */
+  private final AtomicBoolean transportBuffersReleased = new AtomicBoolean();
 
   public HTTP2FutureResponseListener() {
-    this(2 * 1024 * 1024);
+    this(-1);
   }
 
   public HTTP2FutureResponseListener(int maxLength) {
@@ -64,8 +81,13 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     return request;
   }
 
-  public void setFallbackHttp1Client(HttpClient fallbackHttp1Client) {
-    this.fallbackHttp1Client = fallbackHttp1Client;
+  /** Marks this listener as one side of a protocol race. See {@link #raceProtocol}. */
+  public void setRaceProtocol(String raceProtocol) {
+    this.raceProtocol = raceProtocol;
+  }
+
+  public String getRaceProtocol() {
+    return raceProtocol;
   }
 
   protected void setStart() {
@@ -86,6 +108,18 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     return this.responseEnd;
   }
 
+  /**
+   * Adopts a result produced by a different request, used when a protocol race resolves in favour
+   * of a competing attempt and the winner's response is reported through this listener.
+   *
+   * <p>Seals the listener: whoever calls this then aborts the losing request, and that abort makes
+   * Jetty invoke {@link #onComplete}/{@link #onFailure} here with a CancellationException. Letting
+   * those through would overwrite {@link #failure} after the winning response was already stored,
+   * and {@link #getResult()} reports "failed after response received" whenever a failure is present
+   * - so a won race would surface as an error to anyone reading this listener afterwards. The
+   * synchronous caller never noticed because it returns the winner directly instead of reading back
+   * from here; a consumer that polls {@link #isDone()} and then calls {@link #get()} does.
+   */
   public void completeWith(ContentResponse response, long responseStart, long responseEnd) {
     this.response = response;
     this.failure = null;
@@ -94,6 +128,10 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     }
     this.responseEnd = responseEnd > 0 ? responseEnd : System.currentTimeMillis();
     this.onCompleteCalled = true;
+    this.sealed = true;
+    // Drop any partial body this listener may have buffered for its own (losing) attempt — the
+    // adopted response already carries the winner's bytes.
+    releaseTransportBuffers();
     this.latch.countDown();
   }
 
@@ -104,6 +142,12 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
    */
   @Override
   public void onFailure(Response response, Throwable failure) {
+    if (sealed) {
+      // Losing side of a resolved race being aborted; see completeWith.
+      lowLevelDebug("onFailure() ignored, listener already completed by a competing attempt");
+      releaseTransportBuffers();
+      return;
+    }
     lowLevelDebug("=== onFailure() CALLED ===");
     lowLevelDebug("Thread: {}", Thread.currentThread().getName());
     lowLevelDebug("Response: {}", response != null ? "present" : "null");
@@ -112,16 +156,22 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
         : "null";
     lowLevelDebug("Failure: {}", failureInfo);
     
-    // Store the failure immediately
+    // Store the failure immediately. If HPACK decode failed earlier,
+    // avoid protocol_error handling.
     this.failure = failure;
-    
+    if (failure != null && HpackFailureDetector.indicatesHpackFailure(failure)) {
+      lowLevelDebug("HPACK-related failure detected for request");
+      super.onFailure(response, failure);
+      return;
+    }
+
     // Check if this is a protocol_error
     if (failure != null) {
       lowLevelDebug("Checking isProtocolError in onFailure() for: {}",
           failure.getClass().getName());
       boolean isProtocolError = ProtocolErrorException.isProtocolError(failure);
       lowLevelDebug("isProtocolError returned: {}", isProtocolError);
-      
+
       if (isProtocolError) {
         lowLevelDebug("=== PROTOCOL_ERROR DETECTED IN onFailure() ===");
         lowLevelDebug("Original failure: {}: {}",
@@ -131,19 +181,25 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
         String message = failure.getMessage();
         // Replace failure with ProtocolErrorException so it can be caught specifically
         this.failure = new ProtocolErrorException(
-            message != null ? message : "protocol_error", 
+            message != null ? message : "protocol_error",
             failure);
         lowLevelDebug("Replaced with ProtocolErrorException: {}",
             this.failure.getClass().getName());
       }
     }
-    
+
     // Call super to maintain normal behavior
     super.onFailure(response, failure);
   }
 
   @Override
   public void onComplete(Result result) {
+    if (sealed) {
+      // Losing side of a resolved race being aborted; see completeWith.
+      lowLevelDebug("onComplete() ignored, listener already completed by a competing attempt");
+      releaseTransportBuffers();
+      return;
+    }
     // CRITICAL: Mark that onComplete was called
     onCompleteCalled = true;
     
@@ -178,16 +234,15 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
       boolean isProtocolError = ProtocolErrorException.isProtocolError(failure);
       lowLevelDebug("isProtocolError returned: {}", isProtocolError);
       
-      if (isProtocolError) {
+      if (isProtocolError && !HpackFailureDetector.indicatesHpackFailure(failure)) {
         lowLevelDebug("=== PROTOCOL_ERROR DETECTED IN onComplete() ===");
         lowLevelDebug("Original failure: {}: {}",
             failure.getClass().getName(), failure.getMessage());
         lowLevelDebug("HTTP/2 protocol_error detected in onComplete() - "
             + "replacing with ProtocolErrorException");
         String message = failure.getMessage();
-        // Replace failure with ProtocolErrorException so it can be caught specifically
         failure = new ProtocolErrorException(
-            message != null ? message : "protocol_error", 
+            message != null ? message : "protocol_error",
             failure);
         lowLevelDebug("Replaced with ProtocolErrorException: {}", failure.getClass().getName());
       }
@@ -206,22 +261,45 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
       // In Jetty 12, ContentResponse is abstract - create a wrapper implementation
       response = new ContentResponseWrapper(httpResponse, getContent(),
           getMediaType(), getEncoding());
+      // Wrapper owns the body bytes now; drop Jetty's accumulator / cached content array so a
+      // still-referenced listener (async controller wait, HE race) does not keep a second copy.
+      releaseTransportBuffers();
     } else {
+      // Failure / cancel with no response: Jetty may still hold a partial accumulator (common for
+      // Happy-Eyeballs losers aborted via request.abort rather than listener.cancel).
       lowLevelDebug("Response is null in onComplete()");
+      releaseTransportBuffers();
     }
     
     if (failure != null) {
-      LOG.error("Request failed with exception: type={}, message={}", 
-          failure.getClass().getName(), failure.getMessage());
-      if (failure instanceof IOException) {
-        IOException ioException = (IOException) failure;
-        String message = ioException.getMessage();
-        LOG.error("IOException message: {}", message);
-        if (message != null && message.contains("protocol_error")) {
-          LOG.error("HTTP/2 protocol_error in onComplete() - ALPN negotiation likely failed");
+      if (failure instanceof CancellationException) {
+        // The losing side of a resolved protocol race, or an explicit cancel(): expected, and the
+        // winner's response is reported elsewhere. Logging it as an error filled the log with
+        // failures that are not failures, one per raced request.
+        LOG.debug("{} attempt cancelled: {}",
+            raceProtocol != null ? raceProtocol : "Request", failure.getMessage());
+      } else if (raceProtocol != null) {
+        // One side of a race failing on its own is the expected outcome when the origin does not
+        // support that protocol: the other attempt serves the request, and the race only gives up
+        // once both sides fail - at which point the caller reports the real failure. Saying "not
+        // negotiated" rather than "failed" keeps this from reading as a broken request.
+        LOG.debug("{} not negotiated for {}: {}", raceProtocol,
+            request != null ? request.getURI() : "unknown", failure.getMessage());
+      } else {
+        // Internal transport detail; raise the logger to DEBUG to diagnose. The caller still
+        // observes the failure via get()/getResult() and decides fallback or sample error.
+        LOG.debug("Request failed with exception: type={}, message={}",
+            failure.getClass().getName(), failure.getMessage());
+        if (failure instanceof IOException) {
+          IOException ioException = (IOException) failure;
+          String message = ioException.getMessage();
+          LOG.debug("IOException message: {}", message);
+          if (message != null && message.contains("protocol_error")) {
+            LOG.debug("HTTP/2 protocol_error in onComplete() - ALPN negotiation likely failed");
+          }
         }
+        lowLevelDebug("Full failure stack trace:", failure);
       }
-      lowLevelDebug("Full failure stack trace:", failure);
     }
     
     latch.countDown();
@@ -311,13 +389,52 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
 
   @Override
   public boolean cancel(boolean mayInterruptIfRunning) {
-    LOG.error("=== cancel() called ===");
+    LOG.debug("=== cancel() called ===");
     cancelled = true;
     // In Jetty 12, abort() returns CompletableFuture<Boolean>
     if (request != null) {
       request.abort(new CancellationException());
     }
+    releaseTransportBuffers();
     return true;
+  }
+
+  /**
+   * Called once the sample has been materialised into a
+   * {@link org.apache.jmeter.samplers.SampleResult} so this listener can drop the Jetty request
+   * graph (attributes, body, conversation). The SampleResult already owns its own body copy; the
+   * {@link ContentResponse} wrapper (and its link back to Jetty's {@link Response}/{@link Request})
+   * must not stay pinned on this listener.
+   */
+  public void releaseAfterSampleMaterialised() {
+    releaseTransportBuffers();
+    this.request = null;
+    this.response = null;
+  }
+
+  /**
+   * Drops Jetty {@link AbstractResponseListener}'s cached {@code content} byte[] after the body has
+   * been copied into {@link ContentResponseWrapper} / SampleResult. That field is a full second
+   * copy of the response under unlimited buffering.
+   *
+   * <p>Do <strong>not</strong> {@code release()} the {@code accumulator}
+   * {@link org.eclipse.jetty.io.RetainableByteBuffer}: it is owned by Jetty's listener /
+   * {@code ByteBufferPool}. Returning it to the pool while connections may still reference it
+   * corrupts pooled buffers and collapses throughput (protocol errors, repeated HTTP/3
+   * exploration, multi-second samples). Jetty releases the accumulator with the exchange; we only
+   * drop the Java {@code content} duplicate and null request/response links.
+   */
+  private void releaseTransportBuffers() {
+    if (!transportBuffersReleased.compareAndSet(false, true)) {
+      return;
+    }
+    try {
+      Field contentField = AbstractResponseListener.class.getDeclaredField("content");
+      contentField.setAccessible(true);
+      contentField.set(this, BufferUtil.EMPTY_BYTES);
+    } catch (ReflectiveOperationException e) {
+      lowLevelDebug("Could not clear BufferingResponseListener.content", e);
+    }
   }
 
   @Override
@@ -341,13 +458,9 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     try {
       return getResult();
     } catch (ProtocolErrorException e) {
-      ContentResponse fallback = tryHttp11Fallback();
-      if (fallback != null) {
-        return fallback;
-      }
-      LOG.error("ProtocolErrorException caught in get(), wrapping in ExecutionException");
-      // Wrap ProtocolErrorException in ExecutionException to maintain interface contract
-      // The calling code will unwrap it and handle the fallback
+      LOG.debug("ProtocolErrorException caught in get(), wrapping in ExecutionException");
+      // Wrap ProtocolErrorException in ExecutionException so HTTP2JettyClient (the single,
+      // centralized place for HTTP/1.1 fallback decisions) can unwrap it and handle the fallback.
       throw new ExecutionException(e);
     }
   }
@@ -371,13 +484,9 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     try {
       return getResult();
     } catch (ProtocolErrorException e) {
-      ContentResponse fallback = tryHttp11Fallback();
-      if (fallback != null) {
-        return fallback;
-      }
-      LOG.error("ProtocolErrorException caught in get(timeout), wrapping in ExecutionException");
-      // Wrap ProtocolErrorException in ExecutionException to maintain interface contract
-      // The calling code will unwrap it and handle the fallback
+      LOG.debug("ProtocolErrorException caught in get(timeout), wrapping in ExecutionException");
+      // Wrap ProtocolErrorException in ExecutionException so HTTP2JettyClient (the single,
+      // centralized place for HTTP/1.1 fallback decisions) can unwrap it and handle the fallback.
       throw new ExecutionException(e);
     }
   }
@@ -406,51 +515,62 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
       throw (CancellationException) new CancellationException().initCause(failure);
     }
     if (failure != null) { // Failure and Response can coexist.
+      if (HpackFailureDetector.indicatesHpackFailure(failure)) {
+        lowLevelDebug("HPACK-related failure detected in getResult()");
+      }
       if (response == null) { // Only generate exception response when an response not exist
         // Generated by nginx GOAWAY
-        LOG.error("Request failed without response: exception type={}, message={}",
+        LOG.debug("Request failed without response: exception type={}, message={}",
             failure.getClass().getName(), failure.getMessage());
-        
+
         // Check if this is a protocol_error and throw ProtocolErrorException instead
-        // Add detailed logging to diagnose detection
-        LOG.error("Checking if failure is protocol_error: type={}, message={}", 
-            failure.getClass().getName(), failure.getMessage());
         boolean isProtocolError = ProtocolErrorException.isProtocolError(failure);
-        LOG.error("ProtocolErrorException.isProtocolError() returned: {}", isProtocolError);
-        
-        if (isProtocolError) {
+        LOG.debug("ProtocolErrorException.isProtocolError() returned: {}", isProtocolError);
+
+        if (isProtocolError && !HpackFailureDetector.indicatesHpackFailure(failure)) {
           String message = failure.getMessage();
-          LOG.error("HTTP/2 protocol_error detected in getResult() - "
-              + "throwing ProtocolErrorException");
-          LOG.error("  - ALPN negotiation may have failed during TLS handshake");
-          LOG.error("  - Server rejected HTTP/2 connection");
-          LOG.error("  - This will trigger HTTP/1.1 fallback");
+          LOG.debug("HTTP/2 protocol_error detected in getResult() - "
+              + "throwing ProtocolErrorException (HTTP/1.1 fallback may follow)");
           throw new ProtocolErrorException(message != null ? message : "protocol_error", failure);
-        } else {
-          LOG.error("Failure is NOT detected as protocol_error, will throw ExecutionException");
+        } else if (!HpackFailureDetector.indicatesHpackFailure(failure)) {
+          LOG.debug("Failure is NOT detected as protocol_error, will throw ExecutionException");
         }
-        
+
         if (failure instanceof IOException) {
           IOException ioException = (IOException) failure;
           String message = ioException.getMessage();
-          LOG.error("IOException details: {}", message);
+          LOG.debug("IOException details: {}", message);
         }
         lowLevelDebug("Full failure stack trace (no response):", failure);
         throw new ExecutionException(failure);
       } else {
         // It is a failure caused after obtaining the response,
         // analyzing what type of failure it is, and incorporating mechanisms to manage it.
-        LOG.warn("Request failed after response received: status={}, version={}, exception={}",
-            response.getStatus(), response.getVersion(), failure.getClass().getName());
-        
+        if (failure instanceof CancellationException) {
+          // The losing side of a protocol race ends cancelled once the winner has answered. That is
+          // the algorithm working, not a failure, and warning about it made a healthy run look
+          // broken once per raced request.
+          lowLevelDebug("{} attempt cancelled after response: status={}, version={}",
+              raceProtocol != null ? raceProtocol : "Request", response.getStatus(),
+              response.getVersion());
+        } else if (raceProtocol != null) {
+          LOG.debug("{} not negotiated after response: status={}, version={}, exception={}",
+              raceProtocol, response.getStatus(), response.getVersion(),
+              failure.getClass().getName());
+        } else {
+          LOG.debug("Request failed after response received: status={}, version={}, exception={}",
+              response.getStatus(), response.getVersion(), failure.getClass().getName());
+        }
+
         // Check if this is a protocol_error even though we have a response
-        if (ProtocolErrorException.isProtocolError(failure)) {
+        if (ProtocolErrorException.isProtocolError(failure)
+            && !HpackFailureDetector.indicatesHpackFailure(failure)) {
           String message = failure.getMessage();
-          LOG.error("HTTP/2 protocol_error detected after response - "
+          LOG.debug("HTTP/2 protocol_error detected after response - "
               + "throwing ProtocolErrorException");
           throw new ProtocolErrorException(message != null ? message : "protocol_error", failure);
         }
-        
+
         lowLevelDebug("Failure after response received:", failure);
         throw new ExecutionException(failure);
       }
@@ -463,47 +583,6 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
           response.getStatus(), response.getVersion());
     }
     return response;
-  }
-
-  private ContentResponse tryHttp11Fallback() {
-    if (fallbackHttp1Client == null || request == null) {
-      return null;
-    }
-    try {
-      Request http11Request = fallbackHttp1Client.newRequest(request.getURI())
-          .method(request.getMethod())
-          .followRedirects(request.isFollowRedirects());
-      if (request.getHeaders() != null) {
-        HttpFields originalHeaders = request.getHeaders();
-        HttpFields requestHeaders = http11Request.getHeaders();
-        if (requestHeaders instanceof HttpFields.Mutable) {
-          HttpFields.Mutable newHeaders = (HttpFields.Mutable) requestHeaders;
-          originalHeaders.forEach(field -> {
-            String name = field.getName();
-            if (!name.startsWith(":")) {
-              newHeaders.put(name, field.getValue());
-            }
-          });
-          if (!newHeaders.contains(HttpHeader.HOST)) {
-            URI uri = request.getURI();
-            String host = uri.getHost() != null ? uri.getHost() : uri.getAuthority();
-            int port = uri.getPort();
-            int defaultPort = "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
-            boolean includePort = port > 0 && port != defaultPort;
-            String hostValue = includePort ? host + ":" + port : host;
-            newHeaders.put(HttpHeader.HOST, hostValue);
-          }
-        }
-      }
-      if (request.getBody() != null) {
-        http11Request.body(request.getBody());
-      }
-      lowLevelDebug("Retrying request with HTTP/1.1 in listener fallback: {}", request.getURI());
-      return http11Request.send();
-    } catch (Exception e) {
-      LOG.error("HTTP/1.1 fallback in listener failed", e);
-      return null;
-    }
   }
 
 }

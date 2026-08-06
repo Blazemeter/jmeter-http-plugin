@@ -4,7 +4,7 @@
   <groupId>com.blazemeter.jmeter</groupId>
   <artifactId>jmeter-bzm-http2</artifactId>
   <packaging>jar</packaging>
-  <version>3.0.2-SNAPSHOT</version>
+  <version>3.1.0</version>
   <name>BlazeMeter HTTP</name>
   <description>BlazeMeter HTTP Plugin for JMeter (HTTP/1.1, HTTP/2, HTTP/3/QUIC)</description>
   <licenses>
@@ -30,10 +30,16 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-    <jmeter.version>5.4.1</jmeter.version>
-    <jetty.version>12.1.6</jetty.version>
-    <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.6 -->
-    <brotli4j.version>1.20.0</brotli4j.version>
+    <jmeter.version>5.5</jmeter.version>
+    <jmeter.regression.version>5.6.3</jmeter.regression.version>
+    <jmeter.regression.tests>TEST_HTTP,ResponseDecompression,TestHeaderManager,TestCookieManager</jmeter.regression.tests>
+    <jmeter.regression.extended.tests>HTMLParserTestFile_2,TEST_HTTPS,Http4ImplDigestAuth,Http4ImplPreemptiveBasicAuth</jmeter.regression.extended.tests>
+    <jmeter.regression.external.tests>TestKeepAlive,TestRedirectionPolicies</jmeter.regression.external.tests>
+    <jetty.version>12.1.11</jetty.version>
+    <!-- Matches the log4j that JMeter 5.6.x ships in lib/, which provides the API at runtime. -->
+    <log4j.version>2.22.1</log4j.version>
+    <!-- Matches jetty-project ${brotli4j.version} for Jetty 12.1.11 -->
+    <brotli4j.version>1.23.0</brotli4j.version>
     <checkstyle.skip>false</checkstyle.skip>
   </properties>
   <dependencies>
@@ -49,12 +55,24 @@
       <version>${jmeter.version}</version>
       <scope>provided</scope>
     </dependency>
+    <dependency>
+      <groupId>org.apache.jmeter</groupId>
+      <artifactId>ApacheJMeter_components</artifactId>
+      <version>${jmeter.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.jmeter</groupId>
+      <artifactId>ApacheJMeter_java</artifactId>
+      <version>${jmeter.version}</version>
+      <scope>test</scope>
+    </dependency>
     <!-- Apache HttpClient for compilation (classes used in JettyCacheManager) -->
-    <!-- Using same version as JMeter 5.4.1 -->
+    <!-- Using same version as JMeter 5.5 (our minimum supported version) -->
     <dependency>
       <groupId>org.apache.httpcomponents</groupId>
       <artifactId>httpcore</artifactId>
-      <version>4.4.14</version>
+      <version>4.4.15</version>
       <scope>compile</scope>
     </dependency>
     <dependency>
@@ -64,9 +82,15 @@
       <scope>compile</scope>
     </dependency>
     <dependency>
+      <groupId>commons-io</groupId>
+      <artifactId>commons-io</artifactId>
+      <version>2.15.1</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>org.apache.commons</groupId>
       <artifactId>commons-lang3</artifactId>
-      <version>3.12.0</version>
+      <version>3.18.0</version>
       <scope>compile</scope>
     </dependency>
     <dependency>
@@ -177,6 +201,33 @@
       <artifactId>slf4j-api</artifactId>
       <version>2.0.9</version>
     </dependency>
+    <!--
+      SLF4J provider for the *relocated* org.slf4j, bundled in the shaded jar.
+      Without it, SLF4J finds no provider for com.blazemeter.jmeter.http2.shaded.org.slf4j and
+      falls back to NOP, so every log statement in this plugin and in the shaded Jetty is silently
+      discarded at runtime (JMeter's own log4j-slf4j-impl only binds the unrelocated org.slf4j).
+      This binding talks to the unrelocated org.apache.logging.log4j API, so records end up in
+      JMeter's log4j-core and therefore in jmeter.log. Version matches the log4j that JMeter ships.
+      See the org.apache.logging.slf4j relocation below, which is required to make this work.
+    -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-slf4j2-impl</artifactId>
+      <version>${log4j.version}</version>
+    </dependency>
+    <!-- Provided by JMeter's lib/; must not be bundled or it would shadow the runtime's own. -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-api</artifactId>
+      <version>${log4j.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>${log4j.version}</version>
+      <scope>provided</scope>
+    </dependency>
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-simple</artifactId>
@@ -189,10 +240,27 @@
       <version>2.28.2</version>
       <scope>test</scope>
     </dependency>
+    <!-- Pin byte-buddy to 1.14.18 to resolve classpath conflict:
+         mockito-core 2.28.2 pulls byte-buddy ~1.9.x which lacks ElementMatchers.namedOneOf(),
+         a method required by assertj-core 3.27.7's SoftProxies initialisation.
+         1.14.x is the last series compatible with the Mockito 2.x instrumentation API
+         while also satisfying assertj-core 3.27.x. Remove these pins when mockito is upgraded. -->
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy</artifactId>
+      <version>1.14.18</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy-agent</artifactId>
+      <version>1.14.18</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.assertj</groupId>
       <artifactId>assertj-core</artifactId>
-      <version>3.12.2</version>
+      <version>3.27.7</version>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -275,7 +343,7 @@
     <dependency>
       <groupId>com.google.guava</groupId>
       <artifactId>guava</artifactId>
-      <version>29.0-jre</version>
+      <version>32.0.0-jre</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
@@ -328,6 +396,19 @@
                 <relocation>
                   <pattern>org.slf4j</pattern>
                   <shadedPattern>com.blazemeter.jmeter.http2.shaded.org.slf4j</shadedPattern>
+                </relocation>
+                <!--
+                  log4j-slf4j2-impl's own classes live in org.apache.logging.slf4j, the same package
+                  JMeter's log4j-slf4j-impl (the SLF4J 1.7 binding) uses. Leaving them unrelocated
+                  makes the two bindings collide on class names such as Log4jLoggerFactory, and
+                  whichever the classloader picks first may be the one compiled against the *other*
+                  SLF4J API. Relocating keeps our binding self-consistent with the relocated
+                  org.slf4j above. Note org.apache.logging.log4j (the API) is deliberately NOT
+                  relocated: it has to resolve to JMeter's log4j-core so records reach jmeter.log.
+                -->
+                <relocation>
+                  <pattern>org.apache.logging.slf4j</pattern>
+                  <shadedPattern>com.blazemeter.jmeter.http2.shaded.org.apache.logging.slf4j</shadedPattern>
                 </relocation>
                 <!-- Do not relocate com.github.luben.zstd; zstd-jni uses native linkage. -->
                 <relocation>
@@ -383,6 +464,16 @@
         <configuration>
           <!-- avoid issue with jdk 11+ -->
           <useSystemClassLoader>false</useSystemClassLoader>
+          <!--
+            log4j-slf4j2-impl exists only to be bundled (relocated) in the shaded jar. Tests run
+            against unshaded classes, where it lands in the same org.apache.logging.slf4j package as
+            the SLF4J 1.7 binding that JMeter pulls in, and the two disagree on constructors
+            (NoSuchMethodError on Log4jLoggerFactory while initializing JMeterUtils). Keep it off
+            the test classpath; unit tests log through slf4j-simple as before.
+          -->
+          <classpathDependencyExcludes>
+            <classpathDependencyExclude>org.apache.logging.log4j:log4j-slf4j2-impl</classpathDependencyExclude>
+          </classpathDependencyExcludes>
           <!-- Allow slf4j-simple in unit tests to enable Jetty frame logging. -->
           <excludes>
             <exclude>**/*IntegrationTest.java</exclude>
@@ -453,7 +544,14 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-checkstyle-plugin</artifactId>
-        <version>3.1.0</version>
+        <version>3.3.1</version>
+        <dependencies>
+          <dependency>
+            <groupId>com.puppycrawl.tools</groupId>
+            <artifactId>checkstyle</artifactId>
+            <version>10.17.0</version>
+          </dependency>
+        </dependencies>
         <executions>
           <execution>
             <id>validate</id>
@@ -475,9 +573,18 @@
         <artifactId>maven-failsafe-plugin</artifactId>
         <version>2.22.2</version>
         <configuration>
+          <useSystemClassLoader>false</useSystemClassLoader>
           <includes>
             <include>**/*IntegrationTest.java</include>
           </includes>
+          <excludes>
+            <exclude>**/regression/**</exclude>
+          </excludes>
+          <!-- Same clash as in surefire above: the shaded-jar-only SLF4J binding must stay off the
+               unshaded test classpath. -->
+          <classpathDependencyExcludes>
+            <classpathDependencyExclude>org.apache.logging.log4j:log4j-slf4j2-impl</classpathDependencyExclude>
+          </classpathDependencyExcludes>
         </configuration>
         <executions>
           <execution>
@@ -627,6 +734,118 @@
               <publishingServerId>central</publishingServerId>
               <autoPublish>true</autoPublish>
               <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
+      <id>jmeter-regression</id>
+      <properties>
+        <checkstyle.skip>true</checkstyle.skip>
+        <skipTests>true</skipTests>
+        <jmeter.regression>true</jmeter.regression>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <skip>true</skip>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <skipTests>false</skipTests>
+              <includes>
+                <include>**/regression/**/*IntegrationTest.java</include>
+              </includes>
+              <excludes combine.self="override"/>
+              <systemPropertyVariables>
+                <jmeter.regression>${jmeter.regression}</jmeter.regression>
+                <jmeter.regression.tests>${jmeter.regression.tests}</jmeter.regression.tests>
+                <jmeter.regression.tier>${jmeter.regression.tier}</jmeter.regression.tier>
+                <jmeter.regression.version>${jmeter.regression.version}</jmeter.regression.version>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
+      <id>jmeter-regression-extended</id>
+      <properties>
+        <checkstyle.skip>true</checkstyle.skip>
+        <skipTests>true</skipTests>
+        <jmeter.regression>true</jmeter.regression>
+        <jmeter.regression.tier>extended</jmeter.regression.tier>
+        <jmeter.regression.tests>${jmeter.regression.extended.tests}</jmeter.regression.tests>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <skip>true</skip>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <skipTests>false</skipTests>
+              <includes>
+                <include>**/regression/**/*IntegrationTest.java</include>
+              </includes>
+              <excludes combine.self="override"/>
+              <systemPropertyVariables>
+                <jmeter.regression>${jmeter.regression}</jmeter.regression>
+                <jmeter.regression.tests>${jmeter.regression.tests}</jmeter.regression.tests>
+                <jmeter.regression.tier>${jmeter.regression.tier}</jmeter.regression.tier>
+                <jmeter.regression.version>${jmeter.regression.version}</jmeter.regression.version>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
+      <id>jmeter-regression-external</id>
+      <properties>
+        <checkstyle.skip>true</checkstyle.skip>
+        <skipTests>true</skipTests>
+        <jmeter.regression>true</jmeter.regression>
+        <jmeter.regression.tier>external</jmeter.regression.tier>
+        <jmeter.regression.tests>${jmeter.regression.external.tests}</jmeter.regression.tests>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <skip>true</skip>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <skipTests>false</skipTests>
+              <includes>
+                <include>**/regression/**/*IntegrationTest.java</include>
+              </includes>
+              <excludes combine.self="override"/>
+              <systemPropertyVariables>
+                <jmeter.regression>${jmeter.regression}</jmeter.regression>
+                <jmeter.regression.tests>${jmeter.regression.tests}</jmeter.regression.tests>
+                <jmeter.regression.tier>${jmeter.regression.tier}</jmeter.regression.tier>
+                <jmeter.regression.version>${jmeter.regression.version}</jmeter.regression.version>
+              </systemPropertyVariables>
             </configuration>
           </plugin>
         </plugins>
