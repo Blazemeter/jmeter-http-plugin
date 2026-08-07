@@ -636,8 +636,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     err.setHTTPMethod(HTTPConstants.GET);
     long endedAtMs = System.currentTimeMillis();
     long elapsedMs = Math.max(0L, endedAtMs - startedAtMs);
-    // Stamp end = now, start = now - elapsed (same contract as a real timed-out HC4 sample).
-    err.setStampAndTime(endedAtMs, elapsedMs);
+    // SampleResult.setStampAndTime(stamp, elapsed) treats stamp as start (end = stamp + elapsed).
+    err.setStampAndTime(startedAtMs, elapsedMs);
     err.setConnectTime(0L);
     err.setLatency(0L);
     return errorResult(new SocketTimeoutException("Read timed out"), err);
