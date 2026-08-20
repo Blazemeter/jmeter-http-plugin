@@ -569,9 +569,32 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         result.sampleEnd();
       }
     }
-    return errorResult(
-        JmeterHttpClientExceptionMapper.forSampleResult(e, getAutoRedirects(), result.getURL()),
-        result);
+    Throwable failure =
+        JmeterHttpClientExceptionMapper.forSampleResult(e, getAutoRedirects(), result.getURL());
+    attachConnectAttempts(failure, result);
+    return errorResult(failure, result);
+  }
+
+  /**
+   * Recovers the per-address connection failures Jetty discarded while walking the resolved
+   * addresses, so the response data shows every address tried and why, not only the last one.
+   *
+   * <p>Reads the client already cached for this thread instead of asking the factory: building one
+   * here would be a side effect on the error path, and a sample that never got that far has
+   * nothing recorded anyway.
+   */
+  private void attachConnectAttempts(Throwable failure, HTTPSampleResult result) {
+    if (failure == null || result.getURL() == null) {
+      return;
+    }
+    try {
+      HTTP2JettyClient client = CONNECTIONS.get().get(buildConnectionKey());
+      if (client != null) {
+        client.attachConnectAttempts(failure, result.getURL(), result.getStartTime());
+      }
+    } catch (Exception ignored) {
+      // Diagnostics must never replace the failure the sample is actually reporting.
+    }
   }
 
   /**

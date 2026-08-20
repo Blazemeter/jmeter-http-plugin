@@ -18,6 +18,7 @@ import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Method;
 import java.net.MalformedURLException;
+import java.net.SocketAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -317,6 +318,12 @@ public class HTTP2JettyClient {
    * {@code findAuthentication} (realm/URI matching quirks) and prevents per-sample list growth.
    */
   private final Set<String> registeredAuthFingerprints = ConcurrentHashMap.newKeySet();
+  /**
+   * Recovers the per-address connection failures Jetty discards while walking the resolved
+   * addresses. Shared by every connector this client builds, so an attempt is captured whichever
+   * protocol variant made it.
+   */
+  private final ConnectAttemptRecorder connectAttempts = new ConnectAttemptRecorder();
 
   public HTTP2JettyClient(boolean http1UpgradeRequired, String name) {
     this(http1UpgradeRequired, name, null);
@@ -568,7 +575,8 @@ public class HTTP2JettyClient {
     // even though ALPN negotiates HTTP/2 successfully. This is a regression from Jetty 11.
     // We try HTTP/2 first, then fallback to HTTP/1.1 if needed.
     ClientConnectionFactory.Info[] mainProtocols = buildMainProtocols(http3, http2, http11);
-    HttpClientTransport transport = new HttpClientTransportDynamic(clientConnector, mainProtocols);
+    HttpClientTransport transport =
+        new RecordingHttpClientTransportDynamic(clientConnector, mainProtocols);
     mainProtocolsSnapshot = protocolList(mainProtocols);
     lowLevelDebug("HttpClientTransportDynamic configured with protocols: {}",
         mainProtocolsSnapshot);
@@ -585,13 +593,14 @@ public class HTTP2JettyClient {
       ClientConnector noH3Connector = createClientConnector(name + "-noh3");
       ClientConnectionFactory.Info[] noH3Protocols = buildNoH3Protocols(http2, http11);
       HttpClientTransport noH3Transport =
-          new HttpClientTransportDynamic(noH3Connector, noH3Protocols);
+          new RecordingHttpClientTransportDynamic(noH3Connector, noH3Protocols);
       configureTransport(noH3Transport);
       this.httpClientNoH3 = new HttpClient(noH3Transport);
       configureHttpClient(this.httpClientNoH3, noH3Connector);
     }
     ClientConnector http1Connector = createClientConnector(name + "-http1");
-    HttpClientTransport http1Transport = new HttpClientTransportDynamic(http1Connector, http11);
+    HttpClientTransport http1Transport =
+        new RecordingHttpClientTransportDynamic(http1Connector, http11);
     // HTTP/1.1 has no multiplexing (Jetty rejects a 2nd in-flight exchange per connection).
     configureTransport(http1Transport, 1);
     this.httpClientHttp1Only = new HttpClient(http1Transport);
@@ -611,7 +620,7 @@ public class HTTP2JettyClient {
     ClientConnectionFactory.Info[] h2cUpgradeProtocols =
         buildH2cUpgradeProtocols(http11, http2cUpgrade);
     HttpClientTransport h2cUpgradeTransport =
-        new HttpClientTransportDynamic(h2cUpgradeConnector, h2cUpgradeProtocols);
+        new RecordingHttpClientTransportDynamic(h2cUpgradeConnector, h2cUpgradeProtocols);
     configureTransport(h2cUpgradeTransport);
     this.httpClientH2cUpgrade = new HttpClient(h2cUpgradeTransport);
     configureHttpClient(this.httpClientH2cUpgrade, h2cUpgradeConnector);
@@ -625,7 +634,8 @@ public class HTTP2JettyClient {
     } else {
       http2cClient.setMaxConcurrentPushedStreams(maxConcurrentPushedStreams);
     }
-    HttpClientTransport h2cTransport = new CustomHttpClientTransportOverHTTP2(http2cClient);
+    HttpClientTransport h2cTransport =
+        new CustomHttpClientTransportOverHTTP2(http2cClient, connectAttempts);
     configureTransport(h2cTransport);
     this.httpClientH2cPrior = new HttpClient(h2cTransport);
     configureHttpClient(this.httpClientH2cPrior, h2cConnector);
@@ -1228,7 +1238,8 @@ public class HTTP2JettyClient {
 
     // Create transport with ONLY HTTP/1.1 (no HTTP/2)
     ClientConnectionFactory.Info http11 = HttpClientConnectionFactory.HTTP11;
-    HttpClientTransport transport = new HttpClientTransportDynamic(clientConnector, http11);
+    HttpClientTransport transport =
+        new RecordingHttpClientTransportDynamic(clientConnector, http11);
     lowLevelDebug("HttpClientTransportDynamic configured with HTTP/1.1 only (fallback mode)");
 
     HttpClient http11Client = new HttpClient(transport);
@@ -3330,6 +3341,28 @@ public class HTTP2JettyClient {
     return request;
   }
 
+  /**
+   * {@link HttpClientTransportDynamic} that lets {@link ConnectAttemptRecorder} see the failure of
+   * each resolved address before Jetty silently moves on to the next one.
+   *
+   * <p>This is the one point where the address being attempted and the promise that decides the
+   * roll-over are both in hand, which is why it covers a refused socket, a TLS handshake and the
+   * HTTP/2 preface alike.
+   */
+  private class RecordingHttpClientTransportDynamic extends HttpClientTransportDynamic {
+
+    RecordingHttpClientTransportDynamic(ClientConnector connector,
+                                        ClientConnectionFactory.Info... infos) {
+      super(connector, infos);
+    }
+
+    @Override
+    public void connect(SocketAddress address, Map<String, Object> context) {
+      connectAttempts.instrument(address, context);
+      super.connect(address, context);
+    }
+  }
+
   private static class HappyEyeballsThreadFactory implements ThreadFactory {
     private final String prefix;
     private final AtomicInteger counter = new AtomicInteger(1);
@@ -3435,6 +3468,14 @@ public class HTTP2JettyClient {
     return baseDir.resolve("jmeter-http2-plugin")
         .resolve("target")
         .resolve("http2-client-alpn.log");
+  }
+
+  /**
+   * Attaches every connection failure recorded for {@code url} since {@code sinceMillis} to
+   * {@code failure} as suppressed exceptions, recovering the attempts Jetty discarded.
+   */
+  public void attachConnectAttempts(Throwable failure, URL url, long sinceMillis) {
+    connectAttempts.attachTo(failure, url, sinceMillis);
   }
 
   private ClientConnector createClientConnector(String name) {
