@@ -60,6 +60,7 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.Inflater;
 import java.util.zip.InflaterInputStream;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.http.conn.DnsResolver;
 import org.apache.jmeter.protocol.http.control.AuthManager;
 import org.apache.jmeter.protocol.http.control.Authorization;
 import org.apache.jmeter.protocol.http.control.Cookie;
@@ -317,6 +318,12 @@ public class HTTP2JettyClient {
    * {@code findAuthentication} (realm/URI matching quirks) and prevents per-sample list growth.
    */
   private final Set<String> registeredAuthFingerprints = ConcurrentHashMap.newKeySet();
+  /**
+   * The sampler's DNS Cache Manager, or {@code null} when the plan has none. Held so
+   * {@link #configureHttpClient} can install {@link JMeterDnsSocketAddressResolver} on every
+   * protocol-variant client before any of them is started.
+   */
+  private final DnsResolver dnsResolver;
 
   public HTTP2JettyClient(boolean http1UpgradeRequired, String name) {
     this(http1UpgradeRequired, name, null);
@@ -324,6 +331,12 @@ public class HTTP2JettyClient {
 
   public HTTP2JettyClient(boolean http1UpgradeRequired, String name,
                           HTTP2ClientProfileConfig profileConfig) {
+    this(http1UpgradeRequired, name, profileConfig, null);
+  }
+
+  public HTTP2JettyClient(boolean http1UpgradeRequired, String name,
+                          HTTP2ClientProfileConfig profileConfig, DnsResolver dnsResolver) {
+    this.dnsResolver = dnsResolver;
     loadProperties(profileConfig);
     lowLevelDebug(PLUGIN_BUILD_TAG);
 
@@ -3348,6 +3361,7 @@ public class HTTP2JettyClient {
 
   private void configureHttpClient(HttpClient client, ClientConnector connector) {
     client.setUserAgentField(null);
+    configureDnsResolution(client);
     connector.setByteBufferPool(this.bufferPool);
     client.setMaxRequestsQueuedPerDestination(maxRequestsQueuedPerDestination);
     client.setMaxConnectionsPerDestination(maxConnectionsPerDestination);
@@ -3364,6 +3378,23 @@ public class HTTP2JettyClient {
     if (LowLevelDebugLog.isEnabled()) {
       addConnectionLogging(client);
     }
+  }
+
+  /**
+   * Routes host name resolution through the plan's DNS Cache Manager, when there is one.
+   *
+   * <p>With no manager configured nothing is set and {@code HttpClient.doStart} installs its own
+   * {@code SocketAddressResolver.Async}, which is the same default {@code HTTPHC4Impl} falls back
+   * to ({@code SystemDefaultDnsResolver}). Under a proxy this still resolves the proxy host rather
+   * than the target host, because Jetty resolves {@code HttpDestination.resolveOrigin()} - again
+   * matching HC4, which connects to the proxy hop of the route.
+   */
+  private void configureDnsResolution(HttpClient client) {
+    if (dnsResolver == null) {
+      return;
+    }
+    client.setSocketAddressResolver(new JMeterDnsSocketAddressResolver(dnsResolver,
+        client::getExecutor, client::getScheduler, client.getAddressResolutionTimeout()));
   }
 
   private static void addConnectionLogging(HttpClient client) {
