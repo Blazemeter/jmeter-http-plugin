@@ -183,6 +183,15 @@ public class HTTP2JettyClient {
   private static final String ATTR_SKIP_H2C_UPGRADE = "bzm.skipH2cUpgrade";
   private static final String ATTR_ORIGIN_KEY = "bzm.http3.origin";
   private static final String ATTR_REQUEST_HEADERS_SERIALIZED = "bzm.request.headers.serialized";
+  /**
+   * JMeter's deprecated "BASIC_DIGEST" Auth Manager mechanism, still selectable in the GUI and
+   * still present in older plans. HC4 keeps honouring it: {@code AuthManager.setupCredentials}
+   * registers the credentials without binding them to a scheme, so they answer either challenge,
+   * and the preemptive auth cache treats the row as Basic. Referenced by name so this file does
+   * not have to carry a deprecation suppression, the same way the surrounding code compares
+   * mechanisms by {@code name()}.
+   */
+  private static final String BASIC_DIGEST_MECHANISM = "BASIC_DIGEST";
   private static final String PROP_SKIP_REDUNDANT_MANUAL_DECODE =
       "blazemeter.http.skipManualDecodeWhenAdvertised";
   private static final Path DEBUG_LOG_PATH = resolveDebugLogPath();
@@ -3648,24 +3657,44 @@ public class HTTP2JettyClient {
   private boolean isSupportedMechanism(Authorization auth) {
     String authName = auth.getMechanism().name();
     return authName.equals(AuthManager.Mechanism.BASIC.name())
-        || authName.equals(AuthManager.Mechanism.DIGEST.name());
+        || authName.equals(AuthManager.Mechanism.DIGEST.name())
+        || authName.equals(BASIC_DIGEST_MECHANISM);
+  }
+
+  /**
+   * Whether the row may answer a {@code Basic} challenge, which {@code BASIC_DIGEST} rows may.
+   */
+  private static boolean answersBasicChallenge(Authorization auth) {
+    String authName = auth.getMechanism().name();
+    return authName.equals(AuthManager.Mechanism.BASIC.name())
+        || authName.equals(BASIC_DIGEST_MECHANISM);
+  }
+
+  /**
+   * Whether the row may answer a {@code Digest} challenge, which {@code BASIC_DIGEST} rows may.
+   */
+  private static boolean answersDigestChallenge(Authorization auth) {
+    String authName = auth.getMechanism().name();
+    return authName.equals(AuthManager.Mechanism.DIGEST.name())
+        || authName.equals(BASIC_DIGEST_MECHANISM);
   }
 
   private void addAuthenticationToJettyClient(Authorization auth) {
     String authName = auth.getMechanism().name();
-    if (authName.equals(AuthManager.Mechanism.BASIC.name())
-        && BzmHttpPluginProperties.getPropDefault("httpJettyClient.auth.preemptive", false)) {
+    boolean preemptive =
+        BzmHttpPluginProperties.getPropDefault("httpJettyClient.auth.preemptive", false);
+    if (preemptive && answersBasicChallenge(auth)) {
       BasicAuthentication.BasicResult result =
           new BasicAuthentication.BasicResult(URI.create(auth.getURL()), auth.getUser(),
               auth.getPass());
       // Results are keyed by URI (Map.put replaces); safe to re-register every sample.
       forEachAuthenticationStore(store -> store.addAuthenticationResult(result));
-      return;
-    }
-
-    String fingerprint = authFingerprint(auth);
-    if (!registeredAuthFingerprints.add(fingerprint)) {
-      return;
+      if (authName.equals(AuthManager.Mechanism.BASIC.name())) {
+        return;
+      }
+      // A BASIC_DIGEST row falls through: sending Basic up front is what HC4's auth cache does,
+      // but the credentials must still be able to answer whichever challenge the server sends
+      // back, which is the whole point of the mechanism.
     }
 
     URI uri = URI.create(auth.getURL());
@@ -3674,10 +3703,26 @@ public class HTTP2JettyClient {
       // Blank JMeter realm must match any challenge realm; "" would only match "".
       realm = Authentication.ANY_REALM;
     }
-    AbstractAuthentication authentication =
-        authName.equals(AuthManager.Mechanism.BASIC.name())
-            ? new BasicAuthentication(uri, realm, auth.getUser(), auth.getPass())
-            : new DigestAuthentication(uri, realm, auth.getUser(), auth.getPass());
+    if (answersBasicChallenge(auth)) {
+      registerAuthentication(auth,
+          new BasicAuthentication(uri, realm, auth.getUser(), auth.getPass()));
+    }
+    if (answersDigestChallenge(auth)) {
+      registerAuthentication(auth,
+          new DigestAuthentication(uri, realm, auth.getUser(), auth.getPass()));
+    }
+  }
+
+  /**
+   * Adds one Jetty authentication to every protocol-variant store, once per distinct row.
+   *
+   * <p>The fingerprint carries the Jetty authentication type because a single {@code BASIC_DIGEST}
+   * row produces two of them, and both have to get through.
+   */
+  private void registerAuthentication(Authorization auth, AbstractAuthentication authentication) {
+    if (!registeredAuthFingerprints.add(authFingerprint(auth) + '|' + authentication.getType())) {
+      return;
+    }
     forEachAuthenticationStore(store -> store.addAuthentication(authentication));
   }
 
@@ -4000,7 +4045,7 @@ public class HTTP2JettyClient {
     StreamSupport.stream(authManager.getAuthObjects().spliterator(), false)
         .map(j -> (Authorization) j.getObjectValue())
         .filter(auth -> auth != null
-            && AuthManager.Mechanism.BASIC.equals(auth.getMechanism())
+            && answersBasicChallenge(auth)
             && !StringUtils.isEmpty(auth.getURL()))
         .filter(auth -> url.toString().startsWith(auth.getURL()))
         .findFirst()
