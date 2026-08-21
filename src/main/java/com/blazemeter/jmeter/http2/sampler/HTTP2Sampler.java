@@ -39,6 +39,7 @@ import org.apache.jmeter.config.Arguments;
 import org.apache.jmeter.engine.event.LoopIterationEvent;
 import org.apache.jmeter.engine.event.LoopIterationListener;
 import org.apache.jmeter.processor.PreProcessor;
+import org.apache.jmeter.protocol.http.control.DNSCacheManager;
 import org.apache.jmeter.protocol.http.parser.BaseParser;
 import org.apache.jmeter.protocol.http.parser.LinkExtractorParseException;
 import org.apache.jmeter.protocol.http.parser.LinkExtractorParser;
@@ -879,7 +880,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     InetAddress sourceAddress = resolveSourceAddress();
     HTTP2JettyClient client = new HTTP2JettyClient(isHttp1UpgradeEnabled(),
         "http2[" + connectionKey.target + ":" + Thread.currentThread().getId() + "]",
-        buildProfileConfig());
+        buildProfileConfig(), getDNSResolver());
     if (sourceAddress != null) {
       client.setSourceAddress(sourceAddress);
     }
@@ -932,6 +933,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     appendLongKey(key, "h2cttl", getH2cCacheTtlMs());
     appendBooleanKey(key, "h2cup", isHttp1UpgradeEnabled());
     appendSourceAddressKey(key);
+    appendDnsResolverKey(key);
     return key.toString();
   }
 
@@ -961,6 +963,18 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     if (!sourceAddress.isEmpty()) {
       key.append(";ipsrc=").append(sourceAddress);
     }
+  }
+
+  /**
+   * A cached client carries the DNS Cache Manager it was built with, so two samplers under
+   * different managers (or one with a manager and one without) must not share it. Identity is
+   * enough: JMeter clones the manager once per thread and the client cache is per thread too, so
+   * the instance is stable for as long as the entry can be reused.
+   */
+  private void appendDnsResolverKey(StringBuilder key) {
+    DNSCacheManager dnsCacheManager = getDNSResolver();
+    key.append(";dns=")
+        .append(dnsCacheManager == null ? "-" : System.identityHashCode(dnsCacheManager));
   }
 
   private void appendBooleanKey(StringBuilder key, String name, Boolean value) {
