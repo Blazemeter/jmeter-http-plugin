@@ -6,6 +6,7 @@ import com.blazemeter.jmeter.http2.core.HTTP2ClientProfileConfig;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
 import com.blazemeter.jmeter.http2.core.HpackFailureDetector;
+import com.blazemeter.jmeter.http2.core.JMeterSourceAddressResolver;
 import com.blazemeter.jmeter.http2.core.JmeterHttpClientExceptionMapper;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
@@ -16,6 +17,7 @@ import com.helger.commons.annotation.VisibleForTesting;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.ConnectException;
+import java.net.InetAddress;
 import java.net.MalformedURLException;
 import java.net.SocketTimeoutException;
 import java.net.URISyntaxException;
@@ -873,9 +875,15 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
   private HTTP2JettyClient buildClient() throws Exception {
     HTTP2ClientKey connectionKey = buildConnectionKey();
+    // Resolved before the client exists: a bad source address must fail the sample without
+    // leaving an orphaned client behind, and it is the cheapest thing here to get wrong.
+    InetAddress sourceAddress = resolveSourceAddress();
     HTTP2JettyClient client = new HTTP2JettyClient(isHttp1UpgradeEnabled(),
         "http2[" + connectionKey.target + ":" + Thread.currentThread().getId() + "]",
         buildProfileConfig(), getDNSResolver());
+    if (sourceAddress != null) {
+      client.setSourceAddress(sourceAddress);
+    }
     client.start();
     CONNECTIONS.get().put(connectionKey, client);
     return client;
@@ -924,8 +932,37 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     appendLongKey(key, "h1cd", getHttp1OnlyCooldownMs());
     appendLongKey(key, "h2cttl", getH2cCacheTtlMs());
     appendBooleanKey(key, "h2cup", isHttp1UpgradeEnabled());
+    appendSourceAddressKey(key);
     appendDnsResolverKey(key);
     return key.toString();
+  }
+
+  /**
+   * The local address outgoing connections must be bound to - the sampler's "Source address"
+   * field (IP spoofing), or the {@code httpclient.localaddress} property.
+   *
+   * <p>A bad host name, IP or interface propagates out and fails the sample, which is what HC4
+   * does by letting {@code getIpSourceAddress} throw out of {@code setupRequest}. Silently falling
+   * back to the default interface would make a spoofing plan look like it works while every
+   * request leaves from the wrong address.
+   */
+  private InetAddress resolveSourceAddress() throws Exception {
+    if (!JMeterSourceAddressResolver.isConfigured(this)) {
+      return null;
+    }
+    return JMeterSourceAddressResolver.resolve(this);
+  }
+
+  /**
+   * Jetty binds the source address per client, not per request, so a cached client carries the one
+   * it was built with. Keying on the raw configuration - not on the resolved address - keeps this
+   * off the per-sample path: resolving a device name walks the interface list.
+   */
+  private void appendSourceAddressKey(StringBuilder key) {
+    String sourceAddress = JMeterSourceAddressResolver.cacheKeyFor(this);
+    if (!sourceAddress.isEmpty()) {
+      key.append(";ipsrc=").append(sourceAddress);
+    }
   }
 
   /**
