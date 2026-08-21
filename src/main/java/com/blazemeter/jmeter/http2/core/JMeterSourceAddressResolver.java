@@ -82,7 +82,7 @@ public final class JMeterSourceAddressResolver {
   public static boolean isConfigured(HTTPSamplerBase sampler) {
     String ipSource = sampler.getIpSource();
     return (ipSource != null && !ipSource.trim().isEmpty())
-        || !JMeterUtils.getPropDefault(LOCAL_ADDRESS_PROPERTY, "").isEmpty();
+        || !JMeterUtils.getPropDefault(LOCAL_ADDRESS_PROPERTY, "").trim().isEmpty();
   }
 
   private static InetAddress resolveIpSource(String ipSource, int ipSourceType)
@@ -131,7 +131,7 @@ public final class JMeterSourceAddressResolver {
    * is allowed to fail a sample.
    */
   private static InetAddress resolveLocalAddressProperty() {
-    String localHostOrIp = JMeterUtils.getPropDefault(LOCAL_ADDRESS_PROPERTY, "");
+    String localHostOrIp = JMeterUtils.getPropDefault(LOCAL_ADDRESS_PROPERTY, "").trim();
     if (localHostOrIp.isEmpty()) {
       return null;
     }
