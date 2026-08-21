@@ -22,24 +22,24 @@ import org.junit.Before;
 import org.junit.Test;
 
 /**
- * Reproduction of the failure seen against {@code login.microsoftonline.com} from inside an AKS
- * pod, which does not happen from outside it. Both halves of that environment are simulated here.
+ * Reproduction of a failure that needs two conditions at once, which is why it only shows up in
+ * networks that have both. Each is simulated here.
  *
  * <p><b>The peer.</b> {@code withSSL()} without {@code withALPN()} terminates TLS and hands
  * straight to HTTP/1.1, so no ALPN protocol is ever selected - the shape a TLS-inspecting egress
- * produces, and what curl reported from the pod ({@code ALPN: server did not agree on a
- * protocol}). Jetty then picks the first configured protocol, HTTP/2, and the preface is answered
- * with HTTP/1.1 bytes, which our parser rejects with {@code FRAME_SIZE_ERROR}.
+ * produces, and one that RFC 7301 permits, since a server "MAY return a suitable protocol
+ * selection response". Jetty then picks the first configured protocol, HTTP/2, and the preface is
+ * answered with HTTP/1.1 bytes, which our parser rejects with {@code FRAME_SIZE_ERROR}.
  *
- * <p><b>The address list.</b> The pod resolved 8 usable IPv4 addresses followed by 8 unreachable
- * IPv6 ones. Binding the server to {@code 127.0.0.1} only, and sampling {@code localhost},
- * reproduces that: the first address works at the socket level and dies at the HTTP/2 preface, and
- * the next one fails outright - so the failure that survives Jetty's connect loop is the second
- * one, and the perfectly usable first address is never reported.
+ * <p><b>The address list.</b> A host that resolves to reachable addresses followed by unreachable
+ * ones. Binding the server to {@code 127.0.0.1} only, and sampling {@code localhost}, reproduces
+ * it: the first address works at the socket level and dies at the HTTP/2 preface, and the next one
+ * fails outright - so the failure that survives Jetty's connect loop is the second one, and the
+ * perfectly usable first address is never reported.
  *
- * <p>That second half is what makes this fail rather than merely be slow. With a single address
- * the plugin's HTTP/1.1 fallback rescues the sample after one wasted connection, which is why this
- * never reproduced outside the pod.
+ * <p>That second condition is what makes this fail rather than merely be slow. With a single
+ * address the plugin's HTTP/1.1 fallback rescues the sample after one wasted connection, which is
+ * why the defect stays invisible on an ordinary dual-stack host with working connectivity.
  */
 public class AlpnAbsentHttp2RejectedTest extends HTTP2TestBase {
 
@@ -53,8 +53,8 @@ public class AlpnAbsentHttp2RejectedTest extends HTTP2TestBase {
   @Before
   public void setUp() throws Exception {
     HTTP2JettyClientTestIsolation.resetSharedClientState();
-    // Only the IPv4 loopback listens, so the other address localhost resolves to fails to connect
-    // exactly the way the pod's IPv6 addresses did.
+    // Only the IPv4 loopback listens, so the other address localhost resolves to fails to connect,
+    // standing in for an address family the network has no route for.
     server = buildServer("127.0.0.1");
     server.start();
     port = ((ServerConnector) server.getConnectors()[0]).getLocalPort();
