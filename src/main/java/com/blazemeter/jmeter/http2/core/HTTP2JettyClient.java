@@ -17,6 +17,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Method;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
 import java.net.SocketAddress;
 import java.net.URI;
@@ -33,11 +35,13 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -334,6 +338,11 @@ public class HTTP2JettyClient {
    * protocol variant made it.
    */
   private final ConnectAttemptRecorder connectAttempts = new ConnectAttemptRecorder();
+  /**
+   * Every {@link ClientConnector} this client builds, so {@link #setSourceAddress} can reach the
+   * QUIC one too - no transport {@code doStart} propagates the bind address to it.
+   */
+  private final List<ClientConnector> connectors = new ArrayList<>();
   /**
    * The sampler's DNS Cache Manager, or {@code null} when the plan has none. Held so
    * {@link #configureHttpClient} can install {@link JMeterDnsSocketAddressResolver} on every
@@ -3511,6 +3520,29 @@ public class HTTP2JettyClient {
   }
 
   /**
+   * Binds every outgoing connection of this client to {@code sourceAddress} (JMeter's "Source
+   * address" field, a.k.a. IP spoofing), or restores the OS default when {@code null}.
+   *
+   * <p>Must be called before {@link #start()}: Jetty reads the bind address in
+   * {@code AbstractConnectorHttpClientTransport.doStart}, which then pushes it onto the transport's
+   * own connector. The QUIC connector used for HTTP/3 is not owned by any transport's
+   * {@code doStart}, so it is set here directly - which is also why the connectors are tracked.
+   *
+   * <p>Unlike HC4 this is per client rather than per request, because that is the granularity Jetty
+   * offers. {@code HTTP2Sampler} compensates by keying its per-thread client cache on the
+   * sampler's source-address configuration, so two samplers spoofing different IPs get their own
+   * client instead of silently sharing one.
+   */
+  public void setSourceAddress(InetAddress sourceAddress) {
+    SocketAddress bindAddress =
+        sourceAddress == null ? null : new InetSocketAddress(sourceAddress, 0);
+    forEachHttpClient(client -> client.setBindAddress(bindAddress));
+    for (ClientConnector connector : connectors) {
+      connector.setBindAddress(bindAddress);
+    }
+  }
+
+  /**
    * Attaches every connection failure recorded for {@code url} since {@code sinceMillis} to
    * {@code failure} as suppressed exceptions, recovering the attempts Jetty discarded.
    */
@@ -3520,6 +3552,7 @@ public class HTTP2JettyClient {
 
   private ClientConnector createClientConnector(String name) {
     ClientConnector connector = new ClientConnector();
+    connectors.add(connector);
     if (sharedThreadPoolEnabled) {
       connector.setSelectors(-1);
     } else {
