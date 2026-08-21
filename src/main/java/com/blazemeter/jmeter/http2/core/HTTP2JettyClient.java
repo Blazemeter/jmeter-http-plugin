@@ -88,6 +88,7 @@ import org.eclipse.jetty.client.BasicAuthentication;
 import org.eclipse.jetty.client.BytesRequestContent;
 import org.eclipse.jetty.client.ContentDecoder;
 import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.Destination;
 import org.eclipse.jetty.client.DigestAuthentication;
 import org.eclipse.jetty.client.FormRequestContent;
 import org.eclipse.jetty.client.HttpClient;
@@ -132,6 +133,7 @@ import org.eclipse.jetty.io.ByteBufferPool;
 import org.eclipse.jetty.io.ClientConnectionFactory;
 import org.eclipse.jetty.io.ClientConnector;
 import org.eclipse.jetty.io.Connection;
+import org.eclipse.jetty.io.EndPoint;
 import org.eclipse.jetty.io.Transport;
 import org.eclipse.jetty.io.ssl.SslConnection;
 import org.eclipse.jetty.io.ssl.SslHandshakeListener;
@@ -468,7 +470,7 @@ public class HTTP2JettyClient {
     }
 
     CustomClientConnectionFactoryOverHTTP2.HTTP2 http2 =
-        new CustomClientConnectionFactoryOverHTTP2.HTTP2(http2Client);
+        new CustomClientConnectionFactoryOverHTTP2.HTTP2(http2Client, this::onHttp2Rejected);
 
     // Configure server push (can be disabled for compatibility)
     if (disableServerPush) {
@@ -2128,7 +2130,8 @@ public class HTTP2JettyClient {
           throw e;
         }
       }
-      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)
+          || shouldFallbackToHttp11AfterHttp2Rejected(request.getURI())) {
         LOG.warn("Transport failure detected in send()! Attempting fallback to HTTP/1.1");
         LOG.warn("Error details: message='{}', exception={}",
             cause != null ? cause.getMessage() : e.getMessage(),
@@ -3105,6 +3108,28 @@ public class HTTP2JettyClient {
     }
   }
 
+  /**
+   * Records that an origin does not speak HTTP/2 at all, so every later sample to it goes straight
+   * to HTTP/1.1 instead of paying a failed HTTP/2 attempt per resolved address.
+   *
+   * <p>Reported by {@code CustomHttpSessionListenerPromise} only when the session died before the
+   * server preface arrived, which is what separates "this peer cannot speak HTTP/2" from a healthy
+   * session being closed. The usual cause is a TLS handshake that selected no ALPN protocol -
+   * Jetty then falls back to the first configured protocol, which is HTTP/2 - and it is worth
+   * remembering because Jetty treats each rejected attempt as a failed connection and rolls over
+   * to the next address, burning every usable one before reporting whatever the last address said.
+   */
+  private void onHttp2Rejected(URI origin) {
+    if (!enableHttp1 || !http1OnlyCacheEnabled || http1OnlyCooldownMs <= 0 || origin == null) {
+      lowLevelDebug("Origin {} rejected the HTTP/2 preface but will not be remembered "
+              + "(enableHttp1={}, http1OnlyCacheEnabled={}, cooldownMs={})",
+          origin, enableHttp1, http1OnlyCacheEnabled, http1OnlyCooldownMs);
+      return;
+    }
+    lowLevelDebug("Origin {} rejected the HTTP/2 preface; remembering it as HTTP/1.1-only", origin);
+    markHttp1OnlyOrigin(originKey(origin));
+  }
+
   private void markHttp1OnlyOrigin(String origin) {
     Http1OnlyEntry entry = new Http1OnlyEntry();
     entry.expiresAt = System.currentTimeMillis() + http1OnlyCooldownMs;
@@ -3240,6 +3265,21 @@ public class HTTP2JettyClient {
     return ProtocolErrorException.isProtocolError(wrapped)
         || ProtocolErrorException.isProtocolError(cause)
         || isClosedChannelFailure(cause != null ? cause : wrapped);
+  }
+
+  /**
+   * Whether this failure should be retried over HTTP/1.1 because the origin turned out not to
+   * speak HTTP/2 while this very request was being attempted.
+   *
+   * <p>Needed on top of {@link #shouldFallbackToHttp11AfterTransportFailure} because the exception
+   * that reaches the caller is whatever the <em>last</em> resolved address produced, and Jetty
+   * discards the earlier ones. An origin whose usable addresses all rejected the HTTP/2 preface
+   * therefore surfaces as a plain socket error from some later, unrelated address: a host that
+   * resolves to several reachable addresses followed by unreachable ones fails the preface on
+   * each reachable one, and then reports whatever the first unreachable one said.
+   */
+  private boolean shouldFallbackToHttp11AfterHttp2Rejected(URI uri) {
+    return protocolErrorFallbackEnabled && enableHttp1 && uri != null && isHttp1Only(uri);
   }
 
   private static boolean isClosedChannelFailure(Throwable throwable) {
@@ -3382,15 +3422,64 @@ public class HTTP2JettyClient {
    */
   private class RecordingHttpClientTransportDynamic extends HttpClientTransportDynamic {
 
+    private final ClientConnectionFactory.Info[] infos;
+
     RecordingHttpClientTransportDynamic(ClientConnector connector,
                                         ClientConnectionFactory.Info... infos) {
       super(connector, infos);
+      this.infos = infos;
     }
 
     @Override
     public void connect(SocketAddress address, Map<String, Object> context) {
       connectAttempts.instrument(address, context);
       super.connect(address, context);
+    }
+
+    /**
+     * Stops re-offering HTTP/2 to an origin already known to reject it, address after address.
+     *
+     * <p>Jetty resolves the connection factory once per resolved address, so without this the
+     * first rejection is paid again on every remaining address of the same request: each one
+     * completes TCP and TLS, gets the preface refused, and counts as a failed connection attempt
+     * that rolls over to the next. Consulting what {@link #onHttp2Rejected} already learned turns
+     * that into a single wasted connection for the whole origin.
+     *
+     * <p>Deliberately keyed on that knowledge rather than on the negotiated ALPN protocol: at this
+     * point the TLS handshake has not run yet, so neither the context nor the {@code SSLEngine}
+     * knows what was agreed, and an origin that does speak HTTP/2 never reaches this branch
+     * because nothing ever marks it.
+     */
+    @Override
+    public Connection newConnection(EndPoint endPoint, Map<String, Object> context)
+        throws IOException {
+      ClientConnectionFactory.Info http11 = http11ForOriginThatRejectedHttp2(context);
+      if (http11 != null) {
+        return http11.getClientConnectionFactory().newConnection(endPoint, context);
+      }
+      return super.newConnection(endPoint, context);
+    }
+
+    private ClientConnectionFactory.Info http11ForOriginThatRejectedHttp2(
+        Map<String, Object> context) {
+      if (!enableHttp1) {
+        return null;
+      }
+      Destination destination = (Destination) context.get(Destination.CONTEXT_KEY);
+      if (destination == null) {
+        return null;
+      }
+      URI origin = URI.create(destination.getOrigin().asString());
+      if (!isHttp1Only(origin)) {
+        return null;
+      }
+      lowLevelDebug("Origin {} is known to reject HTTP/2; using HTTP/1.1 for this address", origin);
+      for (ClientConnectionFactory.Info info : infos) {
+        if (info.getProtocols(destination.isSecure()).contains("http/1.1")) {
+          return info;
+        }
+      }
+      return null;
     }
   }
 
