@@ -2,8 +2,10 @@ package com.blazemeter.jmeter.http2.core.jetty.custom.http2;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.URI;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import org.eclipse.jetty.client.Connection;
 import org.eclipse.jetty.client.Destination;
 import org.eclipse.jetty.client.HttpClient;
@@ -24,9 +26,16 @@ public class CustomClientConnectionFactoryOverHTTP2 extends ContainerLifeCycle
     implements ClientConnectionFactory, HttpClient.Aware {
   private final ClientConnectionFactory factory = new CustomHTTP2ClientConnectionFactory();
   private final HTTP2Client http2Client;
+  private final Consumer<URI> onHttp2Rejected;
 
   public CustomClientConnectionFactoryOverHTTP2(HTTP2Client http2Client) {
+    this(http2Client, null);
+  }
+
+  public CustomClientConnectionFactoryOverHTTP2(HTTP2Client http2Client,
+      Consumer<URI> onHttp2Rejected) {
     this.http2Client = http2Client;
+    this.onHttp2Rejected = onHttp2Rejected;
     installBean(http2Client);
   }
 
@@ -39,7 +48,7 @@ public class CustomClientConnectionFactoryOverHTTP2 extends ContainerLifeCycle
   public org.eclipse.jetty.io.Connection newConnection(EndPoint endPoint,
       Map<String, Object> context) throws IOException {
     CustomHttpSessionListenerPromise listenerPromise = new CustomHttpSessionListenerPromise(
-        context);
+        context, onHttp2Rejected);
     context.put(HTTP2Client.CONTEXT_KEY, http2Client);
     context.put(HTTP2Client.SESSION_LISTENER_CONTEXT_KEY, listenerPromise);
     context.put(HTTP2Client.SESSION_PROMISE_CONTEXT_KEY, listenerPromise);
@@ -50,11 +59,16 @@ public class CustomClientConnectionFactoryOverHTTP2 extends ContainerLifeCycle
     private final List<String> protocols;
 
     public HTTP2(HTTP2Client http2Client) {
-      this(http2Client, List.of("h2", "h2-17", "h2-16", "h2-15"));
+      this(http2Client, null);
     }
 
-    public HTTP2(HTTP2Client http2Client, List<String> protocols) {
-      super(new CustomClientConnectionFactoryOverHTTP2(http2Client));
+    public HTTP2(HTTP2Client http2Client, Consumer<URI> onHttp2Rejected) {
+      this(http2Client, List.of("h2", "h2-17", "h2-16", "h2-15"), onHttp2Rejected);
+    }
+
+    public HTTP2(HTTP2Client http2Client, List<String> protocols,
+        Consumer<URI> onHttp2Rejected) {
+      super(new CustomClientConnectionFactoryOverHTTP2(http2Client, onHttp2Rejected));
       this.protocols = protocols;
     }
 
