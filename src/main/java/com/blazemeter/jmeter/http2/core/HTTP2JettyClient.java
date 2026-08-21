@@ -3243,9 +3243,9 @@ public class HTTP2JettyClient {
    * <p>Needed on top of {@link #shouldFallbackToHttp11AfterTransportFailure} because the exception
    * that reaches the caller is whatever the <em>last</em> resolved address produced, and Jetty
    * discards the earlier ones. An origin whose usable addresses all rejected the HTTP/2 preface
-   * can therefore surface as a plain socket error from some later, unrelated address - which is
-   * exactly what happened against {@code login.microsoftonline.com} from a pod whose IPv6 had no
-   * route: eight good IPv4 addresses rejected the preface, and the sample reported the ninth.
+   * therefore surfaces as a plain socket error from some later, unrelated address: a host that
+   * resolves to several reachable addresses followed by unreachable ones fails the preface on
+   * each reachable one, and then reports whatever the first unreachable one said.
    */
   private boolean shouldFallbackToHttp11AfterHttp2Rejected(URI uri) {
     return protocolErrorFallbackEnabled && enableHttp1 && uri != null && isHttp1Only(uri);
