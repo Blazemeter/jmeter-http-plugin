@@ -22,6 +22,7 @@ import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.sampler.HTTPSamplerBase.SourceType;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.samplers.SampleResult;
+import org.apache.jmeter.util.JMeterUtils;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.io.ClientConnector;
 import org.eclipse.jetty.io.Connection;
@@ -43,6 +44,8 @@ public class HTTP2JettyClientSourceAddressTest extends HTTP2TestBase {
       "httpClientH2cUpgrade"
   };
 
+  private final List<String[]> savedProperties = new ArrayList<>();
+
   private TeardownableServer server;
   private HTTP2JettyClient client;
   private HTTP2Sampler sampler;
@@ -63,6 +66,13 @@ public class HTTP2JettyClientSourceAddressTest extends HTTP2TestBase {
     }
     if (server != null && server.isStarted()) {
       server.stop();
+    }
+    for (String[] saved : savedProperties) {
+      if (saved[1] == null) {
+        JMeterUtils.getJMeterProperties().remove(saved[0]);
+      } else {
+        JMeterUtils.setProperty(saved[0], saved[1]);
+      }
     }
   }
 
@@ -192,6 +202,42 @@ public class HTTP2JettyClientSourceAddressTest extends HTTP2TestBase {
     assertThat(profileKey(withSource)).isNotEqualTo(profileKey(withAnotherSource));
     assertThat(profileKey(withSource)).isNotEqualTo(profileKey(withAnotherType));
     assertThat(profileKey(withSource)).isEqualTo(profileKey(withSource));
+  }
+
+  @Test
+  public void clientCacheKeyFollowsTheLocalAddressPropertyWhenNoSamplerFieldIsSet()
+      throws Exception {
+    // Two samplers with no Source address field bind to whatever httpclient.localaddress says, so
+    // sharing a client is right while that value holds - but a cached client keeps the address it
+    // was built with, and a plan can change a JMeter property at runtime.
+    HTTP2Sampler sampler = newSampler("localhost", 8080);
+    String withoutProperty = profileKey(sampler);
+
+    overrideProperty("httpclient.localaddress", "127.0.0.1");
+    String withProperty = profileKey(sampler);
+    overrideProperty("httpclient.localaddress", "127.0.0.2");
+    String withAnotherProperty = profileKey(sampler);
+
+    assertThat(withoutProperty).isNotEqualTo(withProperty);
+    assertThat(withProperty).isNotEqualTo(withAnotherProperty);
+  }
+
+  @Test
+  public void clientCacheKeyPrefersTheSamplerFieldOverTheLocalAddressProperty() throws Exception {
+    // The field wins in resolve(), so it has to win in the key too: the property is irrelevant to
+    // what these clients bind to.
+    HTTP2Sampler sampler = newSampler("localhost", 8080);
+    sampler.setIpSource("127.0.0.1");
+    String withoutProperty = profileKey(sampler);
+
+    overrideProperty("httpclient.localaddress", "127.0.0.2");
+
+    assertThat(profileKey(sampler)).isEqualTo(withoutProperty);
+  }
+
+  private void overrideProperty(String key, String value) {
+    savedProperties.add(new String[] {key, JMeterUtils.getProperty(key)});
+    JMeterUtils.setProperty(key, value);
   }
 
   private static boolean isBindable(InetAddress address) {

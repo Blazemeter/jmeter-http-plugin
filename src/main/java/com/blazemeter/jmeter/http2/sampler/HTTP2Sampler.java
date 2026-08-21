@@ -957,11 +957,10 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
    * off the per-sample path: resolving a device name walks the interface list.
    */
   private void appendSourceAddressKey(StringBuilder key) {
-    String ipSource = getIpSource();
-    if (ipSource == null || ipSource.trim().isEmpty()) {
-      return;
+    String sourceAddress = JMeterSourceAddressResolver.cacheKeyFor(this);
+    if (!sourceAddress.isEmpty()) {
+      key.append(";ipsrc=").append(sourceAddress);
     }
-    key.append(";ipsrc=").append(ipSource.trim()).append('/').append(getIpSourceType());
   }
 
   private void appendBooleanKey(StringBuilder key, String name, Boolean value) {

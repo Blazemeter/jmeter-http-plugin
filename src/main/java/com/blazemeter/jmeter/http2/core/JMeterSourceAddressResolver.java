@@ -51,6 +51,29 @@ public final class JMeterSourceAddressResolver {
   }
 
   /**
+   * Identifies the source-address configuration a client would be built with, for use in a client
+   * cache key. Empty when no source address applies.
+   *
+   * <p>Mirrors the precedence in {@link #resolve} without resolving anything, so it stays off the
+   * per-sample path: resolving a device name walks the interface list.
+   *
+   * <p>{@code httpclient.localaddress} is included even though it is global and normally constant.
+   * Every sampler that falls back to it binds to the same address, so sharing one client is the
+   * right outcome and keying on it changes nothing in a normal run - but a plan can change a
+   * JMeter property at runtime, and a cached client keeps the address it was built with. Reading
+   * the raw value costs a property lookup and removes the assumption that it never moves.
+   */
+  public static String cacheKeyFor(HTTPSamplerBase sampler) {
+    String ipSource = sampler.getIpSource();
+    if (ipSource != null && !ipSource.trim().isEmpty()) {
+      return ipSource.trim() + "/" + sampler.getIpSourceType();
+    }
+    String localAddress = JMeterUtils.getPropDefault(LOCAL_ADDRESS_PROPERTY, "").trim();
+    // Prefixed so a property value can never collide with a sampler field of the same text.
+    return localAddress.isEmpty() ? "" : "@" + localAddress;
+  }
+
+  /**
    * Whether {@code sampler} asks for any source address at all, without resolving it.
    *
    * <p>Lets callers keep an unconfigured plan on the cheap path: no interface enumeration, and no
