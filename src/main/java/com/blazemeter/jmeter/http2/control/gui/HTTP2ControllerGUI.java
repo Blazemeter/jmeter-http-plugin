@@ -18,12 +18,15 @@ import org.apache.jmeter.testelement.TestElement;
 public class HTTP2ControllerGUI extends AbstractControllerGui implements Scrollable {
   private static final long serialVersionUID = 240L;
   private final JCheckBox generateControllerSample;
+  private final JCheckBox includeTimers;
   private final JCheckBox limitMaxParallel;
   private final JTextField maxParallelField;
   private int defaultMaxParallel;
 
   public HTTP2ControllerGUI() {
     generateControllerSample = new JCheckBox("Generate Parent Sample");
+    includeTimers = new JCheckBox(
+        "Include duration of timer and pre-post processors in generated sample");
     limitMaxParallel = new JCheckBox("Limit max number of parallel executions");
     maxParallelField = new JTextField(8);
     init();
@@ -47,6 +50,7 @@ public class HTTP2ControllerGUI extends AbstractControllerGui implements Scrolla
     if (el instanceof HTTP2Controller) {
       HTTP2Controller controller = (HTTP2Controller) el;
       controller.setGenerateControllerSample(generateControllerSample.isSelected());
+      controller.setIncludeTimers(includeTimers.isSelected());
       controller.setLimitMaxParallel(limitMaxParallel.isSelected());
       if (limitMaxParallel.isSelected()) {
         controller.setMaxConcurrentAsyncInController(parseMaxParallelValue());
@@ -60,6 +64,8 @@ public class HTTP2ControllerGUI extends AbstractControllerGui implements Scrolla
     if (element instanceof HTTP2Controller) {
       HTTP2Controller controller = (HTTP2Controller) element;
       generateControllerSample.setSelected(controller.isGenerateControllerSample());
+      includeTimers.setSelected(controller.isIncludeTimers());
+      updateIncludeTimersState(controller.isGenerateControllerSample());
       limitMaxParallel.setSelected(controller.isLimitMaxParallel());
       maxParallelField.setText(String.valueOf(controller.getMaxConcurrentAsyncInController()));
       updateMaxParallelFieldState(controller);
@@ -77,6 +83,11 @@ public class HTTP2ControllerGUI extends AbstractControllerGui implements Scrolla
     setBorder(makeBorder());
     add(makeTitlePanel(), BorderLayout.NORTH);
     add(buildOptionsPanel(), BorderLayout.CENTER);
+
+    // The timer question only exists for the sample this controller generates itself: with no
+    // parent sample there is nothing whose duration could include them.
+    generateControllerSample.addItemListener(
+        event -> updateIncludeTimersState(event.getStateChange() == ItemEvent.SELECTED));
 
     limitMaxParallel.addItemListener(event -> {
       boolean enabled = event.getStateChange() == ItemEvent.SELECTED;
@@ -99,6 +110,9 @@ public class HTTP2ControllerGUI extends AbstractControllerGui implements Scrolla
     generateControllerSample.setAlignmentX(JCheckBox.LEFT_ALIGNMENT);
     panel.add(generateControllerSample);
 
+    includeTimers.setAlignmentX(JCheckBox.LEFT_ALIGNMENT);
+    panel.add(includeTimers);
+
     limitMaxParallel.setAlignmentX(JCheckBox.LEFT_ALIGNMENT);
     panel.add(limitMaxParallel);
 
@@ -108,6 +122,10 @@ public class HTTP2ControllerGUI extends AbstractControllerGui implements Scrolla
     panel.add(maxRow);
 
     return panel;
+  }
+
+  private void updateIncludeTimersState(boolean generatesParentSample) {
+    includeTimers.setEnabled(generatesParentSample);
   }
 
   private void updateMaxParallelFieldState(HTTP2Controller controller) {

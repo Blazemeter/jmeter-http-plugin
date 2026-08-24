@@ -33,6 +33,10 @@ public class CountingTimer extends AbstractTestElement implements Timer {
     this.delayMillis = delayMillis;
   }
 
+  public void setDelay(long delayMillis) {
+    this.delayMillis = delayMillis;
+  }
+
   @Override
   public long delay() {
     invocations.incrementAndGet();

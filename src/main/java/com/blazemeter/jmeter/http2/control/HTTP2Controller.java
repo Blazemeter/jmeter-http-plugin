@@ -1,6 +1,7 @@
 package com.blazemeter.jmeter.http2.control;
 
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
+import com.blazemeter.jmeter.http2.core.SampleClock;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import java.io.Serializable;
@@ -13,6 +14,7 @@ import org.apache.jmeter.control.Controller;
 import org.apache.jmeter.control.NextIsNullException;
 import org.apache.jmeter.control.TransactionController;
 import org.apache.jmeter.control.TransactionSampler;
+import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.samplers.Sampler;
 import org.apache.jmeter.testelement.TestElement;
 import org.apache.jmeter.testelement.property.JMeterProperty;
@@ -56,6 +58,8 @@ public class HTTP2Controller extends TransactionController implements Serializab
       BzmHttpPluginProperties.CONTROLLER_PREFERRED_PREFIX + "maxConcurrentAsyncInController";
   private static final String MAX_CONCURRENT_LEGACY =
       BzmHttpPluginProperties.CONTROLLER_LEGACY_PREFIX + "maxConcurrentAsyncInController";
+  /** JMeter's own property name, so a value set on a stock Transaction Controller still reads. */
+  private static final String INCLUDE_TIMERS = "TransactionController.includeTimers";
 
   private static final int DEFAULT_MAX_CONCURRENT_ASYNC_IN_CONTROLLER = 100;
   private static final long COMPLETION_POLL_INTERVAL_MILLIS = 10;
@@ -69,6 +73,12 @@ public class HTTP2Controller extends TransactionController implements Serializab
   private transient boolean handingOutPendingSampler;
   private transient boolean nestedSequentialRequestWarned;
   private boolean generateControllerSample;
+  /**
+   * The parent transaction currently open, so {@link #triggerEndOfLoop()} can still reach it: the
+   * field {@link TransactionController} keeps it in is private and is already null by the time
+   * {@code super.triggerEndOfLoop()} returns.
+   */
+  private transient TransactionSampler openParentTransaction;
 
   public HTTP2Controller() {
     super();
@@ -148,6 +158,7 @@ public class HTTP2Controller extends TransactionController implements Serializab
   public Sampler next() {
     if (isGenerateParentSample()) {
       Sampler next = super.next();
+      measureParentSample(next);
       // Only after the controller has finished the parent transaction (next == null). Releasing
       // while still returning the done TransactionSampler is pointless: JMeterThread calls
       // configureTransactionSampler(done) next and puts that same instance back on the package.
@@ -159,6 +170,128 @@ public class HTTP2Controller extends TransactionController implements Serializab
       return next;
     }
     return nextWithoutTransactionBookkeeping();
+  }
+
+  /**
+   * What the parent sample must report is the time this controller spent on requests, which for
+   * overlapped requests is the span from the first one leaving to the last one arriving.
+   *
+   * <p>Neither of {@link TransactionSampler}'s two modes measures that. With "include timers" on it
+   * leaves the sample stretching from the moment the transaction opened - before the timers and
+   * pre-processors of the first request ran - to the last response, so a think time lands inside
+   * the transaction time (issue #155). With it off, {@code setTransactionDone} reports the sum of
+   * the children instead, which double counts requests that ran at the same time. So the span is
+   * measured here, out of the children's own stamps, exactly as this controller did up to v3.0.1.
+   *
+   * <p>Also stamps an end time on a transaction that is still open. A transaction that never gets
+   * one reports {@code 0 - startTime}: {@code setTransactionDone} only stamps it in the
+   * "include timers" off branch, and {@code JMeterThread} does not call it at all when the run is
+   * cut short - the scheduler expiring, a manual Stop - it just ends the open transaction where it
+   * stands. An enclosing Transaction Controller then folds that result in through
+   * {@code SampleResult.addSubResult}, whose {@code Math.max} keeps the zero, and the enclosing
+   * sample comes out as a negative epoch that wrecks the Average and the Min of every aggregate
+   * over the run.
+   */
+  private void measureParentSample(Sampler next) {
+    if (!(next instanceof TransactionSampler)) {
+      return;
+    }
+    TransactionSampler transactionSampler = (TransactionSampler) next;
+    if (transactionSampler.isTransactionDone()) {
+      openParentTransaction = null;
+      applyRequestSpan(transactionSampler);
+      return;
+    }
+    openParentTransaction = transactionSampler;
+    SampleResult parent = transactionSampler.getTransactionResult();
+    if (parent != null && parent.getEndTime() == 0) {
+      // Floor: a transaction ended from the outside now reports 0 ms instead of -startTime. Every
+      // child that arrives afterwards pushes it forward again through addSubResult's Math.max.
+      parent.setEndTime(parent.getStartTime());
+    }
+  }
+
+  /**
+   * Rewrites the finished parent sample as {@code lastResponse - firstRequestSent}, leaving what
+   * came before the first request (timers, pre-processors) in {@code idleTime}, which is the field
+   * JMeter itself uses for it. Keeps the wall clock reading when the user asked for the timers to
+   * be included.
+   *
+   * @see #isIncludeTimers()
+   */
+  private void applyRequestSpan(TransactionSampler transactionSampler) {
+    if (isIncludeTimers()) {
+      return;
+    }
+    SampleResult parent = transactionSampler.getTransactionResult();
+    if (parent == null) {
+      return;
+    }
+    long firstStart = Long.MAX_VALUE;
+    long lastEnd = 0;
+    for (SampleResult child : parent.getSubResults()) {
+      // Each child's stamps are on its own clock, put on the transaction's the same way
+      // SampleResult.addSubResult does when it extends a parent's end time (Bug 51855).
+      if (child.getStartTime() > 0) {
+        firstStart = Math.min(firstStart,
+            SampleClock.fromResultClock(parent, child, child.getStartTime()));
+      }
+      if (child.getEndTime() > 0) {
+        lastEnd = Math.max(lastEnd,
+            SampleClock.fromResultClock(parent, child, child.getEndTime()));
+      }
+    }
+    if (firstStart == Long.MAX_VALUE || lastEnd < firstStart) {
+      // Nothing was measured: an iteration that was cut short, or children that never got stamps.
+      parent.setIdleTime(0);
+      parent.setEndTime(parent.getStartTime());
+      return;
+    }
+    // elapsed = endTime - startTime - idleTime, so this reads exactly lastEnd - firstStart. Going
+    // through idleTime rather than a synthetic end time leaves the sample ending when its last
+    // request did, and holding what came before the first one in the field JMeter's own Transaction
+    // Controller keeps a pause in (Bug 50080).
+    parent.setIdleTime(firstStart - parent.getStartTime());
+    parent.setEndTime(lastEnd);
+  }
+
+  /**
+   * The children of an aborted iteration - Start Next Loop, Stop Thread - are attached by
+   * {@code super.triggerEndOfLoop()}, which also closes the transaction, so the span can only be
+   * measured after it.
+   */
+  @Override
+  public void triggerEndOfLoop() {
+    TransactionSampler ending = openParentTransaction;
+    openParentTransaction = null;
+    super.triggerEndOfLoop();
+    if (ending != null) {
+      applyRequestSpan(ending);
+    }
+  }
+
+  /**
+   * Same question a stock Transaction Controller asks, with the opposite default: a think time is a
+   * pause, not request time, and this controller has never counted it. Answering {@code true} by
+   * inheritance - which is what JMeter's own default does, for compatibility with test plans older
+   * than its checkbox - is what put the think time inside the transaction time in v3.1.0. An
+   * explicit value, from this element's GUI or from a JMX written against a stock Transaction
+   * Controller, is honoured.
+   */
+  @Override
+  public boolean isIncludeTimers() {
+    return containsElementPropertyNamed(INCLUDE_TIMERS)
+        && getPropertyAsBoolean(INCLUDE_TIMERS, false);
+  }
+
+  /**
+   * Always writes the property. {@code TransactionController.setIncludeTimers} drops it when it
+   * matches JMeter's default of {@code true}, which would leave this controller reading its own
+   * default of {@code false} and silently discard the user's choice.
+   */
+  @Override
+  public void setIncludeTimers(boolean includeTimers) {
+    setProperty(INCLUDE_TIMERS, includeTimers);
   }
 
   /**
