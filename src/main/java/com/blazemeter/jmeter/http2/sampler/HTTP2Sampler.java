@@ -476,25 +476,31 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       if ((isProtocolErrorCause || isProtocolErrorException)
           && !HpackFailureDetector.indicatesHpackFailure(e)
           && !HpackFailureDetector.indicatesHpackFailure(cause)) {
-        boolean fallbackEnabled = isProtocolErrorFallbackEnabled();
+        HTTP2JettyClient fallbackClient = resolveClientForFallback();
+        // The client owns the resolved answer: it already merges this sampler's own flags with
+        // the JMeter properties, and it already turns the fallback off when HTTP/1.1 is disabled.
+        // Re-deriving it from properties alone here ignored both, and retried over HTTP/1.1 even
+        // against h2c-only endpoints where no request may go out as HTTP/1.1.
+        boolean fallbackEnabled =
+            fallbackClient != null && fallbackClient.isProtocolErrorFallbackEnabled();
         if (!fallbackEnabled) {
           LOG.warn("HTTP/2 protocol_error detected and fallback is DISABLED. "
               + "Request will fail.");
           LOG.warn("Error: {}", cause != null ? cause.getMessage() : e.getMessage());
           LOG.warn("To enable fallback, set blazemeter.http.protocolErrorFallbackEnabled=true "
-              + "or blazemeter.http.disableFallback=false in user.properties or jmeter.properties");
+              + "or blazemeter.http.disableFallback=false in user.properties or jmeter.properties, "
+              + "and keep HTTP/1.1 enabled on the sampler");
         } else {
           LOG.warn("HTTP/2 protocol_error detected. Attempting fallback to HTTP/1.1");
           LOG.warn("Error: {}", cause != null ? cause.getMessage() : e.getMessage());
 
           try {
-            // Get the client and request details for fallback
-            HTTP2JettyClient client = clientFactory.call();
             HTTPSampleResult fallbackBase = resolveErrorResult(preparedResult, url, method);
 
             // Retry with HTTP/1.1 only
             LOG.info("Retrying request with HTTP/1.1 only: {}", url);
-            HTTPSampleResult fallbackResult = client.retryWithHTTP11Only(this, fallbackBase);
+            HTTPSampleResult fallbackResult =
+                fallbackClient.retryWithHTTP11Only(this, fallbackBase);
 
             if (fallbackResult != null && fallbackResult.isSuccessful()) {
               LOG.info("HTTP/1.1 fallback succeeded: status={}", fallbackResult.getResponseCode());
@@ -523,17 +529,17 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     return buildResult(url, method);
   }
 
-  private boolean isProtocolErrorFallbackEnabled() {
-    String fb =
-        BzmHttpPluginProperties.resolveRaw("httpJettyClient.protocolErrorFallbackEnabled");
-    if (fb != null) {
-      return Boolean.parseBoolean(fb);
+  /**
+   * The client that would serve this sampler, or {@code null} when it cannot be obtained. Used
+   * from the failure path, where losing the client means there is nothing left to retry on.
+   */
+  private HTTP2JettyClient resolveClientForFallback() {
+    try {
+      return clientFactory.call();
+    } catch (Exception e) {
+      LOG.error("Could not obtain the client to evaluate the HTTP/1.1 fallback", e);
+      return null;
     }
-    String df = BzmHttpPluginProperties.resolveRaw("httpJettyClient.disableFallback");
-    if (df != null) {
-      return !Boolean.parseBoolean(df);
-    }
-    return true;
   }
 
   protected Request sampleAsync(HTTPSampleResult result, HTTP2FutureResponseListener listener)

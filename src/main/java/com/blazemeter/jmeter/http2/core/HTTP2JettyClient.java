@@ -863,6 +863,15 @@ public class HTTP2JettyClient {
     return requestTimeout;
   }
 
+  /**
+   * Whether a {@code protocol_error} may be retried over HTTP/1.1 with this client's resolved
+   * configuration. Already {@code false} whenever HTTP/1.1 is disabled, so callers do not have to
+   * pair it with a separate HTTP/1.1 check.
+   */
+  public boolean isProtocolErrorFallbackEnabled() {
+    return protocolErrorFallbackEnabled;
+  }
+
   public void loadProperties() {
     loadProperties(null);
   }
@@ -4003,11 +4012,42 @@ public class HTTP2JettyClient {
       throws URISyntaxException {
     URI uri = result.getURL().toURI();
     if ("http".equalsIgnoreCase(uri.getScheme())
-        && shouldAttachRequestBody(sampler, result, false)) {
+        && shouldAttachRequestBody(sampler, result, false)
+        && canDivertCleartextBodyToHttp11(uri)) {
       lowLevelDebug("Cleartext request with body; using HTTP/1.1-only client for {}", uri);
       return httpClientHttp1Only;
     }
     return selectHttpClient(uri, isRecoverableIfHttp3Fails(sampler));
+  }
+
+  /**
+   * Whether a bodied cleartext request may be diverted to the HTTP/1.1-only client.
+   *
+   * <p>The diversion only exists to sidestep the h2c Upgrade dance, whose first request travels as
+   * plain HTTP/1.1 and which servers handle inconsistently when it carries a body. It is a
+   * shortcut around a negotiation, never a protocol choice, so it must not fire where HTTP/1.1 is
+   * not what the configuration asks for:
+   *
+   * <ul>
+   *   <li>HTTP/1.1 disabled: no request may go out as HTTP/1.1, bodied or not. Sending one to an
+   *       h2c origin makes the server answer with HTTP/2 frames that the HTTP/1.1 parser reads as
+   *       garbage ({@code Illegal character CNTL=0x0}).</li>
+   *   <li>h2c prior knowledge (configured, or learned and still cached): the origin is spoken to
+   *       as HTTP/2 from the first byte, so there is no Upgrade to avoid in the first place.</li>
+   * </ul>
+   */
+  private boolean canDivertCleartextBodyToHttp11(URI uri) {
+    if (!enableHttp1) {
+      lowLevelDebug("Cleartext request with body but HTTP/1.1 is disabled; "
+          + "keeping protocol selection for {}", uri);
+      return false;
+    }
+    if (shouldUseH2cPriorKnowledge(uri)) {
+      lowLevelDebug("Cleartext request with body on an h2c prior-knowledge origin; "
+          + "keeping HTTP/2 for {}", uri);
+      return false;
+    }
+    return true;
   }
 
   /**
