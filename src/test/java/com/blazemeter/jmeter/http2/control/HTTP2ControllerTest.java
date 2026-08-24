@@ -18,6 +18,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.apache.jmeter.control.NextIsNullException;
+import org.apache.jmeter.control.TransactionController;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampler;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
@@ -230,6 +231,40 @@ public class HTTP2ControllerTest extends HTTP2TestBase {
     c.setProperty(BzmHttpPluginProperties.CONTROLLER_LEGACY_PREFIX + "limitMaxParallel", false);
     c.setProperty(BzmHttpPluginProperties.CONTROLLER_PREFERRED_PREFIX + "limitMaxParallel", true);
     assertThat(c.isLimitMaxParallel()).isTrue();
+  }
+
+  /**
+   * Issue #155: inheriting JMeter's default of {@code true} is what put the think time inside the
+   * transaction time, since no existing JMX carries the property.
+   */
+  @Test
+  public void includeTimersDefaultsToFalseUnlikeAStockTransactionController() {
+    JMeterTestUtils.setupJmeterEnv();
+    assertThat(new TransactionController().isIncludeTimers()).isTrue();
+    assertThat(new HTTP2Controller().isIncludeTimers()).isFalse();
+  }
+
+  @Test
+  public void includeTimersIsHonoredWhenSetOnTheElement() {
+    JMeterTestUtils.setupJmeterEnv();
+    HTTP2Controller c = new HTTP2Controller();
+    // A JMX written against a stock Transaction Controller carries exactly this.
+    c.setProperty("TransactionController.includeTimers", true);
+    assertThat(c.isIncludeTimers()).isTrue();
+  }
+
+  /**
+   * {@code TransactionController.setIncludeTimers} drops the property when it matches JMeter's own
+   * default of {@code true}, which would silently discard the user's choice here.
+   */
+  @Test
+  public void includeTimersSurvivesBeingSetToTrueThroughTheSetter() {
+    JMeterTestUtils.setupJmeterEnv();
+    HTTP2Controller c = new HTTP2Controller();
+    c.setIncludeTimers(true);
+    assertThat(c.isIncludeTimers()).isTrue();
+    c.setIncludeTimers(false);
+    assertThat(c.isIncludeTimers()).isFalse();
   }
 
   private static class FlagHTTP2Sampler extends HTTP2Sampler {

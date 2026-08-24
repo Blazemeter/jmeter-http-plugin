@@ -374,6 +374,7 @@ Add it with **Add → Logic Controller → bzm - HTTP Async Controller**. **`bzm
 | **Field** | **Description** | **Default** |
 |---|---|---|
 | Generate Parent Sample | Wraps child BlazeMeter HTTP results in one parent sample (sub-results in listeners/reports). | Off (`false`) |
+| Include duration of timer and pre-post processors in generated sample | Only applies with **Generate Parent Sample** on. When **off**, the parent sample measures the requests only: from the first one sent to the last response received, so think times and pre/post-processor time are reported as idle time instead of transaction time. When **on**, the parent sample spans the whole controller, pauses included (JMeter's Transaction Controller behaviour). | Off (`false`) |
 | Limit max number of parallel executions | When **off**, the cap is **`blazemeter.http.maxConcurrentAsyncInController`**. When **on**, cap is **Max parallel** (saved in the `.jmx` only while this is on; runtime still uses the global cap when off). | Off (`false`) |
 | Max parallel | Highest number of overlapping BlazeMeter HTTP samplers when limiting is **on** (integer ≥ **1**). Read-only when limiting is **off** (shows the effective global cap). | **100** (matches **`blazemeter.http.maxConcurrentAsyncInController`** unless you override; with limiting **on**, use the value you enter) |
 

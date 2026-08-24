@@ -1913,7 +1913,7 @@ public class HTTP2JettyClient {
     lowLevelDebug("=== send() returned successfully ===");
 
     postContentResponse(sampler, request, result, contentResponse, cacheManager);
-    result.setEndTime(listener.getResponseEnd());
+    stampSampleEnd(result, listener);
 
     resetSamplerDataBeforeResultProcessing(result);
     return sampler.resultProcessing(areFollowingRedirect, depth, result);
@@ -1968,6 +1968,27 @@ public class HTTP2JettyClient {
     return sampler.resultProcessing(areFollowingRedirect, depth, result);
   }
 
+  /**
+   * Ends the sample when the exchange ended, translated onto this result's own clock: the start
+   * came from {@code sampleStart()}, and a {@link org.apache.jmeter.samplers.SampleResult} keeps a
+   * nano-derived clock of its own by default, so reading the end straight off the listener's
+   * wall-clock stamp reported the distance between the two clocks as part of the sample's duration.
+   * See {@link SampleClock}.
+   *
+   * <p>Falls back to {@code sampleEnd()} when the exchange never recorded a completion. Stamping
+   * what the listener held in that case wrote a 0, and {@code setEndTime} turns a zero end into an
+   * elapsed time of minus the start of the epoch.
+   */
+  private static void stampSampleEnd(HTTPSampleResult result,
+                                     HTTP2FutureResponseListener listener) {
+    long endTime = listener.getResponseEndOn(result);
+    if (endTime > 0) {
+      result.setEndTime(endTime);
+    } else if (result.getEndTime() == 0) {
+      result.sampleEnd();
+    }
+  }
+
   public HTTPSampleResult sampleFromListener(HTTP2Sampler sampler, HTTPSampleResult result,
                                              boolean areFollowingRedirect, int depth,
                                              HTTP2FutureResponseListener listener
@@ -1981,7 +2002,7 @@ public class HTTP2JettyClient {
       JettyCacheManager cacheManager =
           JettyCacheManager.fromCacheManager(sampler.getCacheManager());
       postContentResponse(sampler, request, result, contentResponse, cacheManager);
-      result.setEndTime(listener.getResponseEnd());
+      stampSampleEnd(result, listener);
 
       resetSamplerDataBeforeResultProcessing(result);
       return sampler.resultProcessing(areFollowingRedirect, depth, result);
@@ -2008,7 +2029,11 @@ public class HTTP2JettyClient {
           JettyCacheManager cacheManager =
               JettyCacheManager.fromCacheManager(sampler.getCacheManager());
           postContentResponse(sampler, request, result, retryResponse, cacheManager);
-          result.setEndTime(listener.getResponseEnd());
+          // Not from the listener: the only completion it ever recorded is the GOAWAY that killed
+          // the first attempt. retryAfterGoAway sends a clone of its own and returns the response
+          // it got, so the sample ends now - stamping the listener's end reported a sample that
+          // finished before the response it carries, missing the whole retry.
+          result.setEndTime(result.currentTimeInMillis());
           resetSamplerDataBeforeResultProcessing(result);
           return sampler.resultProcessing(areFollowingRedirect, depth, result);
         } catch (Exception retryException) {
@@ -2334,8 +2359,7 @@ public class HTTP2JettyClient {
             h2Request.abort(new java.util.concurrent.CancellationException(
                 "Happy Eyeballs H3 won"));
           } else {
-            h3Listener.completeWith(response,
-                h2Listener.getResponseStart(), h2Listener.getResponseEnd());
+            h3Listener.completeWith(response, h2Listener);
             h3Request.abort(new java.util.concurrent.CancellationException(
                 "Happy Eyeballs H2 won"));
           }

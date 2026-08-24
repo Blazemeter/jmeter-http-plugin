@@ -9,6 +9,7 @@ import com.blazemeter.jmeter.http2.core.HpackFailureDetector;
 import com.blazemeter.jmeter.http2.core.JMeterSourceAddressResolver;
 import com.blazemeter.jmeter.http2.core.JmeterHttpClientExceptionMapper;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
+import com.blazemeter.jmeter.http2.core.SampleClock;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import com.blazemeter.jmeter.http2.util.Rfc9110Redirects;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -30,6 +31,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Predicate;
 import java.util.regex.PatternSyntaxException;
@@ -572,8 +574,13 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       result.sampleStart();
     }
     if (result.getEndTime() == 0) {
-      if (!Objects.isNull(this.asyncListener) && this.asyncListener.getResponseEnd() != 0) {
-        result.setEndTime(this.asyncListener.getResponseEnd());
+      // On this result's own clock: its start came from sampleStart(), and the listener records the
+      // exchange on the wall clock. See SampleClock.
+      long responseEnd = Objects.isNull(this.asyncListener)
+          ? 0
+          : this.asyncListener.getResponseEndOn(result);
+      if (responseEnd > 0) {
+        result.setEndTime(responseEnd);
       } else {
         result.sampleEnd();
       }
@@ -591,6 +598,11 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
    * <p>Reads the client already cached for this thread instead of asking the factory: building one
    * here would be a side effect on the error path, and a sample that never got that far has
    * nothing recorded anyway.
+   *
+   * <p>The recorder keeps its attempts on the wall clock, so the sample's own start is converted
+   * before being used to select them: comparing the two clocks directly dropped attempts of this
+   * very sample, or picked up attempts of the previous one, by however far apart the clocks were.
+   * See {@link SampleClock}.
    */
   private void attachConnectAttempts(Throwable failure, HTTPSampleResult result) {
     if (failure == null || result.getURL() == null) {
@@ -599,7 +611,11 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     try {
       HTTP2JettyClient client = CONNECTIONS.get().get(buildConnectionKey());
       if (client != null) {
-        client.attachConnectAttempts(failure, result.getURL(), result.getStartTime());
+        long sampleStart = result.getStartTime();
+        client.attachConnectAttempts(failure, result.getURL(),
+            // 0 is the recorder's "everything held", and must stay a 0 rather than become the
+            // distance between the clocks.
+            sampleStart == 0 ? 0 : SampleClock.toWallClock(result, sampleStart));
       }
     } catch (Exception ignored) {
       // Diagnostics must never replace the failure the sample is actually reporting.
@@ -650,11 +666,12 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
    * {@code sampleStart}/{@code sampleEnd} back-to-back left elapsed at ~0 and made the page look
    * like it finished when the last fast image landed.
    *
-   * @param startedAtMs when this resource's attempt began (dispatch / listener start), used as the
-   *                    sample start so the reported duration matches the timeout wait
+   * @param startedAtNanos {@link System#nanoTime()} when this resource's attempt began (dispatch /
+   *                       listener start). Monotonic, so the reported duration is the wait itself
+   *                       and not the wait plus whatever the machine clock did meanwhile
    */
   private HTTPSampleResult embeddedTimeoutErrorResult(HTTP2Sampler embeddedSampler,
-                                                      long startedAtMs) {
+                                                      long startedAtNanos) {
     HTTPSampleResult err = new HTTPSampleResult();
     URL url = resolveEmbeddedResourceUrl(embeddedSampler);
     if (url != null) {
@@ -666,21 +683,25 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       err.setSampleLabel(embeddedSampler.getName());
     }
     err.setHTTPMethod(HTTPConstants.GET);
-    long endedAtMs = System.currentTimeMillis();
-    long elapsedMs = Math.max(0L, endedAtMs - startedAtMs);
-    // SampleResult.setStampAndTime(stamp, elapsed) treats stamp as start (end = stamp + elapsed).
-    err.setStampAndTime(startedAtMs, elapsedMs);
+    long elapsedMs =
+        Math.max(0L, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos));
+    // Start on this result's own clock and the wait measured monotonically, so both the timestamps
+    // and the duration hold whichever end of the interval setStampAndTime takes as its stamp.
+    SampleClock.stampInterval(err, SampleClock.fromNanoTime(err, startedAtNanos), elapsedMs);
     err.setConnectTime(0L);
     err.setLatency(0L);
     return errorResult(new SocketTimeoutException("Read timed out"), err);
   }
 
-  private long embeddedAttemptStartMillis(HTTP2Sampler embeddedSampler) {
+  /**
+   * When this resource's attempt went out, as a {@link System#nanoTime()} reading, falling back to
+   * now for a sampler whose request never reached the transport.
+   */
+  private long embeddedAttemptStartNanos(HTTP2Sampler embeddedSampler) {
     HTTP2FutureResponseListener listener = embeddedSampler.getFutureResponseListener();
-    if (listener != null && listener.getResponseStart() > 0) {
-      return listener.getResponseStart();
-    }
-    return System.currentTimeMillis();
+    return listener == null
+        ? System.nanoTime()
+        : listener.getResponseStartNanos().orElseGet(System::nanoTime);
   }
 
   private URL resolveEmbeddedResourceUrl(HTTP2Sampler embeddedSampler) {
@@ -710,12 +731,12 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     samplers.clear();
     for (TestElement element : pending) {
       HTTP2Sampler embedded = (HTTP2Sampler) element;
-      long startedAtMs = embeddedAttemptStartMillis(embedded);
+      long startedAtNanos = embeddedAttemptStartNanos(embedded);
       HTTP2FutureResponseListener listener = embedded.getFutureResponseListener();
       if (listener != null && !listener.isDone() && !listener.isCancelled()) {
         listener.cancel(true);
       }
-      subres.addSubResult(embeddedTimeoutErrorResult(embedded, startedAtMs));
+      subres.addSubResult(embeddedTimeoutErrorResult(embedded, startedAtNanos));
     }
     setParentSampleSuccess(subres, false);
   }
@@ -1642,9 +1663,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     // queue instead would grant it a fresh full timeout on top of however long it already waited;
     // timing the whole page from a single start (as this used to) went the other way and expired
     // resources that had in fact completed normally.
-    long start = listener.getResponseStart() > 0
-        ? listener.getResponseStart()
-        : System.currentTimeMillis();
+    // Monotonic: a wall clock that steps back mid-page would hold a resource past its timeout, and
+    // one that steps forward would expire a resource that is still well within it.
+    long startNanos = embeddedAttemptStartNanos(embeddedSampler);
     while (true) {
       if (listener.isDone() || listener.isCancelled()) {
         consumeFirstEmbeddedSampler(samplers, subres);
@@ -1656,7 +1677,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         abortPendingEmbeddedRequests(samplers);
         return true;
       }
-      if (embeddedTimeout > 0 && (System.currentTimeMillis() - start) >= embeddedTimeout) {
+      if (embeddedTimeout > 0
+          && TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos) >= embeddedTimeout) {
         String pendingUrl = listener.getRequest() != null
             ? listener.getRequest().getURI().toString()
             : "unknown";
@@ -1668,7 +1690,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         // of the page container.
         samplers.remove(0);
         listener.cancel(true);
-        subres.addSubResult(embeddedTimeoutErrorResult(embeddedSampler, start));
+        subres.addSubResult(embeddedTimeoutErrorResult(embeddedSampler, startNanos));
         setParentSampleSuccess(subres, false);
         return false;
       }
