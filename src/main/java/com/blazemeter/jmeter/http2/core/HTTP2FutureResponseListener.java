@@ -348,14 +348,14 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
         // The losing side of a resolved protocol race, or an explicit cancel(): expected, and the
         // winner's response is reported elsewhere. Logging it as an error filled the log with
         // failures that are not failures, one per raced request.
-        LOG.debug("{} attempt cancelled: {}",
+        lowLevelDebug("{} attempt cancelled: {}",
             raceProtocol != null ? raceProtocol : "Request", failure.getMessage());
       } else if (raceProtocol != null) {
         // One side of a race failing on its own is the expected outcome when the origin does not
         // support that protocol: the other attempt serves the request, and the race only gives up
         // once both sides fail - at which point the caller reports the real failure. Saying "not
         // negotiated" rather than "failed" keeps this from reading as a broken request.
-        LOG.debug("{} not negotiated for {}: {}", raceProtocol,
+        lowLevelDebug("{} not negotiated for {}: {}", raceProtocol,
             request != null ? request.getURI() : "unknown", failure.getMessage());
       } else {
         // Internal transport detail; raise the logger to DEBUG to diagnose. The caller still
@@ -461,7 +461,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
 
   @Override
   public boolean cancel(boolean mayInterruptIfRunning) {
-    LOG.debug("=== cancel() called ===");
+    lowLevelDebug("=== cancel() called ===");
     cancelled = true;
     // In Jetty 12, abort() returns CompletableFuture<Boolean>
     if (request != null) {
