@@ -47,6 +47,8 @@ This plugin provides a `bzm - HTTP Sampler` (multi-protocol: **HTTP/1.1**, **HTT
 - [**HTTP Async Controller**](#readme-http-async-controller)
   - [Controller panel](#readme-http-async-panel)
 - [**JMeter property reference**](#readme-jmeter-property-reference)
+- [**Logging and low-level debugging**](#readme-logging)
+  - [Keeping Jetty's own logging out of it](#readme-logging-jetty-verbosity)
 - [**Building from source**](#readme-building-from-source)
 - [**License**](#readme-license)
 
@@ -383,11 +385,16 @@ In **View Results Tree**, rows may follow **completion order**, not test-plan or
 > [!NOTE]
 > Anything else you add as a **direct child**—timers, a different sampler type, an assertion, another controller, etc.—still runs **in tree order**. Before that element runs, the controller **waits until every BlazeMeter HTTP request started above it has completed**. Use that pattern when you mean “kick off these BlazeMeter HTTP calls together, then run the following steps only after they are all done.”
 
+> [!NOTE]
+> **When a Thread Group runs for a duration**, the requests this controller had already sent when the time ran out are still collected and reported, the same way JMeter lets a running request finish before it stops a thread. Nothing new is dispatched once the time is up, so no load reaches the system under test past the end of the run; the thread ends as soon as the responses it was already waiting for arrive. Tune or disable that grace with **`blazemeter.http.schedulerHoldMillis`**. A **Stop** is immediate and is never held off.
+
 
 <a id="readme-jmeter-property-reference"></a>
 # JMeter property reference
 
 Restart JMeter after changing JMeter properties that are applied when affected classes initialize.
+
+The diagnostic switches are **not** in this table: `blazemeter.http.lowLevelLog` is read as a JVM system property, not as a JMeter property — see **[Logging and low-level debugging](#readme-logging)**.
 
 | **Attribute** | **Description** | **Default** |
 |---|---|---:|
@@ -406,6 +413,7 @@ Restart JMeter after changing JMeter properties that are applied when affected c
 | **blazemeter.http.maxConcurrentPushedStreams** | Maximum number of server push streams concurrently received | 100 |
 | **blazemeter.http.maxRequestsPerConnection** | Maximum Jetty HTTP requests per pooled connection | 100 |
 | **blazemeter.http.maxConcurrentAsyncInController** | Default concurrency cap inside **`bzm - HTTP Async Controller`** when parallel limiting is unchecked | 100 |
+| **blazemeter.http.schedulerHoldMillis** | How far **`bzm - HTTP Async Controller`** may push a thread's scheduled end while its requests are still on the wire, so a duration-limited run collects the responses it already asked for instead of dropping them. Renewed while requests are pending and given back as soon as they are collected; a Stop is never held off. Set to **0** to let the schedule cut mid-flight | 2000 |
 | **HTTPSampler.response_timeout** | Default response timeout (ms) when the sampler defines none | 0 |
 | **http.post_add_content_type_if_missing** | Add Content-Type header if missing? | false |
 | **blazemeter.http.enableHttp3** | Enable HTTP/3 support (Alt-Svc + QUIC) | profile |
@@ -433,6 +441,50 @@ Restart JMeter after changing JMeter properties that are applied when affected c
 | **blazemeter.http.controller.generateParentSample** | If you group all requests into a parent sample | false |
 | **blazemeter.http.controller.limitMaxParallel** | Limit max number of parallel executions | false |
 | **blazemeter.http.controller.maxConcurrentAsyncInController** | Maximum parallel requests (integer ≥ 1) | 100 |
+
+
+<a id="readme-logging"></a>
+# Logging and low-level debugging
+
+The plugin logs through JMeter's own logging, so its lines land in **`jmeter.log`** next to JMeter's, under logger names like **`c.b.j.h.c.HTTP2Controller`** and **`c.b.j.h.c.HTTP2JettyClient`**. Warnings and errors are on by default. Everything below is for diagnosing a run and should be **off during a load test**: with both switches on, a single-thread nine-second run with two requests per iteration wrote about **2900 lines**, and that scales with threads and requests.
+
+Two switches, and they do different things:
+
+| **Switch** | **What it does** |
+|---|---|
+| **`-Dblazemeter.http.lowLevelLog=true`** | Opens the plugin's internal traces: every dispatch and completion in the async controller, the request/response steps in the client, protocol negotiation and fallback decisions, plus HTTP/2 frame logging. A **JVM system property** — see the note below |
+| **`-Lcom.blazemeter=DEBUG`** | Raises the log level so DEBUG lines are written at all. Without it the switch above produces nothing |
+
+> [!IMPORTANT]
+> **`-Dblazemeter.http.lowLevelLog=true`**, not `-J`. This one is read as a JVM system property, so JMeter's `-J` (test-plan properties) does **not** set it. In the GUI, or in any launcher script, pass it through **`JVM_ARGS`** instead: `set JVM_ARGS=-Dblazemeter.http.lowLevelLog=true` on Windows, `export JVM_ARGS="-Dblazemeter.http.lowLevelLog=true"` on Linux/macOS.
+
+<a id="readme-logging-jetty-verbosity"></a>
+### Keeping Jetty's own logging out of it
+
+The packaged JAR relocates its Jetty into **`com.blazemeter.jmeter.http2.shaded.org.eclipse.jetty`**, which sits *under* `com.blazemeter`. So **`-Lcom.blazemeter=DEBUG` also turns on all of Jetty's internal logging** — selectors, connection pools, buffer pools, TLS — and that is not something the plugin's own switch has any say over. On a two-iteration plan with two requests each, that is **2659 Jetty lines against 261 from the plugin**.
+
+Silence that package and the log becomes readable:
+
+```bash
+java -Dblazemeter.http.lowLevelLog=true -jar $JMETER_HOME/bin/ApacheJMeter.jar \
+  -n -t plan.jmx -l results.jtl -j run.log \
+  -Lcom.blazemeter=DEBUG -Lcom.blazemeter.jmeter.http2.shaded=INFO
+```
+
+For a permanent setting, or for the GUI, put the same two levels in **`$JMETER_HOME/bin/log4j2.xml`**:
+
+```xml
+<Loggers>
+  <Logger name="com.blazemeter" level="debug"/>
+  <!-- The plugin's relocated Jetty: leave it at info or the plugin's own lines are buried. -->
+  <Logger name="com.blazemeter.jmeter.http2.shaded" level="info"/>
+</Loggers>
+```
+
+Turn Jetty's own logging **on** only when the question is about the transport itself (a stalled connection, a TLS handshake, HTTP/2 frames) — by dropping that second logger, or by raising just one package, e.g. `-Lcom.blazemeter.jmeter.http2.shaded.org.eclipse.jetty.io=DEBUG`.
+
+> [!NOTE]
+> With the low-level switch on, the client also appends HTTP/2 frame traces to an **`http2-debug.log`** file, resolved relative to the working directory JMeter was started from (`<cwd>/jmeter-http2-plugin/target/http2-debug.log`). It is created only while that switch is on.
 
 
 <a id="readme-building-from-source"></a>
