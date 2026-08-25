@@ -46,6 +46,11 @@ This plugin provides a `bzm - HTTP Sampler` (multi-protocol: **HTTP/1.1**, **HTT
   - [Multiplexing, HTTP/2, and overlapping sampler execution](#readme-multiplexing)
 - [**HTTP Async Controller**](#readme-http-async-controller)
   - [Controller panel](#readme-http-async-panel)
+- [**Waterfall Viewer**](#readme-waterfall-viewer)
+  - [Reading the bars](#readme-waterfall-bars)
+  - [The details panel](#readme-waterfall-details)
+  - [Live runs and .jtl files](#readme-waterfall-sources)
+  - [The expanded window](#readme-waterfall-expanded)
 - [**JMeter property reference**](#readme-jmeter-property-reference)
 - [**Logging and low-level debugging**](#readme-logging)
   - [Keeping Jetty's own logging out of it](#readme-logging-jetty-verbosity)
@@ -389,6 +394,131 @@ In **View Results Tree**, rows may follow **completion order**, not test-plan or
 > **When a Thread Group runs for a duration**, the requests this controller had already sent when the time ran out are still collected and reported, the same way JMeter lets a running request finish before it stops a thread. Nothing new is dispatched once the time is up, so no load reaches the system under test past the end of the run; the thread ends as soon as the responses it was already waiting for arrive. Tune or disable that grace with **`blazemeter.http.schedulerHoldMillis`**. A **Stop** is immediate and is never held off.
 
 
+<a id="readme-waterfall-viewer"></a>
+# Waterfall Viewer
+
+Add it with **Add → Listener → bzm - Waterfall Viewer**. It draws a run the way a browser's Network
+panel draws a page load: a table of samples on the left, a time-aligned waterfall of coloured phase
+bars on the right, and a DevTools-style details panel for whichever request you click.
+
+It is the listener to reach for when the question is *why was this slow* rather than *what did this
+return* — and it keeps what **View Results Tree** gives you for the second question too.
+
+Works with **HTTP/1.0, HTTP/1.1, HTTP/2 and HTTP/3**, and with any other sampler as well: a
+`SampleResult` needs only a **start time and an elapsed time** to get a bar. JDBC, JMS, gRPC,
+GraphQL and JSR223 samples all appear. Connect time, latency, protocol, headers and body are
+enrichment — present when the sampler reports them, and explicitly reported as missing when not.
+
+📖 **[Full guide: docs/waterfall-viewer.md](docs/waterfall-viewer.md)**
+
+![Waterfall Viewer](docs/waterfall-viewer.png)
+
+<a id="readme-waterfall-bars"></a>
+### Reading the bars
+
+Each bar spans the sample's real wall-clock extent on a shared time axis, split into the phases in
+the order they happen:
+
+| Colour | Phase | Source |
+|---|---|---|
+| ⬜ Grey | **Queueing / Idle** | `idleTime` — wall-clock time the sample did not measure, such as the pauses between a transaction controller's children |
+| 🟧 Orange | **Connect** | `connectTime`. Absent on a reused connection. On HTTPS this includes the TLS handshake |
+| 🟩 Green | **Waiting (TTFB)** | `latency − connectTime` — the server thinking |
+| 🟦 Blue | **Content Download** | `elapsed − latency` — reading the body off the wire |
+| ▪ Slate | **No phase data** | The whole elapsed time as one segment, for a sample that reported neither connect time nor latency |
+
+Columns are **Name, Method, Status** (coloured by status class)**, Protocol, Type, Size, Time, Start**
+(relative)**, Thread** and the waterfall itself; hover a bar for a tooltip carrying the full phase
+breakdown.
+
+> [!NOTE]
+> These are exactly the phases JMeter measures, and no others. There is **no separate SSL/TLS
+> phase**: `SampleResult.connectTime` is the whole connection setup with the handshake inside it,
+> there is no API to ask for the handshake alone, and no JTL column carries it. A browser can draw a
+> purple TLS band because it instrumented its own socket; JMeter does not report that number, so the
+> viewer does not draw a band for it. The Timing tab labels the connect row *Connect (TLS handshake
+> included)* on a secure request.
+
+<a id="readme-waterfall-details"></a>
+### The details panel
+
+Click a row and four tabs describe that sample. The split between them is a division of labour with
+JMeter: **Response** is JMeter's own machinery, and the other three are what a waterfall needs that
+View Results Tree has no equivalent for. Only the visible tab does any work.
+
+| Tab | What it holds |
+|---|---|
+| **Response** | View Results Tree's right-hand side, hosted here: the same **Render:** selector over every renderer this JMeter has, and the renderer's own *Sampler result / Request / Response data* tabs |
+| **Headers** | A **General** section (URL, method, status, protocol, sizes), then request and response headers together, with one filter box that narrows all three and per-block copy buttons |
+| **Timing** | Every reported phase as a stacked bar plus a table of durations and shares, absolute start and finish, and **Copy timing** |
+| **Cookies** | Request cookies (from the Cookie Manager field or the `Cookie` header), and response cookies split into Name, Value, Domain, Path, Expires, Max-Age, HttpOnly, Secure, SameSite |
+
+> [!IMPORTANT]
+> **Nothing in the Response tab looks at a content type itself.** How to present a response body is
+> a problem JMeter already solved, dynamically and extensibly, through its `ResultRenderer`
+> interface — HTML, JSON, XML, images, the extractor testers, `RenderAsDocument` running the bytes
+> through Apache Tika so a PDF or a Word response comes out as text, and whatever renderer a
+> third-party plugin dropped into `lib/ext`. Renderers are discovered exactly as View Results Tree
+> discovers them and ordered by the same `view.results.tree.renderers_order` property, so this tab
+> behaves identically and gains whatever a future JMeter release adds. Reimplementing that MIME
+> handling here would have produced a second, worse copy that drifts at every JMeter release.
+
+<a id="readme-waterfall-sources"></a>
+### Live runs and .jtl files
+
+**Live:** rows appear as samples complete. Samples are queued on the sampler threads and drained
+into the table four times a second in bounded batches — a listener must never make a test thread wait
+on the UI, or it distorts the numbers it is reporting. While you have not zoomed, the axis follows
+the growing run; once you zoom, the view stays put.
+
+**From a file:** use the listener's own **Write results to file / Read from file** panel to browse to
+a `.jtl`. Both CSV and XML are read, including files from a non-GUI run, and parsing happens on a
+background thread so a large file does not freeze JMeter.
+
+To get a full waterfall out of `jmeter -n -l results.jtl`, the run has to save the columns the
+viewer draws with — `connect_time`, `latency`, `idle_time`, and for the protocol and the details
+panel an XML file with the header and data columns on. Two caveats worth knowing:
+
+- **`sampleresult.timestamp.start` must be `true`** (JMeter's own default in `jmeter.properties`, but
+  the built-in fallback is `false`). Whether a JTL's `timeStamp` is the *start* or the *end* of a
+  sample is decided by this property in the JMeter **reading** the file. Get it wrong and every bar
+  is offset by its own duration — internally consistent, and quietly wrong.
+- **A CSV `.jtl` carries no URL and no protocol.** JMeter's CSV reader writes the URL column and then
+  skips it on the way back in, and the protocol lives in the response status line, which CSV has no
+  column for. Use `output_format=xml` when you need either.
+
+Full property list and the reasoning behind each limitation:
+**[docs/waterfall-viewer.md](docs/waterfall-viewer.md)**.
+
+<a id="readme-waterfall-expanded"></a>
+### The expanded window
+
+A waterfall is only as useful as it is wide — a bar three pixels across cannot say which phase
+dominated it — and JMeter's listener panel is a fraction of a screen with the test plan tree beside
+it. So the view has two modes:
+
+- **Embedded (mini):** inside the listener panel, for a glance while a test runs.
+- **Expanded:** **Expand to window** opens it in a **maximised window of its own**, which is where
+  the analysis is meant to happen. **F11** toggles fullscreen, **Escape** leaves it, and **Return to
+  panel** (or closing the window) puts it back.
+
+Expanding **moves** the view rather than cloning it: same samples, same filters, same zoom, same
+selection either way, so switching never loses what you were reading. The listener panel shows a
+note while the window is open, so it is never unclear where the data went.
+
+Filters cover label or URL (substring or regex), status class, protocol, minimum elapsed time and
+errors-only; rows can be grouped into collapsible headings by **Thread Group** or **Label**; the
+timeline zooms with **Ctrl + wheel** over the bars, pans with **Shift + wheel**, and zooms to a
+dragged range on the ruler.
+
+> [!NOTE]
+> Each row keeps a reference to its `SampleResult` so the details panel can show bodies, which makes
+> retention the viewer's memory ceiling. The oldest samples are evicted past
+> **`blazemeter.waterfall.maxSamples`** (default **50 000**) and the status line reports how many
+> were dropped, so a partial timeline never looks complete. For a very long run, write a `.jtl`
+> during the test and open that afterwards.
+
+
 <a id="readme-jmeter-property-reference"></a>
 # JMeter property reference
 
@@ -441,6 +571,11 @@ The diagnostic switches are **not** in this table: `blazemeter.http.lowLevelLog`
 | **blazemeter.http.controller.generateParentSample** | If you group all requests into a parent sample | false |
 | **blazemeter.http.controller.limitMaxParallel** | Limit max number of parallel executions | false |
 | **blazemeter.http.controller.maxConcurrentAsyncInController** | Maximum parallel requests (integer ≥ 1) | 100 |
+| **blazemeter.waterfall.maxSamples** | Samples **bzm - Waterfall Viewer** retains before evicting the oldest. Each retained row holds its `SampleResult`, response body included, so this is the viewer's memory ceiling. **`-1`** for no limit | 50000 |
+
+The Waterfall Viewer adds only that one property: its Response tab is JMeter's own renderer stack and
+so obeys JMeter's own `view.results.tree.*` settings — `renderers_order`, `max_size`,
+`max_line_size` and `soft_wrap_line_size`.
 
 
 <a id="readme-logging"></a>
