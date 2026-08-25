@@ -98,6 +98,50 @@ public class HttpKeepAliveSampleHeadersTest {
     }
   }
 
+  /**
+   * A request that probes a cleartext origin for HTTP/2 has to send
+   * {@code Connection: Upgrade, HTTP2-Settings} for the upgrade to be well formed. That must not
+   * cost the sample the keep-alive the sampler asked for: a plan asserting
+   * {@code Connection: keep-alive} on its request headers - as Apache's own {@code TEST_HTTP} does -
+   * would otherwise fail on that one request, while every other request in the plan passed.
+   */
+  @Test
+  public void sampleRequestHeadersKeepKeepAliveOnAnH2cUpgradeAttempt() throws Exception {
+    configureCleartextHttp2();
+
+    try (ServerSocket serverSocket = new ServerSocket(0)) {
+      int port = serverSocket.getLocalPort();
+      Future<String> received = startWireCapture(serverSocket);
+
+      // http1UpgradeRequired=true is what makes this request carry the h2c upgrade headers.
+      HTTP2JettyClient jettyClient = new HTTP2JettyClient(true, "keepalive-h2c-upgrade-test");
+      jettyClient.start();
+      try {
+        HTTPSampleResult sampleResult = samplePlainHttp(jettyClient, port, true);
+        String wireRequest = received.get(10, TimeUnit.SECONDS);
+
+        assertThat(wireRequest).as("the upgrade attempt really went out")
+            .contains("Upgrade: h2c");
+        assertThat(wireRequest).as("and the wire keeps the header the upgrade needs")
+            .contains(HTTPConstants.HEADER_CONNECTION + ": Upgrade, HTTP2-Settings");
+        assertThat(sampleResult.getRequestHeaders())
+            .as("the sample still reports the keep-alive the sampler asked for")
+            .contains(HTTPConstants.HEADER_CONNECTION + ": " + HTTPConstants.KEEP_ALIVE);
+        assertThat(sampleResult.getRequestHeaders())
+            .as("without hiding what the request actually asked the origin for")
+            .contains("Upgrade: h2c");
+      } finally {
+        jettyClient.stop();
+      }
+    }
+  }
+
+  private static void configureCleartextHttp2() {
+    JMeterUtils.setProperty("blazemeter.http.enableHttp2", "true");
+    JMeterUtils.setProperty("blazemeter.http.enableHttp3", "false");
+    JMeterUtils.setProperty("blazemeter.http.profile", "browser-compatible");
+  }
+
   private static void configureLegacyHttp1Only() {
     JMeterUtils.setProperty("blazemeter.http.enableHttp2", "false");
     JMeterUtils.setProperty("blazemeter.http.enableHttp3", "false");
