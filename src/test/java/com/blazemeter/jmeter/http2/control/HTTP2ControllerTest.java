@@ -19,6 +19,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.apache.jmeter.control.NextIsNullException;
 import org.apache.jmeter.control.TransactionController;
+import org.apache.jmeter.control.TransactionSampler;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampler;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
@@ -231,6 +232,30 @@ public class HTTP2ControllerTest extends HTTP2TestBase {
     c.setProperty(BzmHttpPluginProperties.CONTROLLER_LEGACY_PREFIX + "limitMaxParallel", false);
     c.setProperty(BzmHttpPluginProperties.CONTROLLER_PREFERRED_PREFIX + "limitMaxParallel", true);
     assertThat(c.isLimitMaxParallel()).isTrue();
+  }
+
+  /**
+   * Issue #155: a transaction that is still open must already carry an end time, because nothing
+   * guarantees it will be closed by this controller. {@code JMeterThread} ends whatever transaction
+   * is open when a run is cut short, without going through {@code setTransactionDone}, and an end
+   * time left at 0 makes {@code elapsed = end - start} report minus the epoch - directly when the
+   * controller is at the top level, and through {@code addSubResult}'s {@code Math.max} when it is
+   * nested in another transaction.
+   */
+  @Test
+  public void anOpenParentTransactionAlreadyCarriesAnEndTime() throws URISyntaxException {
+    setupHttp2Controller(false, 1);
+    http2Controller.setGenerateControllerSample(true);
+    // GenericController.first has no initialiser, so a controller that was never initialised never
+    // opens its transaction. JMeter does this before the run.
+    http2Controller.initialize();
+
+    Sampler first = http2Controller.next();
+
+    assertThat(first).isInstanceOf(TransactionSampler.class);
+    SampleResult parent = ((TransactionSampler) first).getTransactionResult();
+    assertThat(parent.getEndTime()).as("end time of an open transaction").isPositive();
+    assertThat(parent.getTime()).as("reported time of an open transaction").isNotNegative();
   }
 
   /**
