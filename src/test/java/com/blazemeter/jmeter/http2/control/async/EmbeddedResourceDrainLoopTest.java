@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
+import com.blazemeter.jmeter.http2.core.SampleClock;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import java.io.Closeable;
 import java.io.IOException;
@@ -182,10 +183,14 @@ public class EmbeddedResourceDrainLoopTest extends HTTP2TestBase {
         .as("timed-out child must report the wait until give-up, not a ~0ms sampleStart/sampleEnd "
             + "pair; that elapsed end time is what pushes the parent container's clock forward")
         .isGreaterThanOrEqualTo(RESPONSE_TIMEOUT_MILLIS);
+    // On the container's own clock, the way addSubResult itself compares the two (Bug 51855):
+    // each SampleResult captures its nano offset when it is constructed, so two results built on
+    // either side of a refresh of that offset are a millisecond apart on the raw stamps alone.
     assertThat(container.getEndTime())
         .as("parent end time must advance to cover the embedded timeout wait (addSubResult takes "
             + "max of child end times)")
-        .isGreaterThanOrEqualTo(timedOutChild.getEndTime());
+        .isGreaterThanOrEqualTo(
+            SampleClock.fromResultClock(container, timedOutChild, timedOutChild.getEndTime()));
     assertThat(timedOutChild.getConnectTime())
         .as("a poll-aborted attempt never completed the handshake/response, so connect stays 0 "
             + "rather than copying the parent's connect")
