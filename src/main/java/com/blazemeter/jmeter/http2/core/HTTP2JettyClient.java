@@ -189,6 +189,17 @@ public class HTTP2JettyClient {
   private static final String ATTR_HTTP3_ATTEMPTED = "bzm.http3.attempted";
   private static final String ATTR_H2C_FALLBACK_ATTEMPTED = "bzm.h2cFallbackAttempted";
   private static final String ATTR_SKIP_H2C_UPGRADE = "bzm.skipH2cUpgrade";
+  /**
+   * Statuses that answer an {@code Upgrade: h2c} attempt by refusing it rather than by serving the
+   * request: a bad request, an upgrade demanded or not implemented, a version not supported. Only
+   * these are worth sending again without the upgrade headers - see
+   * {@link #shouldRetryAfterFailedH2cUpgrade}.
+   */
+  private static final Set<Integer> H2C_UPGRADE_REFUSED_STATUSES = Set.of(
+      HttpStatus.BAD_REQUEST_400,
+      HttpStatus.UPGRADE_REQUIRED_426,
+      HttpStatus.NOT_IMPLEMENTED_501,
+      HttpStatus.HTTP_VERSION_NOT_SUPPORTED_505);
   private static final String ATTR_ORIGIN_KEY = "bzm.http3.origin";
   private static final String ATTR_REQUEST_HEADERS_SERIALIZED = "bzm.request.headers.serialized";
   /**
@@ -1450,9 +1461,20 @@ public class HTTP2JettyClient {
   }
 
   /**
-   * The server answered (no timeout/error) but never actually negotiated HTTP/2 despite our
-   * {@code Upgrade: h2c} attempt - e.g. it silently ignored the header, as a compliant HTTP/1.1
-   * server that doesn't support h2c is allowed to do. Retry once with a plain HTTP/1.1 request.
+   * Whether the {@code Upgrade: h2c} attempt has to be made again as a plain HTTP/1.1 request.
+   *
+   * <p>Only when the answer says the upgrade attempt itself was refused. A compliant HTTP/1.1
+   * server that does not speak h2c ignores the header and serves the request over HTTP/1.1, and
+   * that response <em>is</em> the answer to this request: re-sending it would put the same request
+   * on the wire twice - twice the load, and twice the side effect for anything that is not a GET -
+   * and would report only the second attempt's time. What is left of the failed negotiation is
+   * remembered by {@link #updateHttp1OnlyCache}, so the requests after it skip the upgrade instead
+   * of paying for it again.
+   *
+   * <p>A server or proxy that answers the upgrade headers with one of
+   * {@link #H2C_UPGRADE_REFUSED_STATUSES} did not serve the request, it rejected the attempt, and
+   * that is a failure this client caused by adding headers the test plan never asked for. Those are
+   * retried once, without the headers.
    */
   private boolean shouldRetryAfterFailedH2cUpgrade(Request request, ContentResponse response) {
     if (!enableHttp1 || !http1UpgradeRequired || request == null || response == null) {
@@ -1469,7 +1491,8 @@ public class HTTP2JettyClient {
     if (!wasH2cUpgradeAttempt(request)) {
       return false;
     }
-    return response.getVersion() != HttpVersion.HTTP_2;
+    return response.getVersion() != HttpVersion.HTTP_2
+        && H2C_UPGRADE_REFUSED_STATUSES.contains(response.getStatus());
   }
 
   private void markCleartextHttp1Only(URI uri) {
@@ -4196,8 +4219,14 @@ public class HTTP2JettyClient {
     // 1. The connection is already HTTP/2 (negotiated via ALPN)
     // 2. Upgrade headers are for cleartext HTTP, not HTTPS
     // 3. It violates the HTTP/2 protocol (RFC 7540)
+    // An origin already known to answer HTTP/1.1 is not asked to upgrade again: the attempt costs
+    // three headers and Jetty's upgrade machinery on every request, and the negotiation it asks for
+    // is one this client already watched fail. This is the "later requests skip the futile upgrade
+    // attempt" the HTTP/1.1-only cache is written for - until now the cache only steered which
+    // client was used, and the headers went out regardless.
     if (http1UpgradeRequired && enableHttp2 && !"https".equalsIgnoreCase(url.getProtocol())
         && !shouldUseH2cPriorKnowledge(request.getURI())
+        && !isHttp1Only(request.getURI())
         && !Boolean.TRUE.equals(request.getAttributes().get(ATTR_SKIP_H2C_UPGRADE))) {
       Mutable headers = ((Mutable) request.getHeaders());
       addHeaderIfMissing(HttpHeader.UPGRADE, "h2c", headers);
