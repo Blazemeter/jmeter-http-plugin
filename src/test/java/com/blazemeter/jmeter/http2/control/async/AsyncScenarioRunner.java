@@ -167,9 +167,40 @@ public final class AsyncScenarioRunner {
    * child result at all yet.
    */
   public static Consumer<JMeterThread> expiredScheduler() {
+    return schedulerEndingIn(-1);
+  }
+
+  /**
+   * Thread Group scheduler whose end lands {@code millisFromNow} from the start of the run, so it
+   * can be made to fall while requests are still on the wire - which for this controller is most of
+   * the time, since its requests live across turns rather than inside one.
+   */
+  public static Consumer<JMeterThread> schedulerEndingIn(long millisFromNow) {
     return thread -> {
       thread.setScheduled(true);
-      thread.setEndTime(System.currentTimeMillis() - 1);
+      thread.setEndTime(System.currentTimeMillis() + millisFromNow);
+    };
+  }
+
+  /**
+   * Stops the thread from the outside {@code millisFromNow} into the run, the way the Stop button
+   * and {@code StandardJMeterEngine} do: straight onto the running flag, with no scheduled end
+   * involved. Nothing a controller does can hold that off, so whatever it had on the wire at that
+   * moment is lost - which is the situation the reported sample still has to survive.
+   */
+  public static Consumer<JMeterThread> stopAfter(long millisFromNow) {
+    return thread -> {
+      Thread stopper = new Thread(() -> {
+        try {
+          Thread.sleep(millisFromNow);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return;
+        }
+        thread.stop();
+      }, "scenario-stopper");
+      stopper.setDaemon(true);
+      stopper.start();
     };
   }
 

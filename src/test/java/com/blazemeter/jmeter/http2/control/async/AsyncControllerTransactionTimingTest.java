@@ -127,6 +127,15 @@ public class AsyncControllerTransactionTimingTest extends HTTP2TestBase {
     softly.assertAll();
   }
 
+  /**
+   * A Stop goes straight onto the running flag, so unlike the scheduled end of
+   * {@link #t5RequestsAlreadyOnTheWireMustSurviveTheScheduledEnd()} it cannot be held off: whatever
+   * this controller had on the wire is lost. What must not happen is a poisoned row getting out -
+   * the transaction that was open when the Stop landed reporting minus the epoch. Landing while the
+   * controller waits for a response, the Stop is seen by {@code JMeterThread}'s own loop before
+   * {@code processSampler} runs again, so usually nothing is reported at all; that the run stops,
+   * and that nothing bogus reaches a listener either way, is what is asserted.
+   */
   @Test
   public void t4ATransactionCutShortMustNotReportANegativeSampleTime() {
     TreeShape shape = fixture -> new AsyncScenarioRunner.Node[]{
@@ -136,14 +145,16 @@ public class AsyncControllerTransactionTimingTest extends HTTP2TestBase {
                 node(fixture.http("S2", LATENCY))))
     };
     Result baseline = execute(ControllerKind.STOCK_TX_PARENT, 1, shape,
-        AsyncScenarioRunner.expiredScheduler());
+        AsyncScenarioRunner.stopAfter(LATENCY / 4));
     Result actual = execute(ControllerKind.ASYNC_PARENT, 1, shape,
-        AsyncScenarioRunner.expiredScheduler());
-    System.out.println("\n=== T4 scheduler already expired, transaction cut short ==="
+        AsyncScenarioRunner.stopAfter(LATENCY / 4));
+    System.out.println("\n=== T4 stopped from the outside, mid-flight ==="
         + "\n  stock: " + describeAll(baseline)
         + "\n  async: " + describeAll(actual));
 
     SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(baseline.hung()).as("the stock run must stop").isFalse();
+    softly.assertThat(actual.hung()).as("the async run must stop").isFalse();
     assertReportsDurationsNotEpochs(softly, "stock", baseline);
     assertReportsDurationsNotEpochs(softly, "async", actual);
     softly.assertAll();
@@ -166,6 +177,90 @@ public class AsyncControllerTransactionTimingTest extends HTTP2TestBase {
           .as("%s: '%s' was reported with %s ms", kind, sample.getSampleLabel(), sample.getTime())
           .isNotNegative();
     }
+  }
+
+  /**
+   * A scheduled end that falls while the requests are on the wire must not throw their responses
+   * away. A stock sampler never loses one: {@code stopSchedulerIfNeeded} runs after the sample
+   * returns, so a request that is already out always finishes and is reported, and its transaction
+   * closes with it inside. This controller keeps its requests out across turns, so without holding
+   * the deadline off the thread stopped between them - the responses were dropped and the
+   * transaction was reported empty, at 0 ms.
+   */
+  @Test
+  public void t5RequestsAlreadyOnTheWireMustSurviveTheScheduledEnd() {
+    TreeShape shape = fixture -> new AsyncScenarioRunner.Node[]{
+        node(fixture.controller("controller"),
+            node(fixture.http("S1", LATENCY)),
+            node(fixture.http("S2", LATENCY)))
+    };
+    // The end lands after the requests went out and well before they come back.
+    Result actual = execute(ControllerKind.ASYNC_PARENT, 1, shape,
+        AsyncScenarioRunner.schedulerEndingIn(LATENCY / 4));
+    SampleResult parent = actual.topLevelResult("controller");
+    report("T5 scheduled end falls mid-flight", actual, parent);
+
+    SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(actual.hung()).as("the thread must still stop, not outlive its schedule")
+        .isFalse();
+    softly.assertThat(parent).as("a parent sample must be reported").isNotNull();
+    if (parent != null) {
+      softly.assertThat(labelsOf(children(parent)))
+          .as("both responses were already on their way back, so both must be reported")
+          .containsExactly("S1", "S2");
+      softly.assertThat(parent.getTime())
+          .as("and the transaction must measure them, not come out as an empty 0 ms row")
+          .isGreaterThanOrEqualTo(LATENCY);
+    }
+    softly.assertAll();
+  }
+
+  /**
+   * Holding the scheduled end off is for the responses this controller already asked for, not a
+   * licence to keep asking: the children it had not dispatched yet when the end went by must stay
+   * undispatched, or a duration-limited run keeps putting load on the system under test after the
+   * time it was given, and the thread outlives its schedule by a whole controller block instead of
+   * by the responses that were on the wire.
+   */
+  @Test
+  public void t6NothingNewIsDispatchedOnceTheScheduledEndHasGoneBy() {
+    TreeShape shape = fixture -> new AsyncScenarioRunner.Node[]{
+        node(fixture.controller("controller"),
+            node(fixture.http("S1", LATENCY)),
+            node(fixture.http("S2", LATENCY)),
+            node(fixture.http("S3", LATENCY)),
+            node(fixture.http("S4", LATENCY)),
+            node(fixture.http("S5", LATENCY)))
+    };
+    // Over by the time the controller gets its second turn, whatever the machine's speed: dispatches
+    // cost microseconds, so a scheduled end a few milliseconds out is a race the test would lose.
+    Result actual = execute(ControllerKind.ASYNC_PARENT, 1, shape,
+        AsyncScenarioRunner.expiredScheduler());
+    SampleResult parent = actual.topLevelResult("controller");
+    report("T6 scheduled end falls after the first dispatches", actual, parent);
+    System.out.println("  dispatched: " + actual.dispatchOrder());
+
+    SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(actual.hung()).as("the thread must still stop").isFalse();
+    softly.assertThat(parent).as("a parent sample must be reported").isNotNull();
+    if (parent != null) {
+      softly.assertThat(labelsOf(children(parent)))
+          .as("the request that did go out must still be collected and reported")
+          .containsExactlyElementsOf(actual.dispatchOrder());
+      softly.assertThat(actual.dispatchOrder())
+          .as("the run was already over on the controller's second turn, so only the request that "
+              + "was on the wire by then may exist")
+          .containsExactly("S1");
+    }
+    softly.assertAll();
+  }
+
+  private static List<String> labelsOf(List<SampleResult> results) {
+    List<String> labels = new ArrayList<>();
+    for (SampleResult result : results) {
+      labels.add(result.getSampleLabel());
+    }
+    return labels;
   }
 
   /** Mirrors issue #155's test plan: parent sample on, think time excluded. */

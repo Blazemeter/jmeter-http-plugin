@@ -1,5 +1,7 @@
 package com.blazemeter.jmeter.http2.control;
 
+import static com.blazemeter.jmeter.http2.core.LowLevelDebugLog.lowLevelDebug;
+
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.SampleClock;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
@@ -67,7 +69,11 @@ public class HTTP2Controller extends TransactionController implements Serializab
   private static final String COMPLETION_TIMEOUT_PROP =
       "httpJettyClient.asyncControllerCompletionTimeout";
   private static final long DEFAULT_COMPLETION_TIMEOUT_MILLIS = 120_000;
+  // New setting, so it carries the preferred name; getPropDefault still takes the legacy prefixes.
+  private static final String SCHEDULER_HOLD_PROP = "blazemeter.http.schedulerHoldMillis";
+  private static final long DEFAULT_SCHEDULER_HOLD_MILLIS = 2_000;
   private int maxConcurrentAsyncInController = DEFAULT_MAX_CONCURRENT_ASYNC_IN_CONTROLLER;
+  private long schedulerHoldMillis = DEFAULT_SCHEDULER_HOLD_MILLIS;
 
   private transient List<HTTP2Sampler> http2SamplesSync = new ArrayList<>();
   private transient boolean handingOutPendingSampler;
@@ -79,6 +85,13 @@ public class HTTP2Controller extends TransactionController implements Serializab
    * {@code super.triggerEndOfLoop()} returns.
    */
   private transient TransactionSampler openParentTransaction;
+  /**
+   * The thread's own scheduled end while this controller is holding it off, or {@code null} when it
+   * is not. See {@link #holdSchedulerWhileRequestsAreInFlight()}.
+   */
+  private transient Long heldSchedulerEndTime;
+  /** How many children the open transaction had when its span was last measured. */
+  private transient int measuredChildren;
 
   public HTTP2Controller() {
     super();
@@ -88,6 +101,7 @@ public class HTTP2Controller extends TransactionController implements Serializab
             String.valueOf(maxConcurrentAsyncInController)));
     generateControllerSample =
         BzmHttpPluginProperties.getControllerPropDefault(GENERATE_PARENT_SAMPLE_PREF, false);
+    schedulerHoldMillis = resolveSchedulerHoldMillis();
   }
 
   public void setLimitMaxParallel(boolean enabled) {
@@ -156,20 +170,122 @@ public class HTTP2Controller extends TransactionController implements Serializab
    */
   @Override
   public Sampler next() {
-    if (isGenerateParentSample()) {
-      Sampler next = super.next();
-      measureParentSample(next);
-      // Only after the controller has finished the parent transaction (next == null). Releasing
-      // while still returning the done TransactionSampler is pointless: JMeterThread calls
-      // configureTransactionSampler(done) next and puts that same instance back on the package.
-      // Releasing on the following null turn is what sticks — and runs after listeners/assertions
-      // in doEndTransactionSampler (same sequencing as JMeter PR #6386's TestCompiler.done() hook).
-      if (next == null) {
-        releaseCompletedParentTransactionSample();
+    try {
+      if (isGenerateParentSample()) {
+        Sampler next = super.next();
+        measureParentSample(next);
+        // Only after the controller has finished the parent transaction (next == null). Releasing
+        // while still returning the done TransactionSampler is pointless: JMeterThread calls
+        // configureTransactionSampler(done) next and puts that same instance back on the package.
+        // Releasing on the following null turn is what sticks — and runs after listeners/assertions
+        // in doEndTransactionSampler (same sequencing as JMeter PR #6386's TestCompiler.done()
+        // hook).
+        if (next == null) {
+          releaseCompletedParentTransactionSample();
+        }
+        return next;
       }
-      return next;
+      return nextWithoutTransactionBookkeeping();
+    } finally {
+      // After the turn, not before it: the request this turn dispatched is only on the wire once
+      // getCurrentElement has run, and what the scheduler checks right after this call returns is
+      // whether anything is out there now.
+      holdSchedulerWhileRequestsAreInFlight();
     }
-    return nextWithoutTransactionBookkeeping();
+  }
+
+  /**
+   * Keeps the thread's scheduled end from landing while this controller still has requests on the
+   * wire, and gives it back the moment they are all collected.
+   *
+   * <p>A stock sampler never loses a response to the schedule: {@code JMeterThread} checks the
+   * scheduled end in {@code stopSchedulerIfNeeded}, which runs after {@code executeSamplePackage}
+   * returns, so a request that is already out always gets to finish and be reported, and the
+   * transaction it belongs to closes with it inside. This controller has requests out across
+   * turns instead of inside one, so the same check lands between them: the thread stops with
+   * responses already on their way back, their samples are never reported, and the transaction they
+   * belonged to closes empty - a 0 ms row with no children, one per thread per run, which is enough
+   * to drag a label's Min to zero.
+   *
+   * <p>What is held off is only the scheduler's own deadline, through {@link JMeterThread}'s public
+   * end time, and only forward: a Stop, a shutdown or an interrupt do not go through it and are not
+   * affected. The push is small and renewed on every turn and on every completion poll, so the
+   * overrun is the time the pending responses need and nothing more; if this controller ever failed
+   * to give the deadline back, the last push expires on its own within
+   * {@code blazemeter.http.schedulerHoldMillis}.
+   *
+   * <p>Only the responses already asked for are waited on: once the real end has gone by,
+   * {@link #getCurrentElement()} stops dispatching the rest of the children rather than sending
+   * requests the run was over before making.
+   *
+   * <p>An empty queue is not the moment to give the deadline back: the response collected last has
+   * been handed to {@code JMeterThread} but not yet turned into a sample, and giving the deadline
+   * back on that same turn lets the scheduler stop the thread before it does - which loses exactly
+   * the response this was holding the thread for. The deadline goes back at the end of the
+   * iteration instead (see {@link #discardPendingAsyncSamples()}, reached through
+   * {@code reInitialize}), by which point every collected response has been reported; and since it
+   * stops being renewed as soon as the queue empties, a push left behind by any path that does not
+   * reach that point expires on its own.
+   */
+  private void holdSchedulerWhileRequestsAreInFlight() {
+    if (http2SamplesSync.isEmpty()) {
+      return;
+    }
+    JMeterThread thread = JMeterContextService.getContext().getThread();
+    if (thread == null || thread.getEndTime() <= 0) {
+      return; // Not a scheduled run: nothing is going to cut this thread short.
+    }
+    long hold = System.currentTimeMillis() + schedulerHoldMillis;
+    if (heldSchedulerEndTime == null) {
+      if (hold <= thread.getEndTime()) {
+        return; // The scheduled end is far enough away to collect what is out there.
+      }
+      heldSchedulerEndTime = thread.getEndTime();
+      lowLevelDebug("Holding the scheduled end of {} while {} request(s) are in flight in '{}'",
+          thread.getThreadName(), http2SamplesSync.size(), getName());
+    }
+    thread.setEndTime(hold);
+  }
+
+  /**
+   * Whether the thread's own scheduled end has already gone by while this controller was holding it
+   * off. Read from the end time that was saved, not from the thread, whose end time is the held one
+   * while the hold is on.
+   */
+  private boolean scheduledEndPassed() {
+    return heldSchedulerEndTime != null && System.currentTimeMillis() >= heldSchedulerEndTime;
+  }
+
+  /** Gives the thread back its own scheduled end, so the next check can stop it. */
+  private void releaseScheduler() {
+    if (heldSchedulerEndTime == null) {
+      return;
+    }
+    JMeterThread thread = JMeterContextService.getContext().getThread();
+    if (thread != null) {
+      thread.setEndTime(heldSchedulerEndTime);
+      lowLevelDebug("Scheduled end of {} restored: nothing left in flight in '{}'",
+          thread.getThreadName(), getName());
+    }
+    heldSchedulerEndTime = null;
+  }
+
+  /**
+   * Resolved once, at construction, like the other settings of this controller: this is read from
+   * the completion poll loop, which runs every {@value #COMPLETION_POLL_INTERVAL_MILLIS} ms for
+   * every thread that has a request out, and a JMeter property read is a synchronized map lookup
+   * per accepted name.
+   */
+  private static long resolveSchedulerHoldMillis() {
+    String configured = BzmHttpPluginProperties.getPropDefault(
+        SCHEDULER_HOLD_PROP, String.valueOf(DEFAULT_SCHEDULER_HOLD_MILLIS));
+    try {
+      return Math.max(0, Long.parseLong(configured.trim()));
+    } catch (NumberFormatException e) {
+      LOG.warn("Invalid {}='{}', falling back to {} ms", SCHEDULER_HOLD_PROP, configured,
+          DEFAULT_SCHEDULER_HOLD_MILLIS);
+      return DEFAULT_SCHEDULER_HOLD_MILLIS;
+    }
   }
 
   /**
@@ -183,32 +299,35 @@ public class HTTP2Controller extends TransactionController implements Serializab
    * the children instead, which double counts requests that ran at the same time. So the span is
    * measured here, out of the children's own stamps, exactly as this controller did up to v3.0.1.
    *
-   * <p>Also stamps an end time on a transaction that is still open. A transaction that never gets
-   * one reports {@code 0 - startTime}: {@code setTransactionDone} only stamps it in the
-   * "include timers" off branch, and {@code JMeterThread} does not call it at all when the run is
-   * cut short - the scheduler expiring, a manual Stop - it just ends the open transaction where it
-   * stands. An enclosing Transaction Controller then folds that result in through
-   * {@code SampleResult.addSubResult}, whose {@code Math.max} keeps the zero, and the enclosing
-   * sample comes out as a negative epoch that wrecks the Average and the Min of every aggregate
-   * over the run.
+   * <p>Measured on every turn, not only when the transaction is closed here, because it is not
+   * always closed here: {@code JMeterThread} ends whatever transaction is open when a run is cut
+   * short, without going through {@code setTransactionDone} and without asking this controller
+   * again. A transaction that has never been measured reports {@code 0 - startTime} - an epoch,
+   * which an enclosing Transaction Controller then folds in through
+   * {@code SampleResult.addSubResult}, whose {@code Math.max} keeps the zero - and one that was
+   * only measured when it closed would report, on that path, the wall clock this exists to correct.
+   * Keeping the open transaction measured as it goes means that however it ends, it already says
+   * what it ran.
    */
   private void measureParentSample(Sampler next) {
     if (!(next instanceof TransactionSampler)) {
       return;
     }
     TransactionSampler transactionSampler = (TransactionSampler) next;
-    if (transactionSampler.isTransactionDone()) {
-      openParentTransaction = null;
-      applyRequestSpan(transactionSampler);
+    openParentTransaction = transactionSampler.isTransactionDone() ? null : transactionSampler;
+    SampleResult parent = transactionSampler.getTransactionResult();
+    if (parent == null) {
       return;
     }
-    openParentTransaction = transactionSampler;
-    SampleResult parent = transactionSampler.getTransactionResult();
-    if (parent != null && parent.getEndTime() == 0) {
-      // Floor: a transaction ended from the outside now reports 0 ms instead of -startTime. Every
-      // child that arrives afterwards pushes it forward again through addSubResult's Math.max.
-      parent.setEndTime(parent.getStartTime());
+    // Only when there is something new to measure. A sample's stamps are final once it is reported,
+    // so the span can only move when a child joins - and walking every child on every turn of every
+    // request would be quadratic on a controller holding many of them.
+    int children = parent.getSubResults().length;
+    if (children == measuredChildren && parent.getEndTime() != 0) {
+      return;
     }
+    measuredChildren = children;
+    applyRequestSpan(transactionSampler);
   }
 
   /**
@@ -220,11 +339,16 @@ public class HTTP2Controller extends TransactionController implements Serializab
    * @see #isIncludeTimers()
    */
   private void applyRequestSpan(TransactionSampler transactionSampler) {
-    if (isIncludeTimers()) {
-      return;
-    }
     SampleResult parent = transactionSampler.getTransactionResult();
     if (parent == null) {
+      return;
+    }
+    if (isIncludeTimers()) {
+      if (parent.getEndTime() == 0) {
+        // The wall clock is what was asked for, but an end time there has to be: a transaction
+        // ended from the outside before its first child arrived would otherwise report the epoch.
+        parent.setEndTime(parent.getStartTime());
+      }
       return;
     }
     long firstStart = Long.MAX_VALUE;
@@ -448,7 +572,7 @@ public class HTTP2Controller extends TransactionController implements Serializab
       long deadline = System.currentTimeMillis() + timeout;
       while (!interrupted) {
         if (http2FListener.isDone() || http2FListener.isCancelled()) {
-          LOG.debug("HTTP Future Finished, retrying the sample with that data {}",
+          lowLevelDebug("HTTP Future Finished, retrying the sample with that data {}",
               describeRequest(http2FListener));
           return dequeueForCompletion(http2Sam);
         }
@@ -460,6 +584,9 @@ public class HTTP2Controller extends TransactionController implements Serializab
         }
         try {
           Thread.sleep(COMPLETION_POLL_INTERVAL_MILLIS);
+          // Renewed from inside the wait too: the scheduled end is only ever read between turns,
+          // and this loop is what makes a turn last as long as a response does.
+          holdSchedulerWhileRequestsAreInFlight();
         } catch (InterruptedException e) {
           http2SamplesSync.clear();
           interrupted = true;
@@ -509,7 +636,7 @@ public class HTTP2Controller extends TransactionController implements Serializab
 
   @Override
   protected TestElement getCurrentElement() throws NextIsNullException {
-    LOG.debug("Current {} Size {}", current, subControllersAndSamplers.size());
+    lowLevelDebug("Current {} Size {}", current, subControllersAndSamplers.size());
     handingOutPendingSampler = false;
 
     if (http2SamplesSync.size() > getEffectiveMaxConcurrentAsyncInController()) {
@@ -517,6 +644,16 @@ public class HTTP2Controller extends TransactionController implements Serializab
       if (!Objects.isNull(http2samDone)) {
         return handOutWithoutAdvancing(http2samDone);
       }
+    }
+
+    if (scheduledEndPassed()) {
+      // The run is over: collect what is already on the wire and end the iteration on it. Holding
+      // the thread alive is for the responses this controller already asked for, not a licence to
+      // keep asking - the remaining children would be load applied past the end of the test.
+      lowLevelDebug("Scheduled end reached with {} request(s) in flight in '{}'; collecting them "
+          + "and skipping the rest of the controller", http2SamplesSync.size(), getName());
+      HTTP2Sampler http2samDone = waitForDoneHTTP2();
+      return Objects.isNull(http2samDone) ? null : handOutWithoutAdvancing(http2samDone);
     }
 
     if (current < subControllersAndSamplers.size()) {
@@ -533,7 +670,7 @@ public class HTTP2Controller extends TransactionController implements Serializab
     }
     if (current == (subControllersAndSamplers.size())) {
       // On the last, force a checkpoint moment
-      LOG.debug("The last, force checkpoint");
+      lowLevelDebug("The last, force checkpoint");
       HTTP2Sampler http2samDone = waitForDoneHTTP2();
       if (!Objects.isNull(http2samDone)) {
         return handOutWithoutAdvancing(http2samDone);
@@ -545,7 +682,7 @@ public class HTTP2Controller extends TransactionController implements Serializab
   /** Switches a sampler to asynchronous mode and queues it for a later completion turn. */
   private HTTP2Sampler dispatchAsync(HTTP2Sampler sampler) {
     sampler.setSyncRequest(false); // Force to run async the first time
-    LOG.debug("Convert http2 sample to Async and add to wait list");
+    lowLevelDebug("Convert http2 sample to Async and add to wait list");
     http2SamplesSync.add(sampler);
     return sampler;
   }
@@ -618,6 +755,7 @@ public class HTTP2Controller extends TransactionController implements Serializab
    */
   private void discardPendingAsyncSamples() {
     if (http2SamplesSync.isEmpty()) {
+      releaseScheduler();
       return;
     }
     LOG.warn("Discarding {} in-flight async sample(s) left by an interrupted iteration of {}",
@@ -632,5 +770,8 @@ public class HTTP2Controller extends TransactionController implements Serializab
       pending.clearPendingSampleState();
     }
     http2SamplesSync.clear();
+    // Nothing is on the wire any more, so the thread gets its own scheduled end back even on the
+    // paths that gave up on the queue rather than draining it.
+    releaseScheduler();
   }
 }
