@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import org.apache.jmeter.assertions.ResponseAssertion;
 import org.apache.jmeter.control.GenericController;
 import org.apache.jmeter.control.TransactionController;
@@ -297,7 +298,21 @@ public final class ScenarioFixture implements Closeable {
   }
 
   public CountingTimer timer(String name) {
-    return timers.computeIfAbsent(name, CountingTimer::new);
+    return timer(name, 0);
+  }
+
+  /**
+   * A timer that really pauses, for the scenarios where the think time has to be long enough to be
+   * told apart from the request times in the reported sample.
+   *
+   * <p>The delay is applied on every call, not only when the timer is created: a scenario that asks
+   * for the same name twice used to keep whichever delay came first, so a test asserting on a think
+   * time could silently run with none and pass without measuring anything.
+   */
+  public CountingTimer timer(String name, long delayMillis) {
+    CountingTimer timer = timers.computeIfAbsent(name, CountingTimer::new);
+    timer.setDelay(delayMillis);
+    return timer;
   }
 
   public CountingPreProcessor pre(String name) {
@@ -356,6 +371,14 @@ public final class ScenarioFixture implements Closeable {
   public Result run(ThreadGroup group, long timeoutMillis,
                     AsyncScenarioRunner.Node... children) {
     return new Result(this, AsyncScenarioRunner.run(group, timeoutMillis, children));
+  }
+
+  /** @see AsyncScenarioRunner#run(ThreadGroup, long, Consumer, AsyncScenarioRunner.Node...) */
+  public Result run(ThreadGroup group, long timeoutMillis,
+                    Consumer<org.apache.jmeter.threads.JMeterThread> threadSetup,
+                    AsyncScenarioRunner.Node... children) {
+    return new Result(this,
+        AsyncScenarioRunner.run(group, timeoutMillis, threadSetup, children));
   }
 
   @Override

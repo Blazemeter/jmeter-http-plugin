@@ -8,6 +8,7 @@ import java.nio.charset.Charset;
 import java.nio.charset.IllegalCharsetNameException;
 import java.nio.charset.StandardCharsets;
 import java.nio.charset.UnsupportedCharsetException;
+import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -15,6 +16,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.jmeter.samplers.SampleResult;
 import org.eclipse.jetty.client.AbstractResponseListener;
 import org.eclipse.jetty.client.BufferingResponseListener;
 import org.eclipse.jetty.client.ContentResponse;
@@ -48,8 +50,14 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
    * origin, while the competing attempt still serves the request. See {@link #onComplete}.
    */
   private volatile String raceProtocol;
-  private long responseStart;
-  private long responseEnd;
+  /**
+   * When the request went out and when it completed. Written on a Jetty thread and read on the
+   * JMeter one, so each end is a single immutable value published through one volatile write:
+   * whoever reads a {@link Stamp} sees all of it, and never a wall-clock reading paired with a
+   * monotonic one that has not been taken yet.
+   */
+  private volatile Stamp responseStartStamp;
+  private volatile Stamp responseEndStamp;
   /**
    * {@link #releaseTransportBuffers()} is invoked from several completion paths (wrapper build,
    * sealed HE abort {@code onFailure}/{@code onComplete}, {@code cancel}, sample materialisation).
@@ -91,21 +99,62 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
   }
 
   protected void setStart() {
-    if (this.responseStart == 0) {
-      this.responseStart = System.currentTimeMillis();
+    if (this.responseStartStamp == null) {
+      this.responseStartStamp = Stamp.now();
     }
   }
 
   protected void setEnd() {
-    this.responseEnd = System.currentTimeMillis();
+    this.responseEndStamp = Stamp.now();
   }
 
+  /**
+   * When the request went out as a {@link System#currentTimeMillis()} time, or 0. An absolute time
+   * to report or to log; to stamp it on a sample use {@link #getResponseStartOn}, and to measure a
+   * wait from it use {@link #getResponseStartNanos}.
+   */
   public long getResponseStart() {
-    return this.responseStart;
+    return Stamp.wallClockOf(this.responseStartStamp);
   }
 
+  /**
+   * When the exchange completed as a {@link System#currentTimeMillis()} time, or 0. See
+   * {@link #getResponseStart()} for which of these three readings to use.
+   */
   public long getResponseEnd() {
-    return this.responseEnd;
+    return Stamp.wallClockOf(this.responseEndStamp);
+  }
+
+  /**
+   * The {@link System#nanoTime()} reading of when the request went out, empty only when the request
+   * never went out at all.
+   *
+   * <p>For measuring how long something has been waiting, which must not be thrown off by the
+   * machine clock moving under it.
+   */
+  public OptionalLong getResponseStartNanos() {
+    Stamp stamp = this.responseStartStamp;
+    return stamp == null ? OptionalLong.empty() : OptionalLong.of(stamp.nanoTime);
+  }
+
+  /**
+   * When the request went out, on {@code result}'s own clock, or 0 when that was never recorded.
+   *
+   * <p>This, and never {@link #getResponseStart()}, is what a {@link SampleResult} must be stamped
+   * from: a sample whose start comes from {@code sampleStart()} and whose end comes from the wall
+   * clock reports the distance between those two clocks as part of its duration. See
+   * {@link SampleClock}.
+   */
+  public long getResponseStartOn(SampleResult result) {
+    return Stamp.on(result, this.responseStartStamp);
+  }
+
+  /**
+   * When the exchange completed, on {@code result}'s own clock, or 0 when that was never recorded.
+   * See {@link #getResponseStartOn}.
+   */
+  public long getResponseEndOn(SampleResult result) {
+    return Stamp.on(result, this.responseEndStamp);
   }
 
   /**
@@ -120,13 +169,36 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
    * synchronous caller never noticed because it returns the winner directly instead of reading back
    * from here; a consumer that polls {@link #isDone()} and then calls {@link #get()} does.
    */
+  public void completeWith(ContentResponse response, HTTP2FutureResponseListener source) {
+    if (source.responseStartStamp != null) {
+      this.responseStartStamp = source.responseStartStamp;
+    }
+    this.responseEndStamp =
+        source.responseEndStamp != null ? source.responseEndStamp : Stamp.now();
+    seal(response);
+  }
+
+  /**
+   * Adopts a result timed only on the wall clock. Prefer
+   * {@link #completeWith(ContentResponse, HTTP2FutureResponseListener)}, which is what the protocol
+   * race uses: it carries the winner's monotonic readings over as well, so the sample stamped from
+   * this listener is translated from the exchange it actually reports.
+   */
   public void completeWith(ContentResponse response, long responseStart, long responseEnd) {
+    if (responseStart > 0) {
+      // These stamps describe another exchange, so this listener's own monotonic readings do not
+      // match them and must not be used to translate them.
+      this.responseStartStamp = Stamp.ofWallClock(responseStart);
+    }
+    this.responseEndStamp =
+        responseEnd > 0 ? Stamp.ofWallClock(responseEnd) : Stamp.now();
+    seal(response);
+  }
+
+  /** Stores the adopted response and seals this listener: common tail of {@code completeWith}. */
+  private void seal(ContentResponse response) {
     this.response = response;
     this.failure = null;
-    if (responseStart > 0) {
-      this.responseStart = responseStart;
-    }
-    this.responseEnd = responseEnd > 0 ? responseEnd : System.currentTimeMillis();
     this.onCompleteCalled = true;
     this.sealed = true;
     // Drop any partial body this listener may have buffered for its own (losing) attempt — the
@@ -276,14 +348,14 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
         // The losing side of a resolved protocol race, or an explicit cancel(): expected, and the
         // winner's response is reported elsewhere. Logging it as an error filled the log with
         // failures that are not failures, one per raced request.
-        LOG.debug("{} attempt cancelled: {}",
+        lowLevelDebug("{} attempt cancelled: {}",
             raceProtocol != null ? raceProtocol : "Request", failure.getMessage());
       } else if (raceProtocol != null) {
         // One side of a race failing on its own is the expected outcome when the origin does not
         // support that protocol: the other attempt serves the request, and the race only gives up
         // once both sides fail - at which point the caller reports the real failure. Saying "not
         // negotiated" rather than "failed" keeps this from reading as a broken request.
-        LOG.debug("{} not negotiated for {}: {}", raceProtocol,
+        lowLevelDebug("{} not negotiated for {}: {}", raceProtocol,
             request != null ? request.getURI() : "unknown", failure.getMessage());
       } else {
         // Internal transport detail; raise the logger to DEBUG to diagnose. The caller still
@@ -389,7 +461,7 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
 
   @Override
   public boolean cancel(boolean mayInterruptIfRunning) {
-    LOG.debug("=== cancel() called ===");
+    lowLevelDebug("=== cancel() called ===");
     cancelled = true;
     // In Jetty 12, abort() returns CompletableFuture<Boolean>
     if (request != null) {
@@ -585,5 +657,59 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
     return response;
   }
 
+  /**
+   * One instant of the exchange, read on both clocks at once so a consumer can pick the one it
+   * needs: the wall clock to report an absolute time, the monotonic reading to measure a duration
+   * or to translate the instant onto a {@link SampleResult}'s clock.
+   *
+   * <p>Immutable, so publishing it through a single volatile field is enough for a JMeter thread to
+   * see a whole instant rather than half of one written by a Jetty thread.
+   */
+  private static final class Stamp {
+
+    private final long wallClockMillis;
+    private final long nanoTime;
+    /** Whether {@link #nanoTime} belongs to this instant, rather than never having been taken. */
+    private final boolean monotonic;
+
+    private Stamp(long wallClockMillis, long nanoTime, boolean monotonic) {
+      this.wallClockMillis = wallClockMillis;
+      this.nanoTime = nanoTime;
+      this.monotonic = monotonic;
+    }
+
+    private static Stamp now() {
+      // The monotonic reading first: it is the one this instant gets translated with, the wall
+      // clock one is only ever reported as it is.
+      long nanoTime = System.nanoTime();
+      return new Stamp(System.currentTimeMillis(), nanoTime, true);
+    }
+
+    /**
+     * An instant known only as a wall-clock time, adopted from another exchange. Its monotonic
+     * counterpart is derived from how long ago it was, so measuring a wait from it still works;
+     * {@code monotonic} stays false because the derivation already went through the wall clock and
+     * translating it again would compound the two conversions.
+     */
+    private static Stamp ofWallClock(long wallClockMillis) {
+      long nanoTime = System.nanoTime()
+          - TimeUnit.MILLISECONDS.toNanos(System.currentTimeMillis() - wallClockMillis);
+      return new Stamp(wallClockMillis, nanoTime, false);
+    }
+
+    private static long wallClockOf(Stamp stamp) {
+      return stamp == null ? 0 : stamp.wallClockMillis;
+    }
+
+    /** This instant on {@code result}'s own clock, or 0 when there is no instant. */
+    private static long on(SampleResult result, Stamp stamp) {
+      if (stamp == null) {
+        return 0;
+      }
+      return stamp.monotonic
+          ? SampleClock.fromNanoTime(result, stamp.nanoTime)
+          : SampleClock.fromWallClock(result, stamp.wallClockMillis);
+    }
+  }
 }
 

@@ -6,8 +6,10 @@ import com.blazemeter.jmeter.http2.core.HTTP2ClientProfileConfig;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
 import com.blazemeter.jmeter.http2.core.HpackFailureDetector;
+import com.blazemeter.jmeter.http2.core.JMeterSourceAddressResolver;
 import com.blazemeter.jmeter.http2.core.JmeterHttpClientExceptionMapper;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
+import com.blazemeter.jmeter.http2.core.SampleClock;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import com.blazemeter.jmeter.http2.util.Rfc9110Redirects;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -16,6 +18,7 @@ import com.helger.commons.annotation.VisibleForTesting;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.ConnectException;
+import java.net.InetAddress;
 import java.net.MalformedURLException;
 import java.net.SocketTimeoutException;
 import java.net.URISyntaxException;
@@ -28,6 +31,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Predicate;
 import java.util.regex.PatternSyntaxException;
@@ -37,6 +41,7 @@ import org.apache.jmeter.config.Arguments;
 import org.apache.jmeter.engine.event.LoopIterationEvent;
 import org.apache.jmeter.engine.event.LoopIterationListener;
 import org.apache.jmeter.processor.PreProcessor;
+import org.apache.jmeter.protocol.http.control.DNSCacheManager;
 import org.apache.jmeter.protocol.http.parser.BaseParser;
 import org.apache.jmeter.protocol.http.parser.LinkExtractorParseException;
 import org.apache.jmeter.protocol.http.parser.LinkExtractorParser;
@@ -473,25 +478,31 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       if ((isProtocolErrorCause || isProtocolErrorException)
           && !HpackFailureDetector.indicatesHpackFailure(e)
           && !HpackFailureDetector.indicatesHpackFailure(cause)) {
-        boolean fallbackEnabled = isProtocolErrorFallbackEnabled();
+        HTTP2JettyClient fallbackClient = resolveClientForFallback();
+        // The client owns the resolved answer: it already merges this sampler's own flags with
+        // the JMeter properties, and it already turns the fallback off when HTTP/1.1 is disabled.
+        // Re-deriving it from properties alone here ignored both, and retried over HTTP/1.1 even
+        // against h2c-only endpoints where no request may go out as HTTP/1.1.
+        boolean fallbackEnabled =
+            fallbackClient != null && fallbackClient.isProtocolErrorFallbackEnabled();
         if (!fallbackEnabled) {
           LOG.warn("HTTP/2 protocol_error detected and fallback is DISABLED. "
               + "Request will fail.");
           LOG.warn("Error: {}", cause != null ? cause.getMessage() : e.getMessage());
           LOG.warn("To enable fallback, set blazemeter.http.protocolErrorFallbackEnabled=true "
-              + "or blazemeter.http.disableFallback=false in user.properties or jmeter.properties");
+              + "or blazemeter.http.disableFallback=false in user.properties or jmeter.properties, "
+              + "and keep HTTP/1.1 enabled on the sampler");
         } else {
           LOG.warn("HTTP/2 protocol_error detected. Attempting fallback to HTTP/1.1");
           LOG.warn("Error: {}", cause != null ? cause.getMessage() : e.getMessage());
 
           try {
-            // Get the client and request details for fallback
-            HTTP2JettyClient client = clientFactory.call();
             HTTPSampleResult fallbackBase = resolveErrorResult(preparedResult, url, method);
 
             // Retry with HTTP/1.1 only
             LOG.info("Retrying request with HTTP/1.1 only: {}", url);
-            HTTPSampleResult fallbackResult = client.retryWithHTTP11Only(this, fallbackBase);
+            HTTPSampleResult fallbackResult =
+                fallbackClient.retryWithHTTP11Only(this, fallbackBase);
 
             if (fallbackResult != null && fallbackResult.isSuccessful()) {
               LOG.info("HTTP/1.1 fallback succeeded: status={}", fallbackResult.getResponseCode());
@@ -520,17 +531,17 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     return buildResult(url, method);
   }
 
-  private boolean isProtocolErrorFallbackEnabled() {
-    String fb =
-        BzmHttpPluginProperties.resolveRaw("httpJettyClient.protocolErrorFallbackEnabled");
-    if (fb != null) {
-      return Boolean.parseBoolean(fb);
+  /**
+   * The client that would serve this sampler, or {@code null} when it cannot be obtained. Used
+   * from the failure path, where losing the client means there is nothing left to retry on.
+   */
+  private HTTP2JettyClient resolveClientForFallback() {
+    try {
+      return clientFactory.call();
+    } catch (Exception e) {
+      LOG.error("Could not obtain the client to evaluate the HTTP/1.1 fallback", e);
+      return null;
     }
-    String df = BzmHttpPluginProperties.resolveRaw("httpJettyClient.disableFallback");
-    if (df != null) {
-      return !Boolean.parseBoolean(df);
-    }
-    return true;
   }
 
   protected Request sampleAsync(HTTPSampleResult result, HTTP2FutureResponseListener listener)
@@ -563,15 +574,52 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       result.sampleStart();
     }
     if (result.getEndTime() == 0) {
-      if (!Objects.isNull(this.asyncListener) && this.asyncListener.getResponseEnd() != 0) {
-        result.setEndTime(this.asyncListener.getResponseEnd());
+      // On this result's own clock: its start came from sampleStart(), and the listener records the
+      // exchange on the wall clock. See SampleClock.
+      long responseEnd = Objects.isNull(this.asyncListener)
+          ? 0
+          : this.asyncListener.getResponseEndOn(result);
+      if (responseEnd > 0) {
+        result.setEndTime(responseEnd);
       } else {
         result.sampleEnd();
       }
     }
-    return errorResult(
-        JmeterHttpClientExceptionMapper.forSampleResult(e, getAutoRedirects(), result.getURL()),
-        result);
+    Throwable failure =
+        JmeterHttpClientExceptionMapper.forSampleResult(e, getAutoRedirects(), result.getURL());
+    attachConnectAttempts(failure, result);
+    return errorResult(failure, result);
+  }
+
+  /**
+   * Recovers the per-address connection failures Jetty discarded while walking the resolved
+   * addresses, so the response data shows every address tried and why, not only the last one.
+   *
+   * <p>Reads the client already cached for this thread instead of asking the factory: building one
+   * here would be a side effect on the error path, and a sample that never got that far has
+   * nothing recorded anyway.
+   *
+   * <p>The recorder keeps its attempts on the wall clock, so the sample's own start is converted
+   * before being used to select them: comparing the two clocks directly dropped attempts of this
+   * very sample, or picked up attempts of the previous one, by however far apart the clocks were.
+   * See {@link SampleClock}.
+   */
+  private void attachConnectAttempts(Throwable failure, HTTPSampleResult result) {
+    if (failure == null || result.getURL() == null) {
+      return;
+    }
+    try {
+      HTTP2JettyClient client = CONNECTIONS.get().get(buildConnectionKey());
+      if (client != null) {
+        long sampleStart = result.getStartTime();
+        client.attachConnectAttempts(failure, result.getURL(),
+            // 0 is the recorder's "everything held", and must stay a 0 rather than become the
+            // distance between the clocks.
+            sampleStart == 0 ? 0 : SampleClock.toWallClock(result, sampleStart));
+      }
+    } catch (Exception ignored) {
+      // Diagnostics must never replace the failure the sample is actually reporting.
+    }
   }
 
   /**
@@ -618,11 +666,12 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
    * {@code sampleStart}/{@code sampleEnd} back-to-back left elapsed at ~0 and made the page look
    * like it finished when the last fast image landed.
    *
-   * @param startedAtMs when this resource's attempt began (dispatch / listener start), used as the
-   *                    sample start so the reported duration matches the timeout wait
+   * @param startedAtNanos {@link System#nanoTime()} when this resource's attempt began (dispatch /
+   *                       listener start). Monotonic, so the reported duration is the wait itself
+   *                       and not the wait plus whatever the machine clock did meanwhile
    */
   private HTTPSampleResult embeddedTimeoutErrorResult(HTTP2Sampler embeddedSampler,
-                                                      long startedAtMs) {
+                                                      long startedAtNanos) {
     HTTPSampleResult err = new HTTPSampleResult();
     URL url = resolveEmbeddedResourceUrl(embeddedSampler);
     if (url != null) {
@@ -634,21 +683,25 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       err.setSampleLabel(embeddedSampler.getName());
     }
     err.setHTTPMethod(HTTPConstants.GET);
-    long endedAtMs = System.currentTimeMillis();
-    long elapsedMs = Math.max(0L, endedAtMs - startedAtMs);
-    // Stamp end = now, start = now - elapsed (same contract as a real timed-out HC4 sample).
-    err.setStampAndTime(endedAtMs, elapsedMs);
+    long elapsedMs =
+        Math.max(0L, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos));
+    // Start on this result's own clock and the wait measured monotonically, so both the timestamps
+    // and the duration hold whichever end of the interval setStampAndTime takes as its stamp.
+    SampleClock.stampInterval(err, SampleClock.fromNanoTime(err, startedAtNanos), elapsedMs);
     err.setConnectTime(0L);
     err.setLatency(0L);
     return errorResult(new SocketTimeoutException("Read timed out"), err);
   }
 
-  private long embeddedAttemptStartMillis(HTTP2Sampler embeddedSampler) {
+  /**
+   * When this resource's attempt went out, as a {@link System#nanoTime()} reading, falling back to
+   * now for a sampler whose request never reached the transport.
+   */
+  private long embeddedAttemptStartNanos(HTTP2Sampler embeddedSampler) {
     HTTP2FutureResponseListener listener = embeddedSampler.getFutureResponseListener();
-    if (listener != null && listener.getResponseStart() > 0) {
-      return listener.getResponseStart();
-    }
-    return System.currentTimeMillis();
+    return listener == null
+        ? System.nanoTime()
+        : listener.getResponseStartNanos().orElseGet(System::nanoTime);
   }
 
   private URL resolveEmbeddedResourceUrl(HTTP2Sampler embeddedSampler) {
@@ -678,12 +731,12 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     samplers.clear();
     for (TestElement element : pending) {
       HTTP2Sampler embedded = (HTTP2Sampler) element;
-      long startedAtMs = embeddedAttemptStartMillis(embedded);
+      long startedAtNanos = embeddedAttemptStartNanos(embedded);
       HTTP2FutureResponseListener listener = embedded.getFutureResponseListener();
       if (listener != null && !listener.isDone() && !listener.isCancelled()) {
         listener.cancel(true);
       }
-      subres.addSubResult(embeddedTimeoutErrorResult(embedded, startedAtMs));
+      subres.addSubResult(embeddedTimeoutErrorResult(embedded, startedAtNanos));
     }
     setParentSampleSuccess(subres, false);
   }
@@ -872,9 +925,15 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
   private HTTP2JettyClient buildClient() throws Exception {
     HTTP2ClientKey connectionKey = buildConnectionKey();
+    // Resolved before the client exists: a bad source address must fail the sample without
+    // leaving an orphaned client behind, and it is the cheapest thing here to get wrong.
+    InetAddress sourceAddress = resolveSourceAddress();
     HTTP2JettyClient client = new HTTP2JettyClient(isHttp1UpgradeEnabled(),
         "http2[" + connectionKey.target + ":" + Thread.currentThread().getId() + "]",
-        buildProfileConfig());
+        buildProfileConfig(), getDNSResolver());
+    if (sourceAddress != null) {
+      client.setSourceAddress(sourceAddress);
+    }
     client.start();
     CONNECTIONS.get().put(connectionKey, client);
     return client;
@@ -923,7 +982,49 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     appendLongKey(key, "h1cd", getHttp1OnlyCooldownMs());
     appendLongKey(key, "h2cttl", getH2cCacheTtlMs());
     appendBooleanKey(key, "h2cup", isHttp1UpgradeEnabled());
+    appendSourceAddressKey(key);
+    appendDnsResolverKey(key);
     return key.toString();
+  }
+
+  /**
+   * The local address outgoing connections must be bound to - the sampler's "Source address"
+   * field (IP spoofing), or the {@code httpclient.localaddress} property.
+   *
+   * <p>A bad host name, IP or interface propagates out and fails the sample, which is what HC4
+   * does by letting {@code getIpSourceAddress} throw out of {@code setupRequest}. Silently falling
+   * back to the default interface would make a spoofing plan look like it works while every
+   * request leaves from the wrong address.
+   */
+  private InetAddress resolveSourceAddress() throws Exception {
+    if (!JMeterSourceAddressResolver.isConfigured(this)) {
+      return null;
+    }
+    return JMeterSourceAddressResolver.resolve(this);
+  }
+
+  /**
+   * Jetty binds the source address per client, not per request, so a cached client carries the one
+   * it was built with. Keying on the raw configuration - not on the resolved address - keeps this
+   * off the per-sample path: resolving a device name walks the interface list.
+   */
+  private void appendSourceAddressKey(StringBuilder key) {
+    String sourceAddress = JMeterSourceAddressResolver.cacheKeyFor(this);
+    if (!sourceAddress.isEmpty()) {
+      key.append(";ipsrc=").append(sourceAddress);
+    }
+  }
+
+  /**
+   * A cached client carries the DNS Cache Manager it was built with, so two samplers under
+   * different managers (or one with a manager and one without) must not share it. Identity is
+   * enough: JMeter clones the manager once per thread and the client cache is per thread too, so
+   * the instance is stable for as long as the entry can be reused.
+   */
+  private void appendDnsResolverKey(StringBuilder key) {
+    DNSCacheManager dnsCacheManager = getDNSResolver();
+    key.append(";dns=")
+        .append(dnsCacheManager == null ? "-" : System.identityHashCode(dnsCacheManager));
   }
 
   private void appendBooleanKey(StringBuilder key, String name, Boolean value) {
@@ -1562,9 +1663,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     // queue instead would grant it a fresh full timeout on top of however long it already waited;
     // timing the whole page from a single start (as this used to) went the other way and expired
     // resources that had in fact completed normally.
-    long start = listener.getResponseStart() > 0
-        ? listener.getResponseStart()
-        : System.currentTimeMillis();
+    // Monotonic: a wall clock that steps back mid-page would hold a resource past its timeout, and
+    // one that steps forward would expire a resource that is still well within it.
+    long startNanos = embeddedAttemptStartNanos(embeddedSampler);
     while (true) {
       if (listener.isDone() || listener.isCancelled()) {
         consumeFirstEmbeddedSampler(samplers, subres);
@@ -1576,7 +1677,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         abortPendingEmbeddedRequests(samplers);
         return true;
       }
-      if (embeddedTimeout > 0 && (System.currentTimeMillis() - start) >= embeddedTimeout) {
+      if (embeddedTimeout > 0
+          && TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos) >= embeddedTimeout) {
         String pendingUrl = listener.getRequest() != null
             ? listener.getRequest().getURI().toString()
             : "unknown";
@@ -1588,7 +1690,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         // of the page container.
         samplers.remove(0);
         listener.cancel(true);
-        subres.addSubResult(embeddedTimeoutErrorResult(embeddedSampler, start));
+        subres.addSubResult(embeddedTimeoutErrorResult(embeddedSampler, startNanos));
         setParentSampleSuccess(subres, false);
         return false;
       }

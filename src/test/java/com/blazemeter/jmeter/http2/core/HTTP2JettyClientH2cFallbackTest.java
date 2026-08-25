@@ -1,6 +1,8 @@
 package com.blazemeter.jmeter.http2.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.core.ServerBuilder.TeardownableServer;
@@ -10,7 +12,9 @@ import java.net.URI;
 import java.net.URL;
 import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
+import org.eclipse.jetty.client.ContentResponse;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.http.HttpFields;
@@ -81,6 +85,81 @@ public class HTTP2JettyClientH2cFallbackTest extends HTTP2TestBase {
     }
   }
 
+  /**
+   * A server that ignores {@code Upgrade: h2c} and answers the request over HTTP/1.1 has answered
+   * it: that response is the sample. Re-sending would hit the server twice for one sampler, which
+   * for anything other than a GET means the side effect happens twice, and would report only the
+   * second attempt's time.
+   */
+  @Test
+  public void anUpgradeAttemptAnsweredOverHttp11PutsOneRequestOnTheWire() throws Exception {
+    AtomicInteger requests = new AtomicInteger();
+    int port = startHttp1OnlyServer(requests);
+    // http1UpgradeRequired=true is what makes this request carry the h2c upgrade headers.
+    HTTP2JettyClient client = new HTTP2JettyClient(true, "h2c-single-request-test");
+    client.start();
+    try {
+      HTTPSampleResult result = sampleGet(client, port);
+
+      assertThat(result.isSuccessful()).isTrue();
+      assertThat(result.getResponseCode()).isEqualTo("200");
+      assertThat(requests.get()).as("requests that reached the server").isEqualTo(1);
+    } finally {
+      client.stop();
+    }
+  }
+
+  /** And the origin is remembered, so the requests after it are not upgrade attempts either. */
+  @Test
+  public void furtherRequestsToAnHttp11OriginPutOneRequestEachOnTheWire() throws Exception {
+    AtomicInteger requests = new AtomicInteger();
+    int port = startHttp1OnlyServer(requests);
+    HTTP2JettyClient client = new HTTP2JettyClient(true, "h2c-single-request-cache-test");
+    client.start();
+    try {
+      sampleGet(client, port);
+      sampleGet(client, port);
+      sampleGet(client, port);
+
+      assertThat(requests.get()).as("requests that reached the server for three samplers")
+          .isEqualTo(3);
+    } finally {
+      client.stop();
+    }
+  }
+
+  /**
+   * The other half of the rule: a server or proxy that answers the upgrade headers by refusing them
+   * did not serve the request, and that failure is one this client caused by adding headers the test
+   * plan never asked for. Those are still sent again without them.
+   */
+  @Test
+  public void onlyAnAnswerThatRefusesTheUpgradeIsSentAgain() throws Exception {
+    HTTP2JettyClient client = new HTTP2JettyClient(true, "h2c-retry-decision-test");
+    Request upgradeAttempt = newProbeRequest("http://example.invalid/")
+        .headers(h -> h.put(HttpHeader.UPGRADE, "h2c"));
+
+    for (int refused : new int[] {400, 426, 501, 505}) {
+      assertThat(shouldRetry(client, upgradeAttempt, refused))
+          .as("status %s refuses the upgrade, so the request must be sent again", refused)
+          .isTrue();
+    }
+    for (int served : new int[] {200, 201, 204, 301, 401, 403, 404, 500, 503}) {
+      assertThat(shouldRetry(client, upgradeAttempt, served))
+          .as("status %s is an answer to the request, so it must not be sent again", served)
+          .isFalse();
+    }
+  }
+
+  private static boolean shouldRetry(HTTP2JettyClient client, Request request, int status)
+      throws Exception {
+    ContentResponse response = mock(ContentResponse.class);
+    when(response.getVersion()).thenReturn(HttpVersion.HTTP_1_1);
+    when(response.getStatus()).thenReturn(status);
+    return (Boolean) invokePrivate(client, "shouldRetryAfterFailedH2cUpgrade",
+        new Class<?>[] {Request.class, ContentResponse.class}, request, response);
+  }
+
   @Test
   public void wasH2cUpgradeAttemptDetectsUpgradeHeader() throws Exception {
     HTTP2JettyClient client = newClientForReflection();
@@ -132,7 +211,17 @@ public class HTTP2JettyClientH2cFallbackTest extends HTTP2TestBase {
   }
 
   private int startHttp1OnlyServer() throws Exception {
+    return startHttp1OnlyServer(null);
+  }
+
+  /**
+   * @param requestCounter counts every request the server answered, or {@code null} to not count
+   */
+  private int startHttp1OnlyServer(AtomicInteger requestCounter) throws Exception {
     server = new ServerBuilder().withHTTP1().buildServer();
+    if (requestCounter != null) {
+      server.setRequestLog((request, response) -> requestCounter.incrementAndGet());
+    }
     server.start();
     return ((ServerConnector) server.getConnectors()[0]).getLocalPort();
   }

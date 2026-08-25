@@ -5,6 +5,7 @@ import com.blazemeter.jmeter.http2.sampler.JMeterTestUtils;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Consumer;
 import org.apache.jmeter.control.LoopController;
 import org.apache.jmeter.control.TransactionController;
 import org.apache.jmeter.engine.StandardJMeterEngine;
@@ -157,7 +158,63 @@ public final class AsyncScenarioRunner {
     return run(group, DEFAULT_TIMEOUT_MILLIS, children);
   }
 
+  /**
+   * Thread Group scheduler that has already run out. The first {@code stopSchedulerIfNeeded()} call
+   * inside {@code JMeterThread.processSampler} then clears the running flag, so the run is cut
+   * short right after the first sampler was handed out — which is what a duration-limited test
+   * (or a manual Stop) does to whatever transaction happens to be open at that moment. With the
+   * async controller that moment is a dispatch turn, so the open transaction has collected no
+   * child result at all yet.
+   */
+  public static Consumer<JMeterThread> expiredScheduler() {
+    return schedulerEndingIn(-1);
+  }
+
+  /**
+   * Thread Group scheduler whose end lands {@code millisFromNow} from the start of the run, so it
+   * can be made to fall while requests are still on the wire - which for this controller is most of
+   * the time, since its requests live across turns rather than inside one.
+   */
+  public static Consumer<JMeterThread> schedulerEndingIn(long millisFromNow) {
+    return thread -> {
+      thread.setScheduled(true);
+      thread.setEndTime(System.currentTimeMillis() + millisFromNow);
+    };
+  }
+
+  /**
+   * Stops the thread from the outside {@code millisFromNow} into the run, the way the Stop button
+   * and {@code StandardJMeterEngine} do: straight onto the running flag, with no scheduled end
+   * involved. Nothing a controller does can hold that off, so whatever it had on the wire at that
+   * moment is lost - which is the situation the reported sample still has to survive.
+   */
+  public static Consumer<JMeterThread> stopAfter(long millisFromNow) {
+    return thread -> {
+      Thread stopper = new Thread(() -> {
+        try {
+          Thread.sleep(millisFromNow);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return;
+        }
+        thread.stop();
+      }, "scenario-stopper");
+      stopper.setDaemon(true);
+      stopper.start();
+    };
+  }
+
   public static Outcome run(ThreadGroup group, long timeoutMillis, Node... children) {
+    return run(group, timeoutMillis, thread -> {
+    }, children);
+  }
+
+  /**
+   * @param threadSetup applied to the {@link JMeterThread} just before it is started, for the
+   *     settings a Thread Group normally pushes onto it (scheduler, start/end time)
+   */
+  public static Outcome run(ThreadGroup group, long timeoutMillis,
+                            Consumer<JMeterThread> threadSetup, Node... children) {
     JMeterTestUtils.setupJmeterEnv();
     ListedHashTree tree = new ListedHashTree();
     HashTree groupTree = tree.add(group);
@@ -178,6 +235,7 @@ public final class AsyncScenarioRunner {
     jmeterThread.setOnErrorStopTestNow(group.getOnErrorStopTestNow());
     jmeterThread.setOnErrorStopThread(group.getOnErrorStopThread());
     jmeterThread.setOnErrorStartNextLoop(group.getOnErrorStartNextLoop());
+    threadSetup.accept(jmeterThread);
 
     Thread runner = new Thread(jmeterThread, group.getName() + " 1-1");
     runner.setDaemon(true);

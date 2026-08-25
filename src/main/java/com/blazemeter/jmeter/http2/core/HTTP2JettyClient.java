@@ -17,7 +17,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Method;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
+import java.net.SocketAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -32,11 +35,13 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -60,6 +65,7 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.Inflater;
 import java.util.zip.InflaterInputStream;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.http.conn.DnsResolver;
 import org.apache.jmeter.protocol.http.control.AuthManager;
 import org.apache.jmeter.protocol.http.control.Authorization;
 import org.apache.jmeter.protocol.http.control.Cookie;
@@ -82,6 +88,7 @@ import org.eclipse.jetty.client.BasicAuthentication;
 import org.eclipse.jetty.client.BytesRequestContent;
 import org.eclipse.jetty.client.ContentDecoder;
 import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.Destination;
 import org.eclipse.jetty.client.DigestAuthentication;
 import org.eclipse.jetty.client.FormRequestContent;
 import org.eclipse.jetty.client.HttpClient;
@@ -126,6 +133,7 @@ import org.eclipse.jetty.io.ByteBufferPool;
 import org.eclipse.jetty.io.ClientConnectionFactory;
 import org.eclipse.jetty.io.ClientConnector;
 import org.eclipse.jetty.io.Connection;
+import org.eclipse.jetty.io.EndPoint;
 import org.eclipse.jetty.io.Transport;
 import org.eclipse.jetty.io.ssl.SslConnection;
 import org.eclipse.jetty.io.ssl.SslHandshakeListener;
@@ -181,8 +189,28 @@ public class HTTP2JettyClient {
   private static final String ATTR_HTTP3_ATTEMPTED = "bzm.http3.attempted";
   private static final String ATTR_H2C_FALLBACK_ATTEMPTED = "bzm.h2cFallbackAttempted";
   private static final String ATTR_SKIP_H2C_UPGRADE = "bzm.skipH2cUpgrade";
+  /**
+   * Statuses that answer an {@code Upgrade: h2c} attempt by refusing it rather than by serving the
+   * request: a bad request, an upgrade demanded or not implemented, a version not supported. Only
+   * these are worth sending again without the upgrade headers - see
+   * {@link #shouldRetryAfterFailedH2cUpgrade}.
+   */
+  private static final Set<Integer> H2C_UPGRADE_REFUSED_STATUSES = Set.of(
+      HttpStatus.BAD_REQUEST_400,
+      HttpStatus.UPGRADE_REQUIRED_426,
+      HttpStatus.NOT_IMPLEMENTED_501,
+      HttpStatus.HTTP_VERSION_NOT_SUPPORTED_505);
   private static final String ATTR_ORIGIN_KEY = "bzm.http3.origin";
   private static final String ATTR_REQUEST_HEADERS_SERIALIZED = "bzm.request.headers.serialized";
+  /**
+   * JMeter's deprecated "BASIC_DIGEST" Auth Manager mechanism, still selectable in the GUI and
+   * still present in older plans. HC4 keeps honouring it: {@code AuthManager.setupCredentials}
+   * registers the credentials without binding them to a scheme, so they answer either challenge,
+   * and the preemptive auth cache treats the row as Basic. Referenced by name so this file does
+   * not have to carry a deprecation suppression, the same way the surrounding code compares
+   * mechanisms by {@code name()}.
+   */
+  private static final String BASIC_DIGEST_MECHANISM = "BASIC_DIGEST";
   private static final String PROP_SKIP_REDUNDANT_MANUAL_DECODE =
       "blazemeter.http.skipManualDecodeWhenAdvertised";
   private static final Path DEBUG_LOG_PATH = resolveDebugLogPath();
@@ -317,6 +345,23 @@ public class HTTP2JettyClient {
    * {@code findAuthentication} (realm/URI matching quirks) and prevents per-sample list growth.
    */
   private final Set<String> registeredAuthFingerprints = ConcurrentHashMap.newKeySet();
+  /**
+   * Recovers the per-address connection failures Jetty discards while walking the resolved
+   * addresses. Shared by every connector this client builds, so an attempt is captured whichever
+   * protocol variant made it.
+   */
+  private final ConnectAttemptRecorder connectAttempts = new ConnectAttemptRecorder();
+  /**
+   * Every {@link ClientConnector} this client builds, so {@link #setSourceAddress} can reach the
+   * QUIC one too - no transport {@code doStart} propagates the bind address to it.
+   */
+  private final List<ClientConnector> connectors = new ArrayList<>();
+  /**
+   * The sampler's DNS Cache Manager, or {@code null} when the plan has none. Held so
+   * {@link #configureHttpClient} can install {@link JMeterDnsSocketAddressResolver} on every
+   * protocol-variant client before any of them is started.
+   */
+  private final DnsResolver dnsResolver;
 
   public HTTP2JettyClient(boolean http1UpgradeRequired, String name) {
     this(http1UpgradeRequired, name, null);
@@ -324,6 +369,12 @@ public class HTTP2JettyClient {
 
   public HTTP2JettyClient(boolean http1UpgradeRequired, String name,
                           HTTP2ClientProfileConfig profileConfig) {
+    this(http1UpgradeRequired, name, profileConfig, null);
+  }
+
+  public HTTP2JettyClient(boolean http1UpgradeRequired, String name,
+                          HTTP2ClientProfileConfig profileConfig, DnsResolver dnsResolver) {
+    this.dnsResolver = dnsResolver;
     loadProperties(profileConfig);
     lowLevelDebug(PLUGIN_BUILD_TAG);
 
@@ -430,7 +481,7 @@ public class HTTP2JettyClient {
     }
 
     CustomClientConnectionFactoryOverHTTP2.HTTP2 http2 =
-        new CustomClientConnectionFactoryOverHTTP2.HTTP2(http2Client);
+        new CustomClientConnectionFactoryOverHTTP2.HTTP2(http2Client, this::onHttp2Rejected);
 
     // Configure server push (can be disabled for compatibility)
     if (disableServerPush) {
@@ -568,7 +619,8 @@ public class HTTP2JettyClient {
     // even though ALPN negotiates HTTP/2 successfully. This is a regression from Jetty 11.
     // We try HTTP/2 first, then fallback to HTTP/1.1 if needed.
     ClientConnectionFactory.Info[] mainProtocols = buildMainProtocols(http3, http2, http11);
-    HttpClientTransport transport = new HttpClientTransportDynamic(clientConnector, mainProtocols);
+    HttpClientTransport transport =
+        new RecordingHttpClientTransportDynamic(clientConnector, mainProtocols);
     mainProtocolsSnapshot = protocolList(mainProtocols);
     lowLevelDebug("HttpClientTransportDynamic configured with protocols: {}",
         mainProtocolsSnapshot);
@@ -585,13 +637,14 @@ public class HTTP2JettyClient {
       ClientConnector noH3Connector = createClientConnector(name + "-noh3");
       ClientConnectionFactory.Info[] noH3Protocols = buildNoH3Protocols(http2, http11);
       HttpClientTransport noH3Transport =
-          new HttpClientTransportDynamic(noH3Connector, noH3Protocols);
+          new RecordingHttpClientTransportDynamic(noH3Connector, noH3Protocols);
       configureTransport(noH3Transport);
       this.httpClientNoH3 = new HttpClient(noH3Transport);
       configureHttpClient(this.httpClientNoH3, noH3Connector);
     }
     ClientConnector http1Connector = createClientConnector(name + "-http1");
-    HttpClientTransport http1Transport = new HttpClientTransportDynamic(http1Connector, http11);
+    HttpClientTransport http1Transport =
+        new RecordingHttpClientTransportDynamic(http1Connector, http11);
     // HTTP/1.1 has no multiplexing (Jetty rejects a 2nd in-flight exchange per connection).
     configureTransport(http1Transport, 1);
     this.httpClientHttp1Only = new HttpClient(http1Transport);
@@ -611,7 +664,7 @@ public class HTTP2JettyClient {
     ClientConnectionFactory.Info[] h2cUpgradeProtocols =
         buildH2cUpgradeProtocols(http11, http2cUpgrade);
     HttpClientTransport h2cUpgradeTransport =
-        new HttpClientTransportDynamic(h2cUpgradeConnector, h2cUpgradeProtocols);
+        new RecordingHttpClientTransportDynamic(h2cUpgradeConnector, h2cUpgradeProtocols);
     configureTransport(h2cUpgradeTransport);
     this.httpClientH2cUpgrade = new HttpClient(h2cUpgradeTransport);
     configureHttpClient(this.httpClientH2cUpgrade, h2cUpgradeConnector);
@@ -625,7 +678,8 @@ public class HTTP2JettyClient {
     } else {
       http2cClient.setMaxConcurrentPushedStreams(maxConcurrentPushedStreams);
     }
-    HttpClientTransport h2cTransport = new CustomHttpClientTransportOverHTTP2(http2cClient);
+    HttpClientTransport h2cTransport =
+        new CustomHttpClientTransportOverHTTP2(http2cClient, connectAttempts);
     configureTransport(h2cTransport);
     this.httpClientH2cPrior = new HttpClient(h2cTransport);
     configureHttpClient(this.httpClientH2cPrior, h2cConnector);
@@ -818,6 +872,15 @@ public class HTTP2JettyClient {
 
   public int getRequestTimeout() {
     return requestTimeout;
+  }
+
+  /**
+   * Whether a {@code protocol_error} may be retried over HTTP/1.1 with this client's resolved
+   * configuration. Already {@code false} whenever HTTP/1.1 is disabled, so callers do not have to
+   * pair it with a separate HTTP/1.1 check.
+   */
+  public boolean isProtocolErrorFallbackEnabled() {
+    return protocolErrorFallbackEnabled;
   }
 
   public void loadProperties() {
@@ -1228,7 +1291,8 @@ public class HTTP2JettyClient {
 
     // Create transport with ONLY HTTP/1.1 (no HTTP/2)
     ClientConnectionFactory.Info http11 = HttpClientConnectionFactory.HTTP11;
-    HttpClientTransport transport = new HttpClientTransportDynamic(clientConnector, http11);
+    HttpClientTransport transport =
+        new RecordingHttpClientTransportDynamic(clientConnector, http11);
     lowLevelDebug("HttpClientTransportDynamic configured with HTTP/1.1 only (fallback mode)");
 
     HttpClient http11Client = new HttpClient(transport);
@@ -1397,9 +1461,20 @@ public class HTTP2JettyClient {
   }
 
   /**
-   * The server answered (no timeout/error) but never actually negotiated HTTP/2 despite our
-   * {@code Upgrade: h2c} attempt - e.g. it silently ignored the header, as a compliant HTTP/1.1
-   * server that doesn't support h2c is allowed to do. Retry once with a plain HTTP/1.1 request.
+   * Whether the {@code Upgrade: h2c} attempt has to be made again as a plain HTTP/1.1 request.
+   *
+   * <p>Only when the answer says the upgrade attempt itself was refused. A compliant HTTP/1.1
+   * server that does not speak h2c ignores the header and serves the request over HTTP/1.1, and
+   * that response <em>is</em> the answer to this request: re-sending it would put the same request
+   * on the wire twice - twice the load, and twice the side effect for anything that is not a GET -
+   * and would report only the second attempt's time. What is left of the failed negotiation is
+   * remembered by {@link #updateHttp1OnlyCache}, so the requests after it skip the upgrade instead
+   * of paying for it again.
+   *
+   * <p>A server or proxy that answers the upgrade headers with one of
+   * {@link #H2C_UPGRADE_REFUSED_STATUSES} did not serve the request, it rejected the attempt, and
+   * that is a failure this client caused by adding headers the test plan never asked for. Those are
+   * retried once, without the headers.
    */
   private boolean shouldRetryAfterFailedH2cUpgrade(Request request, ContentResponse response) {
     if (!enableHttp1 || !http1UpgradeRequired || request == null || response == null) {
@@ -1416,7 +1491,8 @@ public class HTTP2JettyClient {
     if (!wasH2cUpgradeAttempt(request)) {
       return false;
     }
-    return response.getVersion() != HttpVersion.HTTP_2;
+    return response.getVersion() != HttpVersion.HTTP_2
+        && H2C_UPGRADE_REFUSED_STATUSES.contains(response.getStatus());
   }
 
   private void markCleartextHttp1Only(URI uri) {
@@ -1860,7 +1936,7 @@ public class HTTP2JettyClient {
     lowLevelDebug("=== send() returned successfully ===");
 
     postContentResponse(sampler, request, result, contentResponse, cacheManager);
-    result.setEndTime(listener.getResponseEnd());
+    stampSampleEnd(result, listener);
 
     resetSamplerDataBeforeResultProcessing(result);
     return sampler.resultProcessing(areFollowingRedirect, depth, result);
@@ -1915,6 +1991,27 @@ public class HTTP2JettyClient {
     return sampler.resultProcessing(areFollowingRedirect, depth, result);
   }
 
+  /**
+   * Ends the sample when the exchange ended, translated onto this result's own clock: the start
+   * came from {@code sampleStart()}, and a {@link org.apache.jmeter.samplers.SampleResult} keeps a
+   * nano-derived clock of its own by default, so reading the end straight off the listener's
+   * wall-clock stamp reported the distance between the two clocks as part of the sample's duration.
+   * See {@link SampleClock}.
+   *
+   * <p>Falls back to {@code sampleEnd()} when the exchange never recorded a completion. Stamping
+   * what the listener held in that case wrote a 0, and {@code setEndTime} turns a zero end into an
+   * elapsed time of minus the start of the epoch.
+   */
+  private static void stampSampleEnd(HTTPSampleResult result,
+                                     HTTP2FutureResponseListener listener) {
+    long endTime = listener.getResponseEndOn(result);
+    if (endTime > 0) {
+      result.setEndTime(endTime);
+    } else if (result.getEndTime() == 0) {
+      result.sampleEnd();
+    }
+  }
+
   public HTTPSampleResult sampleFromListener(HTTP2Sampler sampler, HTTPSampleResult result,
                                              boolean areFollowingRedirect, int depth,
                                              HTTP2FutureResponseListener listener
@@ -1928,7 +2025,7 @@ public class HTTP2JettyClient {
       JettyCacheManager cacheManager =
           JettyCacheManager.fromCacheManager(sampler.getCacheManager());
       postContentResponse(sampler, request, result, contentResponse, cacheManager);
-      result.setEndTime(listener.getResponseEnd());
+      stampSampleEnd(result, listener);
 
       resetSamplerDataBeforeResultProcessing(result);
       return sampler.resultProcessing(areFollowingRedirect, depth, result);
@@ -1955,7 +2052,11 @@ public class HTTP2JettyClient {
           JettyCacheManager cacheManager =
               JettyCacheManager.fromCacheManager(sampler.getCacheManager());
           postContentResponse(sampler, request, result, retryResponse, cacheManager);
-          result.setEndTime(listener.getResponseEnd());
+          // Not from the listener: the only completion it ever recorded is the GOAWAY that killed
+          // the first attempt. retryAfterGoAway sends a clone of its own and returns the response
+          // it got, so the sample ends now - stamping the listener's end reported a sample that
+          // finished before the response it carries, missing the whole retry.
+          result.setEndTime(result.currentTimeInMillis());
           resetSamplerDataBeforeResultProcessing(result);
           return sampler.resultProcessing(areFollowingRedirect, depth, result);
         } catch (Exception retryException) {
@@ -2086,7 +2187,8 @@ public class HTTP2JettyClient {
           throw e;
         }
       }
-      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)) {
+      if (shouldFallbackToHttp11AfterTransportFailure(cause, e)
+          || shouldFallbackToHttp11AfterHttp2Rejected(request.getURI())) {
         LOG.warn("Transport failure detected in send()! Attempting fallback to HTTP/1.1");
         LOG.warn("Error details: message='{}', exception={}",
             cause != null ? cause.getMessage() : e.getMessage(),
@@ -2280,8 +2382,7 @@ public class HTTP2JettyClient {
             h2Request.abort(new java.util.concurrent.CancellationException(
                 "Happy Eyeballs H3 won"));
           } else {
-            h3Listener.completeWith(response,
-                h2Listener.getResponseStart(), h2Listener.getResponseEnd());
+            h3Listener.completeWith(response, h2Listener);
             h3Request.abort(new java.util.concurrent.CancellationException(
                 "Happy Eyeballs H2 won"));
           }
@@ -3063,6 +3164,28 @@ public class HTTP2JettyClient {
     }
   }
 
+  /**
+   * Records that an origin does not speak HTTP/2 at all, so every later sample to it goes straight
+   * to HTTP/1.1 instead of paying a failed HTTP/2 attempt per resolved address.
+   *
+   * <p>Reported by {@code CustomHttpSessionListenerPromise} only when the session died before the
+   * server preface arrived, which is what separates "this peer cannot speak HTTP/2" from a healthy
+   * session being closed. The usual cause is a TLS handshake that selected no ALPN protocol -
+   * Jetty then falls back to the first configured protocol, which is HTTP/2 - and it is worth
+   * remembering because Jetty treats each rejected attempt as a failed connection and rolls over
+   * to the next address, burning every usable one before reporting whatever the last address said.
+   */
+  private void onHttp2Rejected(URI origin) {
+    if (!enableHttp1 || !http1OnlyCacheEnabled || http1OnlyCooldownMs <= 0 || origin == null) {
+      lowLevelDebug("Origin {} rejected the HTTP/2 preface but will not be remembered "
+              + "(enableHttp1={}, http1OnlyCacheEnabled={}, cooldownMs={})",
+          origin, enableHttp1, http1OnlyCacheEnabled, http1OnlyCooldownMs);
+      return;
+    }
+    lowLevelDebug("Origin {} rejected the HTTP/2 preface; remembering it as HTTP/1.1-only", origin);
+    markHttp1OnlyOrigin(originKey(origin));
+  }
+
   private void markHttp1OnlyOrigin(String origin) {
     Http1OnlyEntry entry = new Http1OnlyEntry();
     entry.expiresAt = System.currentTimeMillis() + http1OnlyCooldownMs;
@@ -3200,6 +3323,21 @@ public class HTTP2JettyClient {
         || isClosedChannelFailure(cause != null ? cause : wrapped);
   }
 
+  /**
+   * Whether this failure should be retried over HTTP/1.1 because the origin turned out not to
+   * speak HTTP/2 while this very request was being attempted.
+   *
+   * <p>Needed on top of {@link #shouldFallbackToHttp11AfterTransportFailure} because the exception
+   * that reaches the caller is whatever the <em>last</em> resolved address produced, and Jetty
+   * discards the earlier ones. An origin whose usable addresses all rejected the HTTP/2 preface
+   * therefore surfaces as a plain socket error from some later, unrelated address: a host that
+   * resolves to several reachable addresses followed by unreachable ones fails the preface on
+   * each reachable one, and then reports whatever the first unreachable one said.
+   */
+  private boolean shouldFallbackToHttp11AfterHttp2Rejected(URI uri) {
+    return protocolErrorFallbackEnabled && enableHttp1 && uri != null && isHttp1Only(uri);
+  }
+
   private static boolean isClosedChannelFailure(Throwable throwable) {
     for (Throwable current = throwable; current != null; current = current.getCause()) {
       if (current instanceof ClosedChannelException) {
@@ -3330,6 +3468,77 @@ public class HTTP2JettyClient {
     return request;
   }
 
+  /**
+   * {@link HttpClientTransportDynamic} that lets {@link ConnectAttemptRecorder} see the failure of
+   * each resolved address before Jetty silently moves on to the next one.
+   *
+   * <p>This is the one point where the address being attempted and the promise that decides the
+   * roll-over are both in hand, which is why it covers a refused socket, a TLS handshake and the
+   * HTTP/2 preface alike.
+   */
+  private class RecordingHttpClientTransportDynamic extends HttpClientTransportDynamic {
+
+    private final ClientConnectionFactory.Info[] infos;
+
+    RecordingHttpClientTransportDynamic(ClientConnector connector,
+                                        ClientConnectionFactory.Info... infos) {
+      super(connector, infos);
+      this.infos = infos;
+    }
+
+    @Override
+    public void connect(SocketAddress address, Map<String, Object> context) {
+      connectAttempts.instrument(address, context);
+      super.connect(address, context);
+    }
+
+    /**
+     * Stops re-offering HTTP/2 to an origin already known to reject it, address after address.
+     *
+     * <p>Jetty resolves the connection factory once per resolved address, so without this the
+     * first rejection is paid again on every remaining address of the same request: each one
+     * completes TCP and TLS, gets the preface refused, and counts as a failed connection attempt
+     * that rolls over to the next. Consulting what {@link #onHttp2Rejected} already learned turns
+     * that into a single wasted connection for the whole origin.
+     *
+     * <p>Deliberately keyed on that knowledge rather than on the negotiated ALPN protocol: at this
+     * point the TLS handshake has not run yet, so neither the context nor the {@code SSLEngine}
+     * knows what was agreed, and an origin that does speak HTTP/2 never reaches this branch
+     * because nothing ever marks it.
+     */
+    @Override
+    public Connection newConnection(EndPoint endPoint, Map<String, Object> context)
+        throws IOException {
+      ClientConnectionFactory.Info http11 = http11ForOriginThatRejectedHttp2(context);
+      if (http11 != null) {
+        return http11.getClientConnectionFactory().newConnection(endPoint, context);
+      }
+      return super.newConnection(endPoint, context);
+    }
+
+    private ClientConnectionFactory.Info http11ForOriginThatRejectedHttp2(
+        Map<String, Object> context) {
+      if (!enableHttp1) {
+        return null;
+      }
+      Destination destination = (Destination) context.get(Destination.CONTEXT_KEY);
+      if (destination == null) {
+        return null;
+      }
+      URI origin = URI.create(destination.getOrigin().asString());
+      if (!isHttp1Only(origin)) {
+        return null;
+      }
+      lowLevelDebug("Origin {} is known to reject HTTP/2; using HTTP/1.1 for this address", origin);
+      for (ClientConnectionFactory.Info info : infos) {
+        if (info.getProtocols(destination.isSecure()).contains("http/1.1")) {
+          return info;
+        }
+      }
+      return null;
+    }
+  }
+
   private static class HappyEyeballsThreadFactory implements ThreadFactory {
     private final String prefix;
     private final AtomicInteger counter = new AtomicInteger(1);
@@ -3348,6 +3557,7 @@ public class HTTP2JettyClient {
 
   private void configureHttpClient(HttpClient client, ClientConnector connector) {
     client.setUserAgentField(null);
+    configureDnsResolution(client);
     connector.setByteBufferPool(this.bufferPool);
     client.setMaxRequestsQueuedPerDestination(maxRequestsQueuedPerDestination);
     client.setMaxConnectionsPerDestination(maxConnectionsPerDestination);
@@ -3364,6 +3574,23 @@ public class HTTP2JettyClient {
     if (LowLevelDebugLog.isEnabled()) {
       addConnectionLogging(client);
     }
+  }
+
+  /**
+   * Routes host name resolution through the plan's DNS Cache Manager, when there is one.
+   *
+   * <p>With no manager configured nothing is set and {@code HttpClient.doStart} installs its own
+   * {@code SocketAddressResolver.Async}, which is the same default {@code HTTPHC4Impl} falls back
+   * to ({@code SystemDefaultDnsResolver}). Under a proxy this still resolves the proxy host rather
+   * than the target host, because Jetty resolves {@code HttpDestination.resolveOrigin()} - again
+   * matching HC4, which connects to the proxy hop of the route.
+   */
+  private void configureDnsResolution(HttpClient client) {
+    if (dnsResolver == null) {
+      return;
+    }
+    client.setSocketAddressResolver(new JMeterDnsSocketAddressResolver(dnsResolver,
+        client::getExecutor, client::getScheduler, client.getAddressResolutionTimeout()));
   }
 
   private static void addConnectionLogging(HttpClient client) {
@@ -3437,8 +3664,40 @@ public class HTTP2JettyClient {
         .resolve("http2-client-alpn.log");
   }
 
+  /**
+   * Binds every outgoing connection of this client to {@code sourceAddress} (JMeter's "Source
+   * address" field, a.k.a. IP spoofing), or restores the OS default when {@code null}.
+   *
+   * <p>Must be called before {@link #start()}: Jetty reads the bind address in
+   * {@code AbstractConnectorHttpClientTransport.doStart}, which then pushes it onto the transport's
+   * own connector. The QUIC connector used for HTTP/3 is not owned by any transport's
+   * {@code doStart}, so it is set here directly - which is also why the connectors are tracked.
+   *
+   * <p>Unlike HC4 this is per client rather than per request, because that is the granularity Jetty
+   * offers. {@code HTTP2Sampler} compensates by keying its per-thread client cache on the
+   * sampler's source-address configuration, so two samplers spoofing different IPs get their own
+   * client instead of silently sharing one.
+   */
+  public void setSourceAddress(InetAddress sourceAddress) {
+    SocketAddress bindAddress =
+        sourceAddress == null ? null : new InetSocketAddress(sourceAddress, 0);
+    forEachHttpClient(client -> client.setBindAddress(bindAddress));
+    for (ClientConnector connector : connectors) {
+      connector.setBindAddress(bindAddress);
+    }
+  }
+
+  /**
+   * Attaches every connection failure recorded for {@code url} since {@code sinceMillis} to
+   * {@code failure} as suppressed exceptions, recovering the attempts Jetty discarded.
+   */
+  public void attachConnectAttempts(Throwable failure, URL url, long sinceMillis) {
+    connectAttempts.attachTo(failure, url, sinceMillis);
+  }
+
   private ClientConnector createClientConnector(String name) {
     ClientConnector connector = new ClientConnector();
+    connectors.add(connector);
     if (sharedThreadPoolEnabled) {
       connector.setSelectors(-1);
     } else {
@@ -3648,24 +3907,44 @@ public class HTTP2JettyClient {
   private boolean isSupportedMechanism(Authorization auth) {
     String authName = auth.getMechanism().name();
     return authName.equals(AuthManager.Mechanism.BASIC.name())
-        || authName.equals(AuthManager.Mechanism.DIGEST.name());
+        || authName.equals(AuthManager.Mechanism.DIGEST.name())
+        || authName.equals(BASIC_DIGEST_MECHANISM);
+  }
+
+  /**
+   * Whether the row may answer a {@code Basic} challenge, which {@code BASIC_DIGEST} rows may.
+   */
+  private static boolean answersBasicChallenge(Authorization auth) {
+    String authName = auth.getMechanism().name();
+    return authName.equals(AuthManager.Mechanism.BASIC.name())
+        || authName.equals(BASIC_DIGEST_MECHANISM);
+  }
+
+  /**
+   * Whether the row may answer a {@code Digest} challenge, which {@code BASIC_DIGEST} rows may.
+   */
+  private static boolean answersDigestChallenge(Authorization auth) {
+    String authName = auth.getMechanism().name();
+    return authName.equals(AuthManager.Mechanism.DIGEST.name())
+        || authName.equals(BASIC_DIGEST_MECHANISM);
   }
 
   private void addAuthenticationToJettyClient(Authorization auth) {
     String authName = auth.getMechanism().name();
-    if (authName.equals(AuthManager.Mechanism.BASIC.name())
-        && BzmHttpPluginProperties.getPropDefault("httpJettyClient.auth.preemptive", false)) {
+    boolean preemptive =
+        BzmHttpPluginProperties.getPropDefault("httpJettyClient.auth.preemptive", false);
+    if (preemptive && answersBasicChallenge(auth)) {
       BasicAuthentication.BasicResult result =
           new BasicAuthentication.BasicResult(URI.create(auth.getURL()), auth.getUser(),
               auth.getPass());
       // Results are keyed by URI (Map.put replaces); safe to re-register every sample.
       forEachAuthenticationStore(store -> store.addAuthenticationResult(result));
-      return;
-    }
-
-    String fingerprint = authFingerprint(auth);
-    if (!registeredAuthFingerprints.add(fingerprint)) {
-      return;
+      if (authName.equals(AuthManager.Mechanism.BASIC.name())) {
+        return;
+      }
+      // A BASIC_DIGEST row falls through: sending Basic up front is what HC4's auth cache does,
+      // but the credentials must still be able to answer whichever challenge the server sends
+      // back, which is the whole point of the mechanism.
     }
 
     URI uri = URI.create(auth.getURL());
@@ -3674,10 +3953,26 @@ public class HTTP2JettyClient {
       // Blank JMeter realm must match any challenge realm; "" would only match "".
       realm = Authentication.ANY_REALM;
     }
-    AbstractAuthentication authentication =
-        authName.equals(AuthManager.Mechanism.BASIC.name())
-            ? new BasicAuthentication(uri, realm, auth.getUser(), auth.getPass())
-            : new DigestAuthentication(uri, realm, auth.getUser(), auth.getPass());
+    if (answersBasicChallenge(auth)) {
+      registerAuthentication(auth,
+          new BasicAuthentication(uri, realm, auth.getUser(), auth.getPass()));
+    }
+    if (answersDigestChallenge(auth)) {
+      registerAuthentication(auth,
+          new DigestAuthentication(uri, realm, auth.getUser(), auth.getPass()));
+    }
+  }
+
+  /**
+   * Adds one Jetty authentication to every protocol-variant store, once per distinct row.
+   *
+   * <p>The fingerprint carries the Jetty authentication type because a single {@code BASIC_DIGEST}
+   * row produces two of them, and both have to get through.
+   */
+  private void registerAuthentication(Authorization auth, AbstractAuthentication authentication) {
+    if (!registeredAuthFingerprints.add(authFingerprint(auth) + '|' + authentication.getType())) {
+      return;
+    }
     forEachAuthenticationStore(store -> store.addAuthentication(authentication));
   }
 
@@ -3764,11 +4059,42 @@ public class HTTP2JettyClient {
       throws URISyntaxException {
     URI uri = result.getURL().toURI();
     if ("http".equalsIgnoreCase(uri.getScheme())
-        && shouldAttachRequestBody(sampler, result, false)) {
+        && shouldAttachRequestBody(sampler, result, false)
+        && canDivertCleartextBodyToHttp11(uri)) {
       lowLevelDebug("Cleartext request with body; using HTTP/1.1-only client for {}", uri);
       return httpClientHttp1Only;
     }
     return selectHttpClient(uri, isRecoverableIfHttp3Fails(sampler));
+  }
+
+  /**
+   * Whether a bodied cleartext request may be diverted to the HTTP/1.1-only client.
+   *
+   * <p>The diversion only exists to sidestep the h2c Upgrade dance, whose first request travels as
+   * plain HTTP/1.1 and which servers handle inconsistently when it carries a body. It is a
+   * shortcut around a negotiation, never a protocol choice, so it must not fire where HTTP/1.1 is
+   * not what the configuration asks for:
+   *
+   * <ul>
+   *   <li>HTTP/1.1 disabled: no request may go out as HTTP/1.1, bodied or not. Sending one to an
+   *       h2c origin makes the server answer with HTTP/2 frames that the HTTP/1.1 parser reads as
+   *       garbage ({@code Illegal character CNTL=0x0}).</li>
+   *   <li>h2c prior knowledge (configured, or learned and still cached): the origin is spoken to
+   *       as HTTP/2 from the first byte, so there is no Upgrade to avoid in the first place.</li>
+   * </ul>
+   */
+  private boolean canDivertCleartextBodyToHttp11(URI uri) {
+    if (!enableHttp1) {
+      lowLevelDebug("Cleartext request with body but HTTP/1.1 is disabled; "
+          + "keeping protocol selection for {}", uri);
+      return false;
+    }
+    if (shouldUseH2cPriorKnowledge(uri)) {
+      lowLevelDebug("Cleartext request with body on an h2c prior-knowledge origin; "
+          + "keeping HTTP/2 for {}", uri);
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -3893,8 +4219,14 @@ public class HTTP2JettyClient {
     // 1. The connection is already HTTP/2 (negotiated via ALPN)
     // 2. Upgrade headers are for cleartext HTTP, not HTTPS
     // 3. It violates the HTTP/2 protocol (RFC 7540)
+    // An origin already known to answer HTTP/1.1 is not asked to upgrade again: the attempt costs
+    // three headers and Jetty's upgrade machinery on every request, and the negotiation it asks for
+    // is one this client already watched fail. This is the "later requests skip the futile upgrade
+    // attempt" the HTTP/1.1-only cache is written for - until now the cache only steered which
+    // client was used, and the headers went out regardless.
     if (http1UpgradeRequired && enableHttp2 && !"https".equalsIgnoreCase(url.getProtocol())
         && !shouldUseH2cPriorKnowledge(request.getURI())
+        && !isHttp1Only(request.getURI())
         && !Boolean.TRUE.equals(request.getAttributes().get(ATTR_SKIP_H2C_UPGRADE))) {
       Mutable headers = ((Mutable) request.getHeaders());
       addHeaderIfMissing(HttpHeader.UPGRADE, "h2c", headers);
@@ -4000,7 +4332,7 @@ public class HTTP2JettyClient {
     StreamSupport.stream(authManager.getAuthObjects().spliterator(), false)
         .map(j -> (Authorization) j.getObjectValue())
         .filter(auth -> auth != null
-            && AuthManager.Mechanism.BASIC.equals(auth.getMechanism())
+            && answersBasicChallenge(auth)
             && !StringUtils.isEmpty(auth.getURL()))
         .filter(auth -> url.toString().startsWith(auth.getURL()))
         .findFirst()
@@ -4963,4 +5295,3 @@ public class HTTP2JettyClient {
     }
   }
 }
-

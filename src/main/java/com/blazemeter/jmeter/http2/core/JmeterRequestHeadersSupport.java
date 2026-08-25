@@ -110,17 +110,50 @@ final class JmeterRequestHeadersSupport {
     return "BlazeMeter HTTP/" + version;
   }
 
+  /**
+   * Reports the {@code Connection} header the sampler asked for, the way {@code HTTPHC4Impl} does,
+   * even when this client owns that header on the wire for its own reasons.
+   *
+   * <p>An {@code h2c} upgrade attempt has to send {@code Connection: Upgrade, HTTP2-Settings} for
+   * the upgrade to be well formed, and only some requests carry it - the ones that probe a
+   * cleartext origin for HTTP/2. Leaving the sample with just those tokens made the keep-alive the
+   * sampler asked for disappear from exactly those requests, so a plan asserting
+   * {@code Connection: keep-alive} on its request headers failed on the one request that happened
+   * to probe. The upgrade tokens stay in the reported header, with the sampler's own token in front
+   * of them.
+   *
+   * <p>A {@code Connection} header that came from the test plan is left exactly as the plan wrote
+   * it, and an HTTP/2 request gets none at all.
+   */
   private static void restoreConnectionHeaderForSample(
       Request request, HttpFields.Mutable headers) {
     Object useKeepAlive = request.getAttributes().get(ATTR_USE_KEEPALIVE);
-    if (useKeepAlive == null || !shouldSendConnectionHeader(request)) {
+    if (useKeepAlive == null || request.getVersion() == HttpVersion.HTTP_2) {
       return;
     }
-    if (Boolean.TRUE.equals(useKeepAlive)) {
-      headers.put(HTTPConstants.HEADER_CONNECTION, HTTPConstants.KEEP_ALIVE);
-    } else {
-      headers.put(HTTPConstants.HEADER_CONNECTION, HTTPConstants.CONNECTION_CLOSE);
+    String samplerToken = Boolean.TRUE.equals(useKeepAlive)
+        ? HTTPConstants.KEEP_ALIVE
+        : HTTPConstants.CONNECTION_CLOSE;
+    HttpFields onTheWire = request.getHeaders();
+    String connection = onTheWire == null ? null : onTheWire.get(HttpHeader.CONNECTION);
+    if (connection == null) {
+      headers.put(HTTPConstants.HEADER_CONNECTION, samplerToken);
+      return;
     }
+    if (!containsToken(connection, HttpHeader.UPGRADE.asString())
+        || containsToken(connection, samplerToken)) {
+      return;
+    }
+    headers.put(HTTPConstants.HEADER_CONNECTION, samplerToken + ", " + connection);
+  }
+
+  private static boolean containsToken(String headerValue, String token) {
+    for (String candidate : headerValue.split(",")) {
+      if (candidate.trim().equalsIgnoreCase(token)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static boolean shouldSendConnectionHeader(Request request) {

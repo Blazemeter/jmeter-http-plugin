@@ -9,6 +9,7 @@ import static org.mockito.Mockito.when;
 
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
+import com.blazemeter.jmeter.http2.core.SampleClock;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import java.io.Closeable;
 import java.net.ConnectException;
@@ -256,11 +257,15 @@ public final class StubAsyncTransport implements Closeable {
       throw new TimeoutException("stub transport: no response for " + sampler.getName());
     }
     ResponseSpec spec = spec(sampler.getName());
-    long start = listener.getResponseStart() > 0
-        ? listener.getResponseStart()
-        : System.currentTimeMillis();
-    long end = listener.getResponseEnd() > start ? listener.getResponseEnd() : start + 1;
-    return fill(result, spec, start, end);
+    // On this result's own clock, like the real client: a SampleResult keeps a nano-derived clock of
+    // its own by default, so stamping children with System.currentTimeMillis() readings would put
+    // every child's times a clock offset away from the transaction's. See SampleClock.
+    long start = listener.getResponseStartOn(result);
+    if (start <= 0) {
+      start = result.currentTimeInMillis();
+    }
+    long end = listener.getResponseEndOn(result);
+    return fill(result, spec, start, Math.max(start + 1, end));
   }
 
   private HTTPSampleResult onSyncSample(HTTP2Sampler sampler, HTTPSampleResult result)
@@ -269,17 +274,17 @@ public final class StubAsyncTransport implements Closeable {
     ResponseSpec spec = spec(name);
     syncSampled.add(name);
     trackInFlight(1);
-    long start = System.currentTimeMillis();
+    long start = result.currentTimeInMillis();
     if (spec.latencyMillis > 0) {
       Thread.sleep(spec.latencyMillis);
     }
     trackInFlight(-1);
-    return fill(result, spec, start, Math.max(start + 1, System.currentTimeMillis()));
+    return fill(result, spec, start, Math.max(start + 1, result.currentTimeInMillis()));
   }
 
   private HTTPSampleResult fill(HTTPSampleResult result, ResponseSpec spec, long start, long end) {
     if (result.getStartTime() == 0 && result.getEndTime() == 0) {
-      result.setStampAndTime(start, Math.max(1, end - start));
+      SampleClock.stampInterval(result, start, Math.max(1, end - start));
     }
     result.setResponseCode(spec.responseCode);
     result.setResponseMessage(spec.responseMessage);
@@ -293,7 +298,7 @@ public final class StubAsyncTransport implements Closeable {
     for (String resource : spec.embeddedResources) {
       HTTPSampleResult sub = new HTTPSampleResult();
       sub.setSampleLabel(resource);
-      sub.setStampAndTime(start, 1);
+      SampleClock.stampInterval(sub, start, 1);
       sub.setResponseCodeOK();
       sub.setResponseMessage("OK");
       sub.setSuccessful(true);
