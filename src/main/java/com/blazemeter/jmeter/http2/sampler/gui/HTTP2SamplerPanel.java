@@ -1,5 +1,7 @@
 package com.blazemeter.jmeter.http2.sampler.gui;
 
+import com.blazemeter.jmeter.http2.core.HTTP2ClientProfile;
+import com.blazemeter.jmeter.http2.core.HTTP2ClientProfiles;
 import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.Container;
@@ -50,26 +52,6 @@ public class HTTP2SamplerPanel extends JPanel {
   private static final String PROFILE_COMBO_PROTOTYPE =
       "Browser-compatible (Other Browsers)";
 
-  private static final String PROFILE_BROWSER_LIKE = "browser-like";
-  private static final String PROFILE_BROWSER_LIKE_CUSTOM = "browser-like-custom";
-  private static final String PROFILE_BROWSER_COMPATIBLE = "browser-compatible";
-  private static final String PROFILE_LEGACY = "legacy";
-  private static final long DEFAULT_HTTP3_BROKEN_COOLDOWN_MS = 300000;
-  private static final long DEFAULT_HTTP1_ONLY_COOLDOWN_MS = 300000;
-  private static final long DEFAULT_H2C_CACHE_TTL_MS = 300000;
-  private static final long DEFAULT_HAPPY_EYEBALLS_DELAY_MS = 250;
-  private static final String[] PROFILE_LABELS = new String[] {
-      "Browser-like (Most Browsers)",
-      "Browser-compatible (Other Browsers)",
-      "Legacy / Older Systems",
-      "Browser-like (Custom)"
-  };
-  private static final String[] PROFILE_VALUES = new String[] {
-      PROFILE_BROWSER_LIKE,
-      PROFILE_BROWSER_COMPATIBLE,
-      PROFILE_LEGACY,
-      PROFILE_BROWSER_LIKE_CUSTOM
-  };
   private static final int URL_CONFIG_TABLE_VIEWPORT_MIN_ROWS = 3;
   private static final int URL_CONFIG_TABLE_VIEWPORT_MAX_ROWS = 6;
 
@@ -93,7 +75,7 @@ public class HTTP2SamplerPanel extends JPanel {
   private final JLabeledTextField embeddedResourcesRegexField = new JLabeledTextField(
       JMeterUtils.getResString("web_testing_embedded_url_pattern"), 20);
   private final JCheckBox http1Upgrade = new JCheckBox("H2C Upgrade (HTTP/1.1 Upgrade)");
-  private final JComboBox<String> profileSelector = new JComboBox<>(PROFILE_LABELS);
+  private final JComboBox<ProfileChoice> profileSelector = new JComboBox<>();
   private final JCheckBox enableHttp3Check = new JCheckBox("Enable HTTP/3 (Alt-Svc + QUIC)");
   private final JCheckBox enableHttp2Check = new JCheckBox("Enable HTTP/2");
   private final JCheckBox enableHttp1Check = new JCheckBox("Enable HTTP/1.1");
@@ -192,6 +174,7 @@ public class HTTP2SamplerPanel extends JPanel {
     JPanel behaviorPanel = new VerticalPanel();
     behaviorPanel.setBorder(BorderFactory.createTitledBorder("Client Behavior"));
 
+    reloadProfileChoices(HTTP2ClientProfiles.DEFAULT_PROFILE_ID);
     JPanel profilePanel = new JPanel(new BorderLayout(5, 0));
     profilePanel.add(new JLabel("Profile"), BorderLayout.WEST);
     profilePanel.add(profileSelector, BorderLayout.CENTER);
@@ -228,7 +211,9 @@ public class HTTP2SamplerPanel extends JPanel {
     timingPanel.add(h2cCacheTtlField);
     behaviorPanel.add(timingPanel);
 
-    profileSelector.setPrototypeDisplayValue(PROFILE_COMBO_PROTOTYPE);
+    profileSelector.setPrototypeDisplayValue(
+        new ProfileChoice(HTTP2ClientProfiles.PROFILE_BROWSER_COMPATIBLE,
+            PROFILE_COMBO_PROTOTYPE));
     relaxHorizontalMinimumWidth(profileSelector);
     profileSelector.addActionListener(e -> updateProfileControls());
     enableHttp1Check.addActionListener(e -> handleProtocolToggle(enableHttp1Check));
@@ -451,7 +436,7 @@ public class HTTP2SamplerPanel extends JPanel {
   }
 
   private void updateConditionalVisibility() {
-    boolean customProfile = PROFILE_BROWSER_LIKE_CUSTOM.equals(getProfile());
+    boolean customProfile = HTTP2ClientProfiles.isSamplerCustomProfile(getProfile());
     boolean http1Enabled = enableHttp1Check.isSelected();
     boolean http2Enabled = enableHttp2Check.isSelected();
     boolean http3Enabled = enableHttp3Check.isSelected();
@@ -500,27 +485,16 @@ public class HTTP2SamplerPanel extends JPanel {
   }
 
   private void applyProfileDefaults(String profile) {
-    if (PROFILE_BROWSER_COMPATIBLE.equals(profile)) {
-      setProtocolDefaults(true, true, true, true);
-      setFallbackDefaults(true, true);
-      setCacheDefaults(true, true, true, false);
-      http1Upgrade.setSelected(false);
-      setTimingDefaults(0L, DEFAULT_HTTP3_BROKEN_COOLDOWN_MS, DEFAULT_HTTP1_ONLY_COOLDOWN_MS,
-          DEFAULT_H2C_CACHE_TTL_MS);
-    } else if (PROFILE_LEGACY.equals(profile)) {
-      setProtocolDefaults(false, false, true, false);
-      setFallbackDefaults(false, false);
-      setCacheDefaults(false, false, true, false);
-      http1Upgrade.setSelected(true);
-      setTimingDefaults(0L, 0L, 0L, DEFAULT_H2C_CACHE_TTL_MS);
-    } else {
-      setProtocolDefaults(true, true, true, true);
-      setFallbackDefaults(true, true);
-      setCacheDefaults(true, true, true, false);
-      http1Upgrade.setSelected(false);
-      setTimingDefaults(DEFAULT_HAPPY_EYEBALLS_DELAY_MS, DEFAULT_HTTP3_BROKEN_COOLDOWN_MS,
-          DEFAULT_HTTP1_ONLY_COOLDOWN_MS, DEFAULT_H2C_CACHE_TTL_MS);
-    }
+    HTTP2ClientProfile defaults = HTTP2ClientProfiles.resolve(profile);
+    setProtocolDefaults(defaults.isEnableHttp3(), defaults.isEnableHttp2(),
+        defaults.isEnableHttp1(), defaults.isAlpnEnabled());
+    setFallbackDefaults(defaults.isFallbackEnabled(),
+        defaults.isProtocolErrorFallbackEnabled());
+    setCacheDefaults(defaults.isAltSvcCacheEnabled(), defaults.isHttp1OnlyCacheEnabled(),
+        defaults.isH2cCacheEnabled(), defaults.isHttp2PriorKnowledgeEnabled());
+    http1Upgrade.setSelected(defaults.isH2cUpgradeEnabled());
+    setTimingDefaults(defaults.getHappyEyeballsDelayMs(), defaults.getHttp3BrokenCooldownMs(),
+        defaults.getHttp1OnlyCooldownMs(), defaults.getH2cCacheTtlMs());
   }
 
   private void setProtocolDefaults(boolean http3, boolean http2, boolean http1, boolean alpn) {
@@ -555,7 +529,7 @@ public class HTTP2SamplerPanel extends JPanel {
     urlConfigGui.clear();
     refreshUrlConfigLayoutAfterDataChange();
     http1Upgrade.setSelected(false);
-    setProfile(PROFILE_BROWSER_LIKE);
+    setProfile(HTTP2ClientProfiles.DEFAULT_PROFILE_ID);
     setSelectedTabIndex(0);
     retrieveEmbeddedResourcesCheckBox.setSelected(false);
     concurrentDownloadCheckBox.setSelected(false);
@@ -599,22 +573,15 @@ public class HTTP2SamplerPanel extends JPanel {
   }
 
   public String getProfile() {
-    int index = profileSelector.getSelectedIndex();
-    if (index >= 0 && index < PROFILE_VALUES.length) {
-      return PROFILE_VALUES[index];
+    ProfileChoice selected = (ProfileChoice) profileSelector.getSelectedItem();
+    if (selected != null) {
+      return selected.id;
     }
-    return PROFILE_BROWSER_LIKE;
+    return HTTP2ClientProfiles.DEFAULT_PROFILE_ID;
   }
 
   public void setProfile(String profile) {
-    int index = 0;
-    for (int i = 0; i < PROFILE_VALUES.length; i++) {
-      if (PROFILE_VALUES[i].equals(profile)) {
-        index = i;
-        break;
-      }
-    }
-    profileSelector.setSelectedIndex(index);
+    reloadProfileChoices(HTTP2ClientProfiles.normalizeProfileId(profile));
     updateProfileControls();
   }
 
@@ -855,5 +822,46 @@ public class HTTP2SamplerPanel extends JPanel {
 
   public void setEmbeddedResourcesRegex(String embeddedResourcesRegex) {
     this.embeddedResourcesRegexField.setText(embeddedResourcesRegex);
+  }
+
+  private void reloadProfileChoices(String selectedProfile) {
+    String selected = HTTP2ClientProfiles.normalizeProfileId(selectedProfile);
+    profileSelector.removeAllItems();
+    int selectedIndex = 0;
+    int index = 0;
+    boolean found = false;
+    for (HTTP2ClientProfile profile : HTTP2ClientProfiles.availableProfiles()) {
+      ProfileChoice choice = new ProfileChoice(profile.getId(), profile.getLabel());
+      profileSelector.addItem(choice);
+      if (choice.id.equals(selected)) {
+        selectedIndex = index;
+        found = true;
+      }
+      index++;
+    }
+    if (!found && !HTTP2ClientProfiles.DEFAULT_PROFILE_ID.equals(selected)) {
+      profileSelector.addItem(new ProfileChoice(selected, selected + " (unresolved)"));
+      selectedIndex = profileSelector.getItemCount() - 1;
+    }
+    if (profileSelector.getItemCount() == 0) {
+      profileSelector.addItem(new ProfileChoice(HTTP2ClientProfiles.DEFAULT_PROFILE_ID,
+          "Browser-like (Most Browsers)"));
+    }
+    profileSelector.setSelectedIndex(selectedIndex);
+  }
+
+  private static final class ProfileChoice {
+    private final String id;
+    private final String label;
+
+    private ProfileChoice(String id, String label) {
+      this.id = id;
+      this.label = label;
+    }
+
+    @Override
+    public String toString() {
+      return label;
+    }
   }
 }

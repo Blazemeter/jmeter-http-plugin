@@ -3,6 +3,7 @@ package com.blazemeter.jmeter.http2.sampler;
 import static org.apache.jmeter.util.JMeterUtils.getPropDefault;
 
 import com.blazemeter.jmeter.http2.core.HTTP2ClientProfileConfig;
+import com.blazemeter.jmeter.http2.core.HTTP2ClientProfiles;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
 import com.blazemeter.jmeter.http2.core.HpackFailureDetector;
@@ -184,8 +185,19 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   }
 
   public boolean isHttp1UpgradeEnabled() {
-    return getPropertyAsBoolean(HTTP1_UPGRADE_PROPERTY,
-        BzmHttpPluginProperties.getPropDefault(H2C_UPGRADE_DEFAULT_PROPERTY, false));
+    Boolean samplerValue = getOptionalBoolean(HTTP1_UPGRADE_PROPERTY);
+    if (samplerValue != null) {
+      return samplerValue;
+    }
+    Boolean globalValue = getGlobalHttp1UpgradeDefault();
+    if (globalValue != null) {
+      return globalValue;
+    }
+    String storedProfile = getStoredProfile();
+    String globalProfile = getGlobalProfile();
+    String profile = storedProfile != null ? storedProfile : globalProfile;
+    profile = profile != null ? profile : HTTP2ClientProfiles.DEFAULT_PROFILE_ID;
+    return HTTP2ClientProfiles.resolve(profile).isH2cUpgradeEnabled();
   }
 
   @Override
@@ -199,9 +211,13 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   }
 
   public String getProfile() {
-    JMeterProperty property = getProperty(PROFILE_PROPERTY);
-    if (property == null || property instanceof NullProperty) {
-      boolean http1UpgradeEnabled = isHttp1UpgradeEnabled();
+    String storedProfile = getStoredProfile();
+    if (storedProfile == null) {
+      String globalProfile = getGlobalProfile();
+      if (globalProfile != null) {
+        return globalProfile;
+      }
+      boolean http1UpgradeEnabled = Boolean.TRUE.equals(getGlobalHttp1UpgradeDefault());
       if (http1UpgradeEnabled && !profileInferenceWarningLogged) {
         LOG.warn(
             "Profile not set; inferring 'legacy' because HTTP/1 upgrade is enabled. "
@@ -209,10 +225,35 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
                 + "ambiguity.");
         profileInferenceWarningLogged = true;
       }
-      return http1UpgradeEnabled ? "legacy" : "browser-like";
+      return http1UpgradeEnabled ? HTTP2ClientProfiles.PROFILE_LEGACY
+          : HTTP2ClientProfiles.DEFAULT_PROFILE_ID;
+    }
+    return HTTP2ClientProfiles.normalizeProfileId(storedProfile);
+  }
+
+  private String getStoredProfile() {
+    JMeterProperty property = getProperty(PROFILE_PROPERTY);
+    if (property == null || property instanceof NullProperty) {
+      return null;
     }
     String value = property.getStringValue();
-    return value == null || value.trim().isEmpty() ? "browser-like" : value.trim();
+    return StringUtils.trimToNull(value);
+  }
+
+  private String getGlobalProfile() {
+    String raw = BzmHttpPluginProperties.resolveRaw("httpJettyClient.profile");
+    if (StringUtils.isBlank(raw)) {
+      return null;
+    }
+    return HTTP2ClientProfiles.normalizeProfileId(raw);
+  }
+
+  private Boolean getGlobalHttp1UpgradeDefault() {
+    String raw = BzmHttpPluginProperties.resolveRaw(H2C_UPGRADE_DEFAULT_PROPERTY);
+    if (StringUtils.isBlank(raw)) {
+      return null;
+    }
+    return Boolean.parseBoolean(raw.trim());
   }
 
   public void setUiTabIndex(int index) {
@@ -957,6 +998,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         .http1OnlyCacheEnabled(getHttp1OnlyCacheEnabled())
         .h2cCacheEnabled(getH2cCacheEnabled())
         .http2PriorKnowledgeEnabled(getHttp2PriorKnowledgeEnabled())
+        .h2cUpgradeEnabled(isHttp1UpgradeEnabled())
         .happyEyeballsDelayMs(getHappyEyeballsDelayMs())
         .http3BrokenCooldownMs(getHttp3BrokenCooldownMs())
         .http1OnlyCooldownMs(getHttp1OnlyCooldownMs())

@@ -13,6 +13,7 @@ public class HTTP2ClientProfileConfig {
   private final Boolean http1OnlyCacheEnabled;
   private final Boolean h2cCacheEnabled;
   private final Boolean http2PriorKnowledgeEnabled;
+  private final Boolean h2cUpgradeEnabled;
   private final Long happyEyeballsDelayMs;
   private final Long http3BrokenCooldownMs;
   private final Long http1OnlyCooldownMs;
@@ -30,6 +31,7 @@ public class HTTP2ClientProfileConfig {
     this.http1OnlyCacheEnabled = builder.http1OnlyCacheEnabled;
     this.h2cCacheEnabled = builder.h2cCacheEnabled;
     this.http2PriorKnowledgeEnabled = builder.http2PriorKnowledgeEnabled;
+    this.h2cUpgradeEnabled = builder.h2cUpgradeEnabled;
     this.happyEyeballsDelayMs = builder.happyEyeballsDelayMs;
     this.http3BrokenCooldownMs = builder.http3BrokenCooldownMs;
     this.http1OnlyCooldownMs = builder.http1OnlyCooldownMs;
@@ -84,6 +86,10 @@ public class HTTP2ClientProfileConfig {
     return http2PriorKnowledgeEnabled;
   }
 
+  public Boolean getH2cUpgradeEnabled() {
+    return h2cUpgradeEnabled;
+  }
+
   public Long getHappyEyeballsDelayMs() {
     return happyEyeballsDelayMs;
   }
@@ -112,6 +118,7 @@ public class HTTP2ClientProfileConfig {
     private Boolean http1OnlyCacheEnabled;
     private Boolean h2cCacheEnabled;
     private Boolean http2PriorKnowledgeEnabled;
+    private Boolean h2cUpgradeEnabled;
     private Long happyEyeballsDelayMs;
     private Long http3BrokenCooldownMs;
     private Long http1OnlyCooldownMs;
@@ -169,6 +176,11 @@ public class HTTP2ClientProfileConfig {
 
     public Builder http2PriorKnowledgeEnabled(Boolean http2PriorKnowledgeEnabled) {
       this.http2PriorKnowledgeEnabled = http2PriorKnowledgeEnabled;
+      return this;
+    }
+
+    public Builder h2cUpgradeEnabled(Boolean h2cUpgradeEnabled) {
+      this.h2cUpgradeEnabled = h2cUpgradeEnabled;
       return this;
     }
 

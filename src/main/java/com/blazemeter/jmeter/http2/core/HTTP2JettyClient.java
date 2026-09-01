@@ -214,16 +214,7 @@ public class HTTP2JettyClient {
   private static final String PROP_SKIP_REDUNDANT_MANUAL_DECODE =
       "blazemeter.http.skipManualDecodeWhenAdvertised";
   private static final Path DEBUG_LOG_PATH = resolveDebugLogPath();
-  private static final String PROFILE_PROPERTY = "httpJettyClient.profile";
-  private static final String PROFILE_BROWSER_LIKE = "browser-like";
-  private static final String PROFILE_BROWSER_LIKE_CUSTOM = "browser-like-custom";
-  private static final String PROFILE_BROWSER_COMPATIBLE = "browser-compatible";
-  private static final String PROFILE_LEGACY = "legacy";
   private static final long ALT_SVC_DEFAULT_MAX_AGE_SECONDS = 86400;
-  private static final long DEFAULT_HTTP3_BROKEN_COOLDOWN_MS = 300000;
-  private static final long DEFAULT_HTTP1_ONLY_COOLDOWN_MS = 300000;
-  private static final long DEFAULT_H2C_CACHE_TTL_MS = 300000;
-  private static final long DEFAULT_HAPPY_EYEBALLS_DELAY_MS = 250;
   private static final long H3_RECENT_SUCCESS_WINDOW_MS =
       TimeUnit.MINUTES.toMillis(5);
   private static final Object SHARED_POOL_LOCK = new Object();
@@ -322,10 +313,10 @@ public class HTTP2JettyClient {
   private int http3HandshakeTimeoutMs = 1000;
   private int quicMaxBidirectionalStreams = 100;
   private int quicMaxUnidirectionalStreams = 100;
-  private long http3BrokenCooldownMs = DEFAULT_HTTP3_BROKEN_COOLDOWN_MS;
-  private long http1OnlyCooldownMs = DEFAULT_HTTP1_ONLY_COOLDOWN_MS;
-  private long h2cCacheTtlMs = DEFAULT_H2C_CACHE_TTL_MS;
-  private long happyEyeballsDelayMs = DEFAULT_HAPPY_EYEBALLS_DELAY_MS;
+  private long http3BrokenCooldownMs = HTTP2ClientProfiles.DEFAULT_HTTP3_BROKEN_COOLDOWN_MS;
+  private long http1OnlyCooldownMs = HTTP2ClientProfiles.DEFAULT_HTTP1_ONLY_COOLDOWN_MS;
+  private long h2cCacheTtlMs = HTTP2ClientProfiles.DEFAULT_H2C_CACHE_TTL_MS;
+  private long happyEyeballsDelayMs = HTTP2ClientProfiles.DEFAULT_HAPPY_EYEBALLS_DELAY_MS;
   private boolean http2PriorKnowledgeEnabled = false;
   private boolean http3PriorKnowledgeEnabled = false;
   private boolean enableHttp3 = true;
@@ -339,6 +330,7 @@ public class HTTP2JettyClient {
   private boolean altSvcCacheEnabled = true;
   private boolean http1OnlyCacheEnabled = true;
   private boolean h2cCacheEnabled = true;
+  private boolean h2cUpgradeEnabled = false;
   private boolean heExecutorsRegistered = false;
   /**
    * Fingerprints of Auth Manager rows already pushed into Jetty stores. Avoids relying solely on
@@ -683,7 +675,7 @@ public class HTTP2JettyClient {
     configureTransport(h2cTransport);
     this.httpClientH2cPrior = new HttpClient(h2cTransport);
     configureHttpClient(this.httpClientH2cPrior, h2cConnector);
-    this.http1UpgradeRequired = http1UpgradeRequired;
+    this.http1UpgradeRequired = http1UpgradeRequired || h2cUpgradeEnabled;
     this.httpClient.setName(name);
     if (httpClientNoH3 != httpClient) {
       this.httpClientNoH3.setName(name + "-noh3");
@@ -888,7 +880,7 @@ public class HTTP2JettyClient {
   }
 
   public void loadProperties(HTTP2ClientProfileConfig profileConfig) {
-    ProfileDefaults defaults = resolveProfileDefaults(profileConfig);
+    HTTP2ClientProfile defaults = resolveProfileDefaults(profileConfig);
     requestTimeout = JMeterUtils.getPropDefault("HTTPSampler.response_timeout", 0);
     byteBufferPoolFactor =
         Integer.parseInt(BzmHttpPluginProperties.getPropDefault(
@@ -950,30 +942,30 @@ public class HTTP2JettyClient {
             String.valueOf(quicMaxUnidirectionalStreams)));
     enableHttp3 = getBooleanProp("httpJettyClient.enableHttp3",
         profileConfig != null ? profileConfig.getEnableHttp3() : null,
-        defaults.enableHttp3);
+        defaults.isEnableHttp3());
     enableHttp2 = getBooleanProp("httpJettyClient.enableHttp2",
         profileConfig != null ? profileConfig.getEnableHttp2() : null,
-        defaults.enableHttp2);
+        defaults.isEnableHttp2());
     enableHttp1 = getBooleanProp("httpJettyClient.enableHttp1",
         profileConfig != null ? profileConfig.getEnableHttp1() : null,
-        defaults.enableHttp1);
+        defaults.isEnableHttp1());
     alpnEnabled = getBooleanProp("httpJettyClient.alpnEnabled",
         profileConfig != null ? profileConfig.getAlpnEnabled() : null,
-        defaults.alpnEnabled);
+        defaults.isAlpnEnabled());
     fallbackEnabled = getBooleanProp("httpJettyClient.fallbackEnabled",
         profileConfig != null ? profileConfig.getFallbackEnabled() : null,
-        defaults.fallbackEnabled);
+        defaults.isFallbackEnabled());
     altSvcCacheEnabled =
         getBooleanProp("httpJettyClient.altSvcCacheEnabled",
             profileConfig != null ? profileConfig.getAltSvcCacheEnabled() : null,
-            defaults.altSvcCacheEnabled);
+            defaults.isAltSvcCacheEnabled());
     http1OnlyCacheEnabled =
         getBooleanProp("httpJettyClient.http1OnlyCacheEnabled",
             profileConfig != null ? profileConfig.getHttp1OnlyCacheEnabled() : null,
-            defaults.http1OnlyCacheEnabled);
+            defaults.isHttp1OnlyCacheEnabled());
     h2cCacheEnabled = getBooleanProp("httpJettyClient.h2cCacheEnabled",
         profileConfig != null ? profileConfig.getH2cCacheEnabled() : null,
-        defaults.h2cCacheEnabled);
+        defaults.isH2cCacheEnabled());
     protocolErrorFallbackEnabled = resolveProtocolErrorFallback(defaults, profileConfig);
     goawayRetryEnabled =
         Boolean.parseBoolean(BzmHttpPluginProperties.getPropDefault(
@@ -986,21 +978,24 @@ public class HTTP2JettyClient {
 
     http3BrokenCooldownMs = getLongProp("httpJettyClient.http3BrokenCooldownMs",
         profileConfig != null ? profileConfig.getHttp3BrokenCooldownMs() : null,
-        defaults.http3BrokenCooldownMs);
+        defaults.getHttp3BrokenCooldownMs());
     http1OnlyCooldownMs = getLongProp("httpJettyClient.http1OnlyCooldownMs",
         profileConfig != null ? profileConfig.getHttp1OnlyCooldownMs() : null,
-        defaults.http1OnlyCooldownMs);
+        defaults.getHttp1OnlyCooldownMs());
     h2cCacheTtlMs = getLongProp("httpJettyClient.h2cCacheTtlMs",
         profileConfig != null ? profileConfig.getH2cCacheTtlMs() : null,
-        defaults.h2cCacheTtlMs);
+        defaults.getH2cCacheTtlMs());
     http2PriorKnowledgeEnabled = getBooleanProp("httpJettyClient.http2PriorKnowledge",
         profileConfig != null ? profileConfig.getHttp2PriorKnowledgeEnabled() : null,
-        defaults.http2PriorKnowledgeEnabled);
+        defaults.isHttp2PriorKnowledgeEnabled());
+    h2cUpgradeEnabled = getBooleanProp("httpJettyClient.h2cUpgradeEnabled",
+        profileConfig != null ? profileConfig.getH2cUpgradeEnabled() : null,
+        defaults.isH2cUpgradeEnabled());
     http3PriorKnowledgeEnabled = Boolean.parseBoolean(BzmHttpPluginProperties.getPropDefault(
         "httpJettyClient.http3PriorKnowledge", "false"));
     happyEyeballsDelayMs = getLongProp("httpJettyClient.happyEyeballsDelayMs",
         profileConfig != null ? profileConfig.getHappyEyeballsDelayMs() : null,
-        defaults.happyEyeballsDelayMs);
+        defaults.getHappyEyeballsDelayMs());
     // Default reduced to 4096 (Issue #12071)
     settingsMaxHeaderListSize =
         Integer.parseInt(BzmHttpPluginProperties.getPropDefault(
@@ -1072,7 +1067,7 @@ public class HTTP2JettyClient {
     return defaultValue;
   }
 
-  private boolean resolveProtocolErrorFallback(ProfileDefaults defaults,
+  private boolean resolveProtocolErrorFallback(HTTP2ClientProfile defaults,
                                                HTTP2ClientProfileConfig profileConfig) {
     if (profileConfig != null && profileConfig.getProtocolErrorFallbackEnabled() != null) {
       return profileConfig.getProtocolErrorFallbackEnabled();
@@ -1085,27 +1080,12 @@ public class HTTP2JettyClient {
     if (df != null) {
       return !Boolean.parseBoolean(df);
     }
-    return defaults.protocolErrorFallbackEnabled;
+    return defaults.isProtocolErrorFallbackEnabled();
   }
 
-  private ProfileDefaults resolveProfileDefaults(HTTP2ClientProfileConfig profileConfig) {
+  private HTTP2ClientProfile resolveProfileDefaults(HTTP2ClientProfileConfig profileConfig) {
     String profile = profileConfig != null ? profileConfig.getProfile() : null;
-    if (profile == null || profile.trim().isEmpty()) {
-      String rawProfile =
-          BzmHttpPluginProperties.getPropDefault(PROFILE_PROPERTY, PROFILE_BROWSER_LIKE).trim();
-      profile = rawProfile.isEmpty() ? PROFILE_BROWSER_LIKE : rawProfile;
-    }
-    profile = profile.trim().toLowerCase(Locale.ROOT);
-    switch (profile) {
-      case PROFILE_BROWSER_COMPATIBLE:
-        return ProfileDefaults.browserCompatible();
-      case PROFILE_LEGACY:
-        return ProfileDefaults.legacy();
-      case PROFILE_BROWSER_LIKE_CUSTOM:
-      case PROFILE_BROWSER_LIKE:
-      default:
-        return ProfileDefaults.browserLike();
-    }
+    return HTTP2ClientProfiles.resolve(profile);
   }
 
   private ClientConnectionFactory.Info[] buildMainProtocols(
@@ -1175,64 +1155,6 @@ public class HTTP2JettyClient {
       out.append(protocols[i].getProtocols(true));
     }
     return out.toString();
-  }
-
-  private static class ProfileDefaults {
-    private final boolean enableHttp3;
-    private final boolean enableHttp2;
-    private final boolean enableHttp1;
-    private final boolean alpnEnabled;
-    private final boolean fallbackEnabled;
-    private final boolean protocolErrorFallbackEnabled;
-    private final boolean altSvcCacheEnabled;
-    private final boolean http1OnlyCacheEnabled;
-    private final boolean h2cCacheEnabled;
-    private final boolean http2PriorKnowledgeEnabled;
-    private final long http3BrokenCooldownMs;
-    private final long http1OnlyCooldownMs;
-    private final long h2cCacheTtlMs;
-    private final long happyEyeballsDelayMs;
-
-    private ProfileDefaults(boolean enableHttp3, boolean enableHttp2, boolean enableHttp1,
-                            boolean alpnEnabled, boolean fallbackEnabled,
-                            boolean protocolErrorFallbackEnabled,
-                            boolean altSvcCacheEnabled, boolean http1OnlyCacheEnabled,
-                            boolean h2cCacheEnabled,
-                            boolean http2PriorKnowledgeEnabled, long http3BrokenCooldownMs,
-                            long http1OnlyCooldownMs,
-                            long h2cCacheTtlMs, long happyEyeballsDelayMs) {
-      this.enableHttp3 = enableHttp3;
-      this.enableHttp2 = enableHttp2;
-      this.enableHttp1 = enableHttp1;
-      this.alpnEnabled = alpnEnabled;
-      this.fallbackEnabled = fallbackEnabled;
-      this.protocolErrorFallbackEnabled = protocolErrorFallbackEnabled;
-      this.altSvcCacheEnabled = altSvcCacheEnabled;
-      this.http1OnlyCacheEnabled = http1OnlyCacheEnabled;
-      this.h2cCacheEnabled = h2cCacheEnabled;
-      this.http2PriorKnowledgeEnabled = http2PriorKnowledgeEnabled;
-      this.http3BrokenCooldownMs = http3BrokenCooldownMs;
-      this.http1OnlyCooldownMs = http1OnlyCooldownMs;
-      this.h2cCacheTtlMs = h2cCacheTtlMs;
-      this.happyEyeballsDelayMs = happyEyeballsDelayMs;
-    }
-
-    private static ProfileDefaults browserLike() {
-      return new ProfileDefaults(true, true, true, true, true, true, true, true, true, false,
-          DEFAULT_HTTP3_BROKEN_COOLDOWN_MS, DEFAULT_HTTP1_ONLY_COOLDOWN_MS,
-          DEFAULT_H2C_CACHE_TTL_MS, DEFAULT_HAPPY_EYEBALLS_DELAY_MS);
-    }
-
-    private static ProfileDefaults browserCompatible() {
-      return new ProfileDefaults(true, true, true, true, true, true, true, true, true, false,
-          DEFAULT_HTTP3_BROKEN_COOLDOWN_MS, DEFAULT_HTTP1_ONLY_COOLDOWN_MS,
-          DEFAULT_H2C_CACHE_TTL_MS, 0L);
-    }
-
-    private static ProfileDefaults legacy() {
-      return new ProfileDefaults(false, false, true, false, false, false, false, false, true,
-          false, 0L, 0L, DEFAULT_H2C_CACHE_TTL_MS, 0L);
-    }
   }
 
   public void start() throws Exception {

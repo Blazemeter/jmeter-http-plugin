@@ -6,6 +6,9 @@ import static org.junit.Assert.assertEquals;
 
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Properties;
 import org.apache.jmeter.util.JMeterUtils;
 import org.junit.After;
 import org.junit.BeforeClass;
@@ -25,6 +28,7 @@ public class HTTP2JettyClientProfileTest extends HTTP2TestBase {
   private static final String ALT_SVC_CACHE = "httpJettyClient.altSvcCacheEnabled";
   private static final String HTTP1_ONLY_CACHE = "httpJettyClient.http1OnlyCacheEnabled";
   private static final String H2C_CACHE = "httpJettyClient.h2cCacheEnabled";
+  private static final String PROFILE_PREFIX = "blazemeter.http.profiles.";
 
   @BeforeClass
   public static void setupClass() {
@@ -44,6 +48,7 @@ public class HTTP2JettyClientProfileTest extends HTTP2TestBase {
     remove(ALT_SVC_CACHE);
     remove(HTTP1_ONLY_CACHE);
     remove(H2C_CACHE);
+    removeCustomProfiles();
   }
 
   @Test
@@ -80,6 +85,19 @@ public class HTTP2JettyClientProfileTest extends HTTP2TestBase {
 
     assertFalse(getBooleanField(client, "enableHttp3"));
     assertEquals(0L, getLongField(client, "happyEyeballsDelayMs"));
+  }
+
+  @Test
+  public void shouldApplyUserDefinedProfileDefaults() throws Exception {
+    set("blazemeter.http.profiles.mobile-h3.extends", "browser-like");
+    set("blazemeter.http.profiles.mobile-h3.enableHttp3", "false");
+    set("blazemeter.http.profiles.mobile-h3.happyEyeballsDelayMs", "500");
+    set(PROFILE_PROPERTY, "mobile-h3");
+    HTTP2JettyClient client = new HTTP2JettyClient(false, "test");
+
+    assertFalse(getBooleanField(client, "enableHttp3"));
+    assertTrue(getBooleanField(client, "enableHttp2"));
+    assertEquals(500L, getLongField(client, "happyEyeballsDelayMs"));
   }
 
   @Test
@@ -144,6 +162,16 @@ public class HTTP2JettyClientProfileTest extends HTTP2TestBase {
 
   private static void remove(String key) {
     JMeterUtils.getJMeterProperties().remove(key);
+  }
+
+  private static void removeCustomProfiles() {
+    Properties properties = JMeterUtils.getJMeterProperties();
+    List<Object> keys = new ArrayList<>(properties.keySet());
+    for (Object key : keys) {
+      if (String.valueOf(key).startsWith(PROFILE_PREFIX)) {
+        properties.remove(key);
+      }
+    }
   }
 
   private static boolean getBooleanField(Object target, String fieldName) throws Exception {
