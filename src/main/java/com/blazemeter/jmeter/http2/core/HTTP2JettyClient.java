@@ -82,10 +82,12 @@ import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.util.JMeterUtils;
 import org.brotli.dec.BrotliInputStream;
 import org.eclipse.jetty.client.AbstractAuthentication;
+import org.eclipse.jetty.client.AbstractConnectionPool;
 import org.eclipse.jetty.client.Authentication;
 import org.eclipse.jetty.client.AuthenticationStore;
 import org.eclipse.jetty.client.BasicAuthentication;
 import org.eclipse.jetty.client.BytesRequestContent;
+import org.eclipse.jetty.client.ConnectionPool;
 import org.eclipse.jetty.client.ContentDecoder;
 import org.eclipse.jetty.client.ContentResponse;
 import org.eclipse.jetty.client.Destination;
@@ -815,15 +817,58 @@ public class HTTP2JettyClient {
     return null;
   }
 
-  public void clearBufferPool() {
-    if (bufferPool != null) {
-      bufferPool.clear();
+  /**
+   * Drops every destination that has no in-flight exchange, which closes its pooled connections so
+   * the next iteration opens a new one. This mirrors what JMeter's own HttpClient4 sampler does on
+   * a new-user iteration ({@code HTTPHC4Impl#resetStateIfNeeded} closes idle and expired
+   * connections), and matches the Thread Group documentation for "Same user on each iteration":
+   * when it is unchecked, a new connection is opened between iterations. Destinations with active
+   * connections are left alone, since JMeter also never closes in-flight ones.
+   */
+  public void closeIdleConnections() {
+    forEachHttpClient(client -> {
+      if (client == null) {
+        return;
+      }
+      for (Destination destination : client.getDestinations()) {
+        if (!hasActiveConnections(destination)) {
+          client.removeDestination(destination);
+        }
+      }
+    });
+  }
+
+  private static boolean hasActiveConnections(Destination destination) {
+    ConnectionPool connectionPool = destination.getConnectionPool();
+    if (connectionPool == null) {
+      return false;
     }
+    if (connectionPool instanceof AbstractConnectionPool) {
+      return ((AbstractConnectionPool) connectionPool).getActiveConnectionCount() > 0;
+    }
+    // Unknown pool implementation: only drop the destination when it holds no connection at all.
+    return !connectionPool.isEmpty();
   }
 
   /**
    * Caps how much pooled buffer memory Jetty may retain. Without a cap, {@code ArrayByteBufferPool}
    * keeps the high-water mark for the JVM lifetime of the client under continuous load.
+   *
+   * <p>Never call {@code clear()} on the returned pool while this client is alive. {@code
+   * maxBucketSize} is unbounded, so Jetty gives each bucket a {@code CompoundPool} whose secondary
+   * is a {@code QueuedPool} (a plain {@code ConcurrentPool} is only used up to
+   * {@code ConcurrentPool.OPTIMAL_MAX_SIZE}). {@code ArrayByteBufferPool.clear()} removes entries
+   * with {@code stream().forEach(Pool.Entry::remove)}, and {@code QueuedPool.QueuedEntry.remove()}
+   * nulls the pooled buffer but leaves the entry in its queue - so the next {@code acquire()} polls
+   * a terminated entry and NPEs inside Jetty. Reported upstream as jetty/jetty.project#15807, which
+   * is the third call site to hit that same {@code QueuedPool} behaviour (jetty#11098 and
+   * jetty#12790 were the first two, both fixed at the caller). See the regression test
+   * {@code BufferPoolIterationResetRegressionTest}.
+   *
+   * <p>The other paths that remove pool entries are safe in this Jetty version, so dropping the
+   * {@code clear()} calls is enough: {@code RetainedBucket.evict()} (which the memory caps above do
+   * trigger) dequeues the entry before removing it and never reads {@code getPooled()}, and
+   * {@code removeAndRelease()} no longer exists in 12.1.x.
    */
   private ByteBufferPool createByteBufferPool() {
     long maxHeap = Long.parseLong(BzmHttpPluginProperties.getPropDefault(
@@ -1635,7 +1680,9 @@ public class HTTP2JettyClient {
       firstFailure = stopClient(httpClientH2cPrior, firstFailure);
       firstFailure = stopClient(httpClientH2cUpgrade, firstFailure);
       stopCompressionResources();
-      clearBufferPool();
+      // The buffer pool is dropped with this client, so there is nothing to reclaim by clearing it
+      // - and clearing it would poison it for any I/O thread still finishing its shutdown. See
+      // createByteBufferPool().
       if (heExecutorsRegistered) {
         int remaining = HAPPY_EYEBALLS_CLIENTS.decrementAndGet();
         if (remaining <= 0) {
