@@ -3102,7 +3102,17 @@ public class HTTP2JettyClient {
     if (entry == null) {
       return;
     }
-    ALT_SVC_CACHE.put(origin, entry);
+    // A refresh renews what the origin advertises, not what this client learned by using it. An
+    // origin that sends Alt-Svc on every HTTP/2 response would otherwise end its HTTP/3 broken
+    // cooldown after one request, and forget a recent HTTP/3 success that sets the race delay.
+    // compute() keeps a markHttp3Broken landing between the read and the write from being lost.
+    ALT_SVC_CACHE.compute(origin, (key, previous) -> {
+      if (previous != null) {
+        entry.brokenUntil = previous.brokenUntil;
+        entry.lastH3SuccessAt = previous.lastH3SuccessAt;
+      }
+      return entry;
+    });
     HTTP3_EXPLORE_IN_FLIGHT.remove(origin);
     if (ALT_SVC_CACHE.size() > PROTOCOL_CACHE_SOFT_MAX) {
       pruneExpiredProtocolCaches();
