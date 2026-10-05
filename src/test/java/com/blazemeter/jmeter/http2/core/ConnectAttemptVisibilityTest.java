@@ -6,8 +6,11 @@ import static org.junit.Assume.assumeTrue;
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import java.io.IOException;
+import java.net.ConnectException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
@@ -137,7 +140,17 @@ public class ConnectAttemptVisibilityTest extends HTTP2TestBase {
 
   @Test
   public void keepsTheReportedFailureItselfUnchanged() throws Exception {
-    sampler = samplerAgainst(closedPort());
+    int closedPort = closedPort();
+    // The sample reports the failure of the last address Jetty tries, and HttpHostConnectException
+    // is what JMeter reports only when that failure is a refusal. Some CI hosts break that premise:
+    // GitHub-hosted Ubuntu runners map localhost to ::1 in /etc/hosts, but since October 2026
+    // (first seen on image ubuntu24/20260927.320) the JVM there cannot open IPv6 connections, so
+    // the last attempt fails with "SocketException: Address family not supported by protocol"
+    // instead of being refused. There JMeter itself would not report HttpHostConnectException
+    // either, so the test is skipped rather than failed; the other tests in this class still run.
+    assumeTrue("the last address of localhost does not refuse the connection here",
+        lastLocalhostAddressRefuses(closedPort));
+    sampler = samplerAgainst(closedPort);
 
     SampleResult result = sampler.sample();
 
@@ -179,6 +192,25 @@ public class ConnectAttemptVisibilityTest extends HTTP2TestBase {
   private void overrideProperty(String key, String value) {
     savedProperties.add(new String[] {key, JMeterUtils.getProperty(key)});
     JMeterUtils.setProperty(key, value);
+  }
+
+  /**
+   * Connects to {@code port} on the last address {@code localhost} resolves to, the one whose
+   * failure Jetty propagates, and says whether it is refused. Uses {@link SocketChannel} because
+   * that is how Jetty connects, so a host that cannot open IPv6 connections fails this probe the
+   * same way it fails the sample.
+   */
+  private static boolean lastLocalhostAddressRefuses(int port) throws IOException {
+    InetAddress[] addresses = InetAddress.getAllByName("localhost");
+    InetAddress last = addresses[addresses.length - 1];
+    try (SocketChannel channel = SocketChannel.open()) {
+      channel.connect(new InetSocketAddress(last, port));
+      return false;
+    } catch (ConnectException e) {
+      return true;
+    } catch (IOException e) {
+      return false;
+    }
   }
 
   /** A port nothing is listening on: bound to learn it is free, then released. */
