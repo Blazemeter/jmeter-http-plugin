@@ -28,6 +28,41 @@ jobs:
           java-version: "17"
           cache: maven
 
+      # TEMPORARY: isolates why Jetty's connect to ::1 fails with EAFNOSUPPORT on the runner while a
+      # plain blocking SocketChannel gets "Connection refused". Remove once the cause is known.
+      - name: Diagnose IPv6 connect (temporary)
+        run: |
+          grep -n localhost /etc/hosts
+          sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.lo.disable_ipv6 || true
+          cat /proc/cmdline
+          if command -v bpftool >/dev/null; then sudo bpftool cgroup tree | head -40; else echo "bpftool not available"; fi
+          cat > /tmp/JettyConnectProbe.java <<'EOF'
+          import java.net.*;
+          import java.nio.channels.*;
+          import java.util.concurrent.*;
+          public class JettyConnectProbe {
+            public static void main(String[] args) throws Exception {
+              int closed; try (ServerSocket s = new ServerSocket(0)) { closed = s.getLocalPort(); }
+              InetSocketAddress v6 = new InetSocketAddress(InetAddress.getByName("::1"), closed);
+              for (boolean opts : new boolean[] {false, true}) for (boolean blocking : new boolean[] {true, false}) for (boolean pool : new boolean[] {false, true}) {
+                Callable<String> attempt = () -> {
+                  try (SocketChannel c = SocketChannel.open()) {
+                    if (opts) { c.setOption(StandardSocketOptions.TCP_NODELAY, true); c.setOption(StandardSocketOptions.SO_REUSEADDR, true);
+                      try { c.setOption(StandardSocketOptions.SO_REUSEPORT, false); } catch (UnsupportedOperationException ignored) { } }
+                    c.configureBlocking(blocking);
+                    if (!c.connect(v6) && !blocking) { try (Selector sel = Selector.open()) { c.register(sel, SelectionKey.OP_CONNECT); sel.select(2000); c.finishConnect(); } }
+                    return "connected?!";
+                  } catch (Exception e) { return e.toString(); }
+                };
+                String r = pool ? Executors.newSingleThreadExecutor().submit(attempt).get() : attempt.call();
+                System.out.println("options=" + opts + " blocking=" + blocking + " thread=" + (pool ? "pool" : "main") + " -> " + r);
+              }
+              System.exit(0);
+            }
+          }
+          EOF
+          java /tmp/JettyConnectProbe.java
+
       - name: Build and test (JMeter ${{ matrix.jmeter_version }})
         run: >-
           xvfb-run -a mvn -U --batch-mode
