@@ -12,6 +12,7 @@ import java.net.URI;
 import java.net.URL;
 import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.eclipse.jetty.client.ContentResponse;
@@ -103,7 +104,8 @@ public class HTTP2JettyClientH2cFallbackTest extends HTTP2TestBase {
 
       assertThat(result.isSuccessful()).isTrue();
       assertThat(result.getResponseCode()).isEqualTo("200");
-      assertThat(requests.get()).as("requests that reached the server").isEqualTo(1);
+      assertThat(awaitRequestCount(requests, 1)).as("requests that reached the server")
+          .isEqualTo(1);
     } finally {
       client.stop();
     }
@@ -121,7 +123,8 @@ public class HTTP2JettyClientH2cFallbackTest extends HTTP2TestBase {
       sampleGet(client, port);
       sampleGet(client, port);
 
-      assertThat(requests.get()).as("requests that reached the server for three samplers")
+      assertThat(awaitRequestCount(requests, 3))
+          .as("requests that reached the server for three samplers")
           .isEqualTo(3);
     } finally {
       client.stop();
@@ -224,6 +227,21 @@ public class HTTP2JettyClientH2cFallbackTest extends HTTP2TestBase {
     }
     server.start();
     return ((ServerConnector) server.getConnectors()[0]).getLocalPort();
+  }
+
+  /**
+   * Jetty calls the request log after the response has been sent, so the client can hold the last
+   * response before the server has counted it. The count only grows, so waiting for it to reach
+   * {@code expected} before comparing hides no extra request a read right after the samples would
+   * have caught.
+   */
+  private static int awaitRequestCount(AtomicInteger requestCounter, int expected)
+      throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (requestCounter.get() < expected && System.nanoTime() < deadline) {
+      Thread.sleep(10);
+    }
+    return requestCounter.get();
   }
 
   private static HTTPSampleResult sampleGet(HTTP2JettyClient client, int port) throws Exception {

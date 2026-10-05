@@ -82,12 +82,15 @@ import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.util.JMeterUtils;
 import org.brotli.dec.BrotliInputStream;
 import org.eclipse.jetty.client.AbstractAuthentication;
+import org.eclipse.jetty.client.AbstractConnectionPool;
 import org.eclipse.jetty.client.Authentication;
 import org.eclipse.jetty.client.AuthenticationStore;
 import org.eclipse.jetty.client.BasicAuthentication;
 import org.eclipse.jetty.client.BytesRequestContent;
+import org.eclipse.jetty.client.ConnectionPool;
 import org.eclipse.jetty.client.ContentDecoder;
 import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.CustomConnectionPoolAccessor;
 import org.eclipse.jetty.client.Destination;
 import org.eclipse.jetty.client.DigestAuthentication;
 import org.eclipse.jetty.client.FormRequestContent;
@@ -105,6 +108,7 @@ import org.eclipse.jetty.client.RetryableRequestException;
 import org.eclipse.jetty.client.StringRequestContent;
 import org.eclipse.jetty.client.transport.HttpClientConnectionFactory;
 import org.eclipse.jetty.client.transport.HttpClientTransportDynamic;
+import org.eclipse.jetty.client.transport.HttpDestination;
 import org.eclipse.jetty.compression.brotli.BrotliCompression;
 import org.eclipse.jetty.compression.client.CompressionContentDecoderFactory;
 import org.eclipse.jetty.compression.gzip.GzipCompression;
@@ -815,15 +819,70 @@ public class HTTP2JettyClient {
     return null;
   }
 
-  public void clearBufferPool() {
-    if (bufferPool != null) {
-      bufferPool.clear();
+  /**
+   * Closes every pooled connection that carries no exchange, so the next iteration opens a new one.
+   * This mirrors what JMeter's own HttpClient4 sampler does on a new-user iteration ({@code
+   * HTTPHC4Impl#closeCurrentConnections} closes expired connections and anything idle for 1
+   * microsecond, connection by connection), and matches the Thread Group documentation for "Same
+   * user on each iteration": when it is unchecked, a new connection is opened between iterations.
+   *
+   * <p>The decision is per connection, not per destination: an in-use connection stays open until
+   * its exchange completes, and does not keep its idle siblings on the same origin alive. The
+   * destination itself is never removed, because {@code HttpClient.removeDestination} stops a
+   * managed destination and that aborts every exchange still in flight on it.
+   *
+   * <p>Each connection is taken out of its pool before it is closed. That is the order an HTTP/1.1
+   * connection's own {@code close()} follows, but an HTTP/2 connection only leaves the pool once
+   * its GOAWAY is written, and the next sample must not pick it up in between.
+   */
+  public void closeIdleConnections() {
+    forEachHttpClient(client -> {
+      if (client == null) {
+        return;
+      }
+      for (Destination destination : client.getDestinations()) {
+        closeIdleConnections(destination);
+      }
+    });
+  }
+
+  private static void closeIdleConnections(Destination destination) {
+    ConnectionPool connectionPool = destination.getConnectionPool();
+    // Every pool this client builds is an AbstractConnectionPool (Jetty's duplex default, or the
+    // multiplex pool from the transport factory). An unknown one cannot tell idle from in use.
+    if (!(connectionPool instanceof AbstractConnectionPool)
+        || !(destination instanceof HttpDestination)) {
+      return;
+    }
+    HttpDestination httpDestination = (HttpDestination) destination;
+    AbstractConnectionPool pool = (AbstractConnectionPool) connectionPool;
+    for (org.eclipse.jetty.client.Connection connection
+        : CustomConnectionPoolAccessor.getIdleConnections(pool)) {
+      if (httpDestination.remove(connection)) {
+        connection.close();
+      }
     }
   }
 
   /**
    * Caps how much pooled buffer memory Jetty may retain. Without a cap, {@code ArrayByteBufferPool}
    * keeps the high-water mark for the JVM lifetime of the client under continuous load.
+   *
+   * <p>Never call {@code clear()} on the returned pool while this client is alive. {@code
+   * maxBucketSize} is unbounded, so Jetty gives each bucket a {@code CompoundPool} whose secondary
+   * is a {@code QueuedPool} (a plain {@code ConcurrentPool} is only used up to
+   * {@code ConcurrentPool.OPTIMAL_MAX_SIZE}). {@code ArrayByteBufferPool.clear()} removes entries
+   * with {@code stream().forEach(Pool.Entry::remove)}, and {@code QueuedPool.QueuedEntry.remove()}
+   * nulls the pooled buffer but leaves the entry in its queue - so the next {@code acquire()} polls
+   * a terminated entry and NPEs inside Jetty. Reported upstream as jetty/jetty.project#15807, which
+   * is the third call site to hit that same {@code QueuedPool} behaviour (jetty#11098 and
+   * jetty#12790 were the first two, both fixed at the caller). See the regression test
+   * {@code BufferPoolIterationResetRegressionTest}.
+   *
+   * <p>The other paths that remove pool entries are safe in this Jetty version, so dropping the
+   * {@code clear()} calls is enough: {@code RetainedBucket.evict()} (which the memory caps above do
+   * trigger) dequeues the entry before removing it and never reads {@code getPooled()}, and
+   * {@code removeAndRelease()} no longer exists in 12.1.x.
    */
   private ByteBufferPool createByteBufferPool() {
     long maxHeap = Long.parseLong(BzmHttpPluginProperties.getPropDefault(
@@ -1635,7 +1694,9 @@ public class HTTP2JettyClient {
       firstFailure = stopClient(httpClientH2cPrior, firstFailure);
       firstFailure = stopClient(httpClientH2cUpgrade, firstFailure);
       stopCompressionResources();
-      clearBufferPool();
+      // The buffer pool is dropped with this client, so there is nothing to reclaim by clearing it
+      // - and clearing it would poison it for any I/O thread still finishing its shutdown. See
+      // createByteBufferPool().
       if (heExecutorsRegistered) {
         int remaining = HAPPY_EYEBALLS_CLIENTS.decrementAndGet();
         if (remaining <= 0) {
@@ -3041,7 +3102,17 @@ public class HTTP2JettyClient {
     if (entry == null) {
       return;
     }
-    ALT_SVC_CACHE.put(origin, entry);
+    // A refresh renews what the origin advertises, not what this client learned by using it. An
+    // origin that sends Alt-Svc on every HTTP/2 response would otherwise end its HTTP/3 broken
+    // cooldown after one request, and forget a recent HTTP/3 success that sets the race delay.
+    // compute() keeps a markHttp3Broken landing between the read and the write from being lost.
+    ALT_SVC_CACHE.compute(origin, (key, previous) -> {
+      if (previous != null) {
+        entry.brokenUntil = previous.brokenUntil;
+        entry.lastH3SuccessAt = previous.lastH3SuccessAt;
+      }
+      return entry;
+    });
     HTTP3_EXPLORE_IN_FLIGHT.remove(origin);
     if (ALT_SVC_CACHE.size() > PROTOCOL_CACHE_SOFT_MAX) {
       pruneExpiredProtocolCaches();
