@@ -90,6 +90,7 @@ import org.eclipse.jetty.client.BytesRequestContent;
 import org.eclipse.jetty.client.ConnectionPool;
 import org.eclipse.jetty.client.ContentDecoder;
 import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.CustomConnectionPoolAccessor;
 import org.eclipse.jetty.client.Destination;
 import org.eclipse.jetty.client.DigestAuthentication;
 import org.eclipse.jetty.client.FormRequestContent;
@@ -107,6 +108,7 @@ import org.eclipse.jetty.client.RetryableRequestException;
 import org.eclipse.jetty.client.StringRequestContent;
 import org.eclipse.jetty.client.transport.HttpClientConnectionFactory;
 import org.eclipse.jetty.client.transport.HttpClientTransportDynamic;
+import org.eclipse.jetty.client.transport.HttpDestination;
 import org.eclipse.jetty.compression.brotli.BrotliCompression;
 import org.eclipse.jetty.compression.client.CompressionContentDecoderFactory;
 import org.eclipse.jetty.compression.gzip.GzipCompression;
@@ -818,12 +820,20 @@ public class HTTP2JettyClient {
   }
 
   /**
-   * Drops every destination that has no in-flight exchange, which closes its pooled connections so
-   * the next iteration opens a new one. This mirrors what JMeter's own HttpClient4 sampler does on
-   * a new-user iteration ({@code HTTPHC4Impl#resetStateIfNeeded} closes idle and expired
-   * connections), and matches the Thread Group documentation for "Same user on each iteration":
-   * when it is unchecked, a new connection is opened between iterations. Destinations with active
-   * connections are left alone, since JMeter also never closes in-flight ones.
+   * Closes every pooled connection that carries no exchange, so the next iteration opens a new one.
+   * This mirrors what JMeter's own HttpClient4 sampler does on a new-user iteration ({@code
+   * HTTPHC4Impl#closeCurrentConnections} closes expired connections and anything idle for 1
+   * microsecond, connection by connection), and matches the Thread Group documentation for "Same
+   * user on each iteration": when it is unchecked, a new connection is opened between iterations.
+   *
+   * <p>The decision is per connection, not per destination: an in-use connection stays open until
+   * its exchange completes, and does not keep its idle siblings on the same origin alive. The
+   * destination itself is never removed, because {@code HttpClient.removeDestination} stops a
+   * managed destination and that aborts every exchange still in flight on it.
+   *
+   * <p>Each connection is taken out of its pool before it is closed. That is the order an HTTP/1.1
+   * connection's own {@code close()} follows, but an HTTP/2 connection only leaves the pool once
+   * its GOAWAY is written, and the next sample must not pick it up in between.
    */
   public void closeIdleConnections() {
     forEachHttpClient(client -> {
@@ -831,23 +841,27 @@ public class HTTP2JettyClient {
         return;
       }
       for (Destination destination : client.getDestinations()) {
-        if (!hasActiveConnections(destination)) {
-          client.removeDestination(destination);
-        }
+        closeIdleConnections(destination);
       }
     });
   }
 
-  private static boolean hasActiveConnections(Destination destination) {
+  private static void closeIdleConnections(Destination destination) {
     ConnectionPool connectionPool = destination.getConnectionPool();
-    if (connectionPool == null) {
-      return false;
+    // Every pool this client builds is an AbstractConnectionPool (Jetty's duplex default, or the
+    // multiplex pool from the transport factory). An unknown one cannot tell idle from in use.
+    if (!(connectionPool instanceof AbstractConnectionPool)
+        || !(destination instanceof HttpDestination)) {
+      return;
     }
-    if (connectionPool instanceof AbstractConnectionPool) {
-      return ((AbstractConnectionPool) connectionPool).getActiveConnectionCount() > 0;
+    HttpDestination httpDestination = (HttpDestination) destination;
+    AbstractConnectionPool pool = (AbstractConnectionPool) connectionPool;
+    for (org.eclipse.jetty.client.Connection connection
+        : CustomConnectionPoolAccessor.getIdleConnections(pool)) {
+      if (httpDestination.remove(connection)) {
+        connection.close();
+      }
     }
-    // Unknown pool implementation: only drop the destination when it holds no connection at all.
-    return !connectionPool.isEmpty();
   }
 
   /**

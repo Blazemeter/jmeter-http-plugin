@@ -1,7 +1,6 @@
 package com.blazemeter.jmeter.http2.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
@@ -22,30 +21,18 @@ import org.junit.Test;
  * nulls the pooled buffer but leaves the entry in its queue, and the next {@code acquire()} polls
  * that dead entry. Buffers are reset on release and carry no user state, so the reset has no reason
  * to touch the pool at all.
+ *
+ * <p>The regression itself has to go through the sampler's real reset path, {@code
+ * HTTP2Sampler#iterationStart}, so it lives in {@link
+ * NewUserIterationConnectionResetTest#newUserIterationLeavesTheBufferPoolUsable()}, which reuses
+ * {@link #primeSecondaryPool(ByteBufferPool)}. This class pins the Jetty behaviour behind it.
  */
 public class BufferPoolIterationResetRegressionTest extends HTTP2TestBase {
 
   /** Network-buffer sized, and below the pool's 65536 max capacity so it is really pooled. */
-  private static final int POOLED_BUFFER_SIZE = 16 * 1024;
+  static final int POOLED_BUFFER_SIZE = 16 * 1024;
   /** Above {@code ConcurrentPool.OPTIMAL_MAX_SIZE}, so the secondary QueuedPool holds entries. */
   private static final int BUFFERS_BEYOND_PRIMARY_POOL = ConcurrentPool.OPTIMAL_MAX_SIZE + 44;
-
-  @Test
-  public void newUserIterationResetKeepsTheBufferPoolUsable() throws Exception {
-    HTTP2JettyClient client = new HTTP2JettyClient(false, "buffer-pool-iteration-reset");
-    try {
-      ByteBufferPool bufferPool = client.getBufferPool();
-      primeSecondaryPool(bufferPool);
-
-      client.closeIdleConnections();
-
-      assertThatCode(() -> bufferPool.acquire(POOLED_BUFFER_SIZE, false).release())
-          .as("the new-user iteration reset must leave the buffer pool serving buffers")
-          .doesNotThrowAnyException();
-    } finally {
-      client.stop();
-    }
-  }
 
   /**
    * Pins the Jetty behaviour the reset has to stay away from. When this test starts failing, Jetty
@@ -71,7 +58,7 @@ public class BufferPoolIterationResetRegressionTest extends HTTP2TestBase {
   }
 
   /** Fills the bucket past the primary ConcurrentPool so its secondary QueuedPool is populated. */
-  private void primeSecondaryPool(ByteBufferPool bufferPool) {
+  static void primeSecondaryPool(ByteBufferPool bufferPool) {
     List<RetainableByteBuffer> buffers = new ArrayList<>(BUFFERS_BEYOND_PRIMARY_POOL);
     for (int i = 0; i < BUFFERS_BEYOND_PRIMARY_POOL; i++) {
       buffers.add(bufferPool.acquire(POOLED_BUFFER_SIZE, false));
