@@ -1,7 +1,9 @@
 package com.blazemeter.jmeter.http2.core;
 
+import java.io.IOException;
 import java.net.ConnectException;
 import java.net.InetAddress;
+import java.net.SocketException;
 import java.net.URL;
 import java.net.UnknownHostException;
 import java.util.Locale;
@@ -61,9 +63,12 @@ public final class JmeterHttpClientExceptionMapper {
     if (root instanceof HttpHostConnectException) {
       return root;
     }
-    if (root instanceof ConnectException) {
+    if (root instanceof ConnectException
+        || isJettyConnectSocketException(root)) {
       HttpHost host = toHttpHost(url);
-      ConnectException cause = normalizeConnectCause((ConnectException) root);
+      IOException cause = root instanceof ConnectException
+          ? normalizeConnectCause((ConnectException) root)
+          : (SocketException) root;
       if (host != null) {
         try {
           return new HttpHostConnectException(cause, host,
@@ -72,9 +77,18 @@ public final class JmeterHttpClientExceptionMapper {
           // Fall back to host-only message formatting.
         }
       }
+      if (cause instanceof ConnectException) {
+        return new HttpHostConnectException((ConnectException) cause, host);
+      }
       return new HttpHostConnectException(cause, host);
     }
     return null;
+  }
+
+  private static boolean isJettyConnectSocketException(final Throwable failure) {
+    String message = failure.getMessage();
+    return failure instanceof SocketException && message != null
+        && message.startsWith("Could not connect to ");
   }
 
   private static ConnectException normalizeConnectCause(ConnectException root) {
