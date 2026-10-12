@@ -67,7 +67,11 @@ public class HTTP2JettyClientSourceAddressTest extends HTTP2TestBase {
     if (server != null && server.isStarted()) {
       server.stop();
     }
-    for (String[] saved : savedProperties) {
+    // Newest first: a key overridden twice in one test must end at the value it had before the
+    // test, not at the first override. Restoring in insertion order left httpclient.localaddress
+    // set to 127.0.0.1 for every later test in the JVM, binding their sockets to IPv4.
+    for (int i = savedProperties.size() - 1; i >= 0; i--) {
+      String[] saved = savedProperties.get(i);
       if (saved[1] == null) {
         JMeterUtils.getJMeterProperties().remove(saved[0]);
       } else {
