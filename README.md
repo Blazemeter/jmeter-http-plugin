@@ -405,6 +405,8 @@ The diagnostic switches are **not** in this table: `blazemeter.http.lowLevelLog`
 | **blazemeter.http.maxRequestsQueuedPerDestination** | Maximum number of requests that may be queued to a destination | 32767 |
 | **blazemeter.http.maxConnectionsPerDestination** | Sets the maximum number of connections to open to each destination | 100 |
 | **blazemeter.http.byteBufferPoolFactor** | Factor applied when allocating buffers for the HTTP client | 4 |
+| **blazemeter.http.byteBufferPoolMaxHeapMemory** | Max heap memory, in bytes, the HTTP client's buffer pool may retain. `-1` means unlimited, and `0` selects Jetty's own heuristic of max heap / 8 | 67108864 |
+| **blazemeter.http.byteBufferPoolMaxDirectMemory** | Max direct memory, in bytes, the HTTP client's buffer pool may retain. `-1` means unlimited, and `0` selects Jetty's own heuristic of max heap / 8 | 67108864 |
 | **blazemeter.http.strictEventOrdering** | Force request events ordering | false |
 | **blazemeter.http.sharedThreadPool** | Use a shared thread pool across HTTP clients | false |
 | **blazemeter.http.idleTimeout** | Max time, in milliseconds, a connection can be idle | 60000 |

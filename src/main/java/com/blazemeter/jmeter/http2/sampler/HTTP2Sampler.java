@@ -123,6 +123,13 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   private static final String USER_AGENT = "User-Agent"; // $NON-NLS-1$
   private static final boolean USE_JAVA_REGEX = !getPropDefault(
       "jmeter.regex.engine", "oro").equalsIgnoreCase("oro");
+  /**
+   * Same property, name and default as JMeter's own HttpClient4 sampler: when the Thread Group
+   * simulates a new visitor on each iteration, the connections are closed so the next iteration
+   * opens a new one. Read once, as the core sampler does.
+   */
+  private static final boolean RESET_STATE_ON_THREAD_GROUP_ITERATION =
+      getPropDefault("httpclient.reset_state_on_thread_group_iteration", true);
 
   private final transient Callable<HTTP2JettyClient> clientFactory;
   private final boolean dumpAtThreadEnd =
@@ -1867,6 +1874,13 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     closeConnections();
   }
 
+  /**
+   * New-user iteration reset, matching what JMeter itself drops when "Same user on each iteration"
+   * is unchecked: cookies and cache (JMeter's own managers), the authentication state, and the
+   * connections, so the next iteration opens a new one. Jetty's byte buffer pool is deliberately
+   * left alone: buffers are reset on release so they carry no user state, and clearing a live pool
+   * corrupts it - see {@link HTTP2JettyClient#closeIdleConnections()}.
+   */
   private void clearUserStores() {
     Map<HTTP2ClientKey, HTTP2JettyClient> clients = CONNECTIONS.get();
     for (HTTP2JettyClient client : clients.values()) {
@@ -1874,7 +1888,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         client.clearCookies();
         client.clearAuthenticationResults();
         client.clearAuthentications();
-        client.clearBufferPool();
+        if (RESET_STATE_ON_THREAD_GROUP_ITERATION) {
+          client.closeIdleConnections();
+        }
       } catch (Exception e) {
         LOG.error("Error while cleaning user store", e);
       }
