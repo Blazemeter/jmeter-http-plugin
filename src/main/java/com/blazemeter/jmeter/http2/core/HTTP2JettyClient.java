@@ -137,6 +137,7 @@ import org.eclipse.jetty.io.ByteBufferPool;
 import org.eclipse.jetty.io.ClientConnectionFactory;
 import org.eclipse.jetty.io.ClientConnector;
 import org.eclipse.jetty.io.Connection;
+import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.io.EndPoint;
 import org.eclipse.jetty.io.Transport;
 import org.eclipse.jetty.io.ssl.SslConnection;
@@ -233,6 +234,8 @@ public class HTTP2JettyClient {
   private static final Object SHARED_POOL_LOCK = new Object();
   private static final String SHARED_POOL_NAME = "http2-shared";
   private static volatile QueuedThreadPool sharedThreadPool;
+  /** Guarded by the class lock; see {@link #sharedZstdCompression(int)}. */
+  private static ZstandardCompression sharedZstdCompression;
   private static volatile Executor sharedExecutor;
   private static volatile int sharedMaxThreads = -1;
   private static volatile int sharedMinThreads = -1;
@@ -885,6 +888,10 @@ public class HTTP2JettyClient {
    * {@code removeAndRelease()} no longer exists in 12.1.x.
    */
   private ByteBufferPool createByteBufferPool() {
+    return newByteBufferPool(byteBufferPoolFactor);
+  }
+
+  private static ByteBufferPool newByteBufferPool(int byteBufferPoolFactor) {
     long maxHeap = Long.parseLong(BzmHttpPluginProperties.getPropDefault(
         "httpJettyClient.byteBufferPoolMaxHeapMemory",
         String.valueOf(DEFAULT_BYTE_BUFFER_POOL_MAX_MEMORY)));
@@ -1303,6 +1310,7 @@ public class HTTP2JettyClient {
     if (!httpClient.isStarted()) {
       lowLevelDebug("Starting HttpClient: name={}, http1UpgradeRequired={}",
           httpClient.getName(), http1UpgradeRequired);
+      blockServiceLoaderDecoders(httpClient);
       httpClient.start();
       CustomWwwAuthenticationProtocolHandler.install(httpClient);
       lowLevelDebug("HttpClient started successfully");
@@ -1311,12 +1319,14 @@ public class HTTP2JettyClient {
     }
     if (httpClientNoH3 != httpClient && !httpClientNoH3.isStarted()) {
       lowLevelDebug("Starting HttpClient (no HTTP/3): name={}", httpClientNoH3.getName());
+      blockServiceLoaderDecoders(httpClientNoH3);
       httpClientNoH3.start();
       CustomWwwAuthenticationProtocolHandler.install(httpClientNoH3);
       lowLevelDebug("HttpClient (no HTTP/3) started successfully");
     }
     if (!httpClientHttp1Only.isStarted()) {
       lowLevelDebug("Starting HttpClient (HTTP/1.1 only): name={}", httpClientHttp1Only.getName());
+      blockServiceLoaderDecoders(httpClientHttp1Only);
       httpClientHttp1Only.start();
       CustomWwwAuthenticationProtocolHandler.install(httpClientHttp1Only);
       lowLevelDebug("HttpClient (HTTP/1.1 only) started successfully");
@@ -1324,12 +1334,14 @@ public class HTTP2JettyClient {
     if (!httpClientH2cPrior.isStarted()) {
       lowLevelDebug("Starting HttpClient (H2C prior knowledge): name={}",
           httpClientH2cPrior.getName());
+      blockServiceLoaderDecoders(httpClientH2cPrior);
       httpClientH2cPrior.start();
       CustomWwwAuthenticationProtocolHandler.install(httpClientH2cPrior);
       lowLevelDebug("HttpClient (H2C prior knowledge) started successfully");
     }
     if (!httpClientH2cUpgrade.isStarted()) {
       lowLevelDebug("Starting HttpClient (H2C upgrade): name={}", httpClientH2cUpgrade.getName());
+      blockServiceLoaderDecoders(httpClientH2cUpgrade);
       httpClientH2cUpgrade.start();
       CustomWwwAuthenticationProtocolHandler.install(httpClientH2cUpgrade);
       lowLevelDebug("HttpClient (H2C upgrade) started successfully");
@@ -1367,6 +1379,7 @@ public class HTTP2JettyClient {
 
     // Start the client
     if (!http11Client.isStarted()) {
+      blockServiceLoaderDecoders(http11Client);
       http11Client.start();
       CustomWwwAuthenticationProtocolHandler.install(http11Client);
       lowLevelDebug("HTTP/1.1-only fallback client started");
@@ -1750,7 +1763,7 @@ public class HTTP2JettyClient {
     gzipCompression = null;
     stopLifeCycleQuietly(brotliCompression);
     brotliCompression = null;
-    stopLifeCycleQuietly(zstdCompression);
+    // Shared by every client (see sharedZstdCompression), so only the reference goes.
     zstdCompression = null;
     brotliDecoderFactory = null;
     zstdDecoderFactory = null;
@@ -2699,6 +2712,39 @@ public class HTTP2JettyClient {
     }
   }
 
+  /**
+   * Must run before every {@code HttpClient.start()}: {@code doStop()} clears the factories, so a
+   * restarted client would do the lookup again. See {@link ServiceLoaderDecodersPlaceholder}.
+   */
+  private static void blockServiceLoaderDecoders(HttpClient client) {
+    ContentDecoder.Factories factories = client.getContentDecoderFactories();
+    if (factories != null && factories.isEmpty()) {
+      factories.put(new ServiceLoaderDecodersPlaceholder());
+    }
+  }
+
+  /**
+   * What {@code HttpClient.doStart()} finds instead of an empty factory list. When it finds none,
+   * it creates a new instance of every {@code Compression} on the classpath through
+   * {@code ServiceLoader}, and in Jetty 12.1.11 each {@link ZstandardCompression} starts a
+   * {@code Cleaner} thread that only ends when a GC collects it: one per internal
+   * {@link HttpClient}, five per plugin client, thousands per load test. The plugin never decodes
+   * with those instances, since every request clears the factories and registers its own (see
+   * {@link #configureContentDecoders}), so this placeholder is dropped by the first request and
+   * never reaches the wire. Drop it once Jetty stops creating a {@code Cleaner} per instance.
+   */
+  private static final class ServiceLoaderDecodersPlaceholder extends ContentDecoder.Factory {
+
+    private ServiceLoaderDecodersPlaceholder() {
+      super("identity");
+    }
+
+    @Override
+    public Content.Source newDecoderContentSource(Content.Source source) {
+      return source;
+    }
+  }
+
   private void ensureDecoderFactoriesInitialized() {
     if (decoderFactoriesInitialized) {
       return;
@@ -2726,8 +2772,7 @@ public class HTTP2JettyClient {
       lowLevelDebug("Zstd decoder disabled by blazemeter.http.disableZstdDecoder");
     } else {
       try {
-        zstdCompression = new ZstandardCompression();
-        zstdCompression.setByteBufferPool(bufferPool);
+        zstdCompression = sharedZstdCompression(byteBufferPoolFactor);
         zstdDecoderFactory = new CompressionContentDecoderFactory(zstdCompression);
         lowLevelDebug("Initialized Zstandard content decoder factory");
       } catch (Throwable t) {
@@ -2771,6 +2816,29 @@ public class HTTP2JettyClient {
         LOG.warn("Deflate decoder not available; skipping factory initialization", t);
       }
     }
+  }
+
+  /**
+   * One {@link ZstandardCompression} for every client in the JVM: in Jetty 12.1.11 each instance
+   * starts a {@code Cleaner} thread that only ends when a GC collects it, so one per client cost a
+   * thread per client for the whole test. It decodes with its own pool rather than a client's,
+   * since it outlives them all; zstd-jni needs direct buffers, which that pool also caps.
+   *
+   * <p>Started here, before any factory wraps it, on purpose:
+   * {@code CompressionContentDecoderFactory} installs a {@code Compression} that is already
+   * running as an unmanaged bean, so stopping one client's {@link HttpClient} stops its factory
+   * but never this instance. That is also why {@link #stopCompressionResources} only drops the
+   * reference.
+   */
+  private static synchronized ZstandardCompression sharedZstdCompression(int byteBufferPoolFactor)
+      throws Exception {
+    if (sharedZstdCompression == null) {
+      ZstandardCompression compression = new ZstandardCompression();
+      compression.setByteBufferPool(newByteBufferPool(byteBufferPoolFactor));
+      compression.start();
+      sharedZstdCompression = compression;
+    }
+    return sharedZstdCompression;
   }
 
   private void configureContentDecoders(HttpClient client, Request request) {
@@ -3510,6 +3578,7 @@ public class HTTP2JettyClient {
     URI uri = originalRequest.getURI();
     if (!client.isStarted()) {
       try {
+        blockServiceLoaderDecoders(client);
         client.start();
       } catch (Exception e) {
         throw new ExecutionException("Failed to start HTTP client", e);
