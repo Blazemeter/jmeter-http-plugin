@@ -405,6 +405,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     // still needs the same object (cookies / request headers already applied) for errorResult —
     // otherwise connect failures rebuild a blank result and assertions on "Cookie Data:" fail.
     HTTPSampleResult preparedResult = null;
+    // The listener of the exchange this turn collects. The finally below drops the field before the
+    // catch runs, and the catch still needs it to end an error result when the request failed.
+    HTTP2FutureResponseListener collectedListener = null;
     try {
       HTTP2JettyClient client = clientFactory.call();
       LOG.trace("=== Client obtained, proceeding with request ===");
@@ -431,6 +434,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         } else {
           // If there is a listener, it is processed using the result it had
           preparedResult = this.result;
+          collectedListener = this.asyncListener;
           try {
             int completionDepth = depth > 0 ? depth : pendingCompletionDepth;
             this.result = sampleFromListener(
@@ -466,7 +470,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      return buildErrorResult(e, resolveErrorResult(preparedResult, url, method));
+      return buildErrorResult(e, resolveErrorResult(preparedResult, url, method),
+          collectedListener);
     } catch (Exception e) {
       logSampleFailure(e);
 
@@ -523,7 +528,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
         }
       }
 
-      return buildErrorResult(e, resolveErrorResult(preparedResult, url, method));
+      return buildErrorResult(e, resolveErrorResult(preparedResult, url, method),
+          collectedListener);
     }
   }
 
@@ -576,17 +582,24 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     return result;
   }
 
-  private HTTPSampleResult buildErrorResult(Exception e, HTTPSampleResult result) {
+  /**
+   * @param collectedListener the listener of the async exchange this turn collected, or
+   *     {@code null}: when the request failed on the wire, it ends the sample at the failure, not
+   *     at the turn that collected it, which can come long after, behind slower requests queued
+   *     ahead of it in the async controller
+   */
+  private HTTPSampleResult buildErrorResult(Exception e, HTTPSampleResult result,
+                                            HTTP2FutureResponseListener collectedListener) {
     if (result.getStartTime() == 0) {
       result.sampleStart();
     }
     if (result.getEndTime() == 0) {
       // On this result's own clock: its start came from sampleStart(), and the listener records the
       // exchange on the wall clock. See SampleClock.
-      long responseEnd = Objects.isNull(this.asyncListener)
-          ? 0
-          : this.asyncListener.getResponseEndOn(result);
-      if (responseEnd > 0) {
+      HTTP2FutureResponseListener listener =
+          collectedListener != null ? collectedListener : this.asyncListener;
+      long responseEnd = Objects.isNull(listener) ? 0 : listener.getResponseEndOn(result);
+      if (responseEnd >= result.getStartTime() && responseEnd > 0) {
         result.setEndTime(responseEnd);
       } else {
         result.sampleEnd();
