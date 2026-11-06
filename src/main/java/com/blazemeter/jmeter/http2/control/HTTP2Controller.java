@@ -16,6 +16,7 @@ import org.apache.jmeter.control.Controller;
 import org.apache.jmeter.control.NextIsNullException;
 import org.apache.jmeter.control.TransactionController;
 import org.apache.jmeter.control.TransactionSampler;
+import org.apache.jmeter.samplers.SampleEvent;
 import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.samplers.Sampler;
 import org.apache.jmeter.testelement.TestElement;
@@ -191,7 +192,6 @@ public class HTTP2Controller extends TransactionController implements Serializab
       // getCurrentElement has run, and what the scheduler checks right after this call returns is
       // whether anything is out there now.
       holdSchedulerWhileRequestsAreInFlight();
-      releaseSchedulerOnceCollectedPastTheEnd();
     }
   }
 
@@ -226,11 +226,10 @@ public class HTTP2Controller extends TransactionController implements Serializab
    * iteration instead (see {@link #discardPendingAsyncSamples()}, reached through
    * {@code reInitialize}), by which point every collected response has been reported; and since it
    * stops being renewed as soon as the queue empties, a push left behind by any path that does not
-   * reach that point expires on its own. The one exception is a flat controller whose end has
-   * already gone by: there the deadline goes back on the turn that hands out the last response,
+   * reach that point expires on its own. The one exception is a flat controller: there the
+   * deadline goes back as soon as a sample has been reported with no response left on the wire,
    * because the end of the iteration comes too late to stop the thread (see
-   * {@link #releaseSchedulerOnceCollectedPastTheEnd()}). That last response is still reported:
-   * {@code JMeterThread} checks the end only after it has sampled and reported it.
+   * {@link #sampleOccurred(SampleEvent)}).
    */
   private void holdSchedulerWhileRequestsAreInFlight() {
     if (http2SamplesSync.isEmpty()) {
@@ -253,9 +252,17 @@ public class HTTP2Controller extends TransactionController implements Serializab
   }
 
   /**
-   * Gives the scheduled end back on the turn that hands out the last response still on the wire,
-   * once that end has gone by, so that {@code JMeterThread}'s own check, right after that response
-   * is sampled and reported, stops the thread.
+   * Gives the scheduled end back once a sample has been reported and no response is left on the
+   * wire, so that {@code JMeterThread}'s own check, which runs right after the listeners are
+   * notified, stops the thread if the end has gone by - during the request, during its
+   * post-processors or assertions, or before any of it.
+   *
+   * <p>This controller is a {@code SampleListener} by inheritance ({@link TransactionController}),
+   * so JMeter notifies it of every sample under it, after the post-processors and assertions of
+   * that sample and before the scheduler check. That covers the two ways a pass can run out of
+   * responses: the last one is collected and reported, or the last request queued failed at
+   * dispatch, was reported as an error, and never gets a response listener, hence no collection
+   * turn of its own.
    *
    * <p>With "Generate parent sample" off, waiting for the end of the iteration
    * ({@code reInitialize}) is too late: that happens on the turn this controller returns
@@ -264,7 +271,7 @@ public class HTTP2Controller extends TransactionController implements Serializab
    * {@code JMeterThread} checks the end it was just given back. The first dispatch of the new
    * iteration then found the end already gone by and held it again, and the thread never stopped:
    * one request per iteration past the end, for as long as the test was left running (BlazeMeter
-   * HTTP issue 169).
+   * HTTP issue 169). Every response is reported before the end goes back, so none is lost to it.
    *
    * <p>Handing the end back here instead ends the thread the way a stock sampler does: right after
    * the sample the end fell in, through the check {@code JMeterThread} runs after every sample. So
@@ -277,10 +284,26 @@ public class HTTP2Controller extends TransactionController implements Serializab
    * finished transaction is handed to {@code JMeterThread}, whose check after it stops the thread:
    * that path closes its own transaction and is left as it is.
    */
-  private void releaseSchedulerOnceCollectedPastTheEnd() {
-    if (!isGenerateParentSample() && http2SamplesSync.isEmpty() && scheduledEndPassed()) {
+  @Override
+  public void sampleOccurred(SampleEvent event) {
+    super.sampleOccurred(event);
+    if (!isGenerateParentSample() && !isResponseStillOnTheWire()) {
       releaseScheduler();
     }
+  }
+
+  /**
+   * Whether a queued request is still waiting for its response. A queued sampler without a
+   * response listener at this point has already been sampled: its dispatch failed and was reported,
+   * and {@link #waitForDoneHTTP2()} drops it on a later turn.
+   */
+  private boolean isResponseStillOnTheWire() {
+    for (HTTP2Sampler queued : http2SamplesSync) {
+      if (queued.getFutureResponseListener() != null) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

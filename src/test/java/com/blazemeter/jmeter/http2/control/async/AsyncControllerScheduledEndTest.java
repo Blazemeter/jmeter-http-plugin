@@ -10,8 +10,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.function.Consumer;
+import org.apache.jmeter.processor.PostProcessor;
 import org.apache.jmeter.samplers.Entry;
 import org.apache.jmeter.samplers.SampleResult;
+import org.apache.jmeter.testelement.AbstractTestElement;
 import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.threads.JMeterThread;
 import org.apache.jmeter.threads.ThreadGroup;
@@ -137,6 +139,104 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
     softly.assertAll();
   }
 
+  /**
+   * A request whose dispatch fails never gets a response listener, so it has no completion turn:
+   * the controller drops it from its queue on a later turn. When it is the last one queued, no
+   * collected response follows it for {@code JMeterThread} to check the end after, and the end was
+   * handed back only when the pass ended, too late to stop the Thread Group's next iteration. With
+   * every dispatch failing, each new iteration held the end again and the thread never stopped.
+   * A stock thread whose sampler keeps failing is stopped by the check after the failed sample.
+   */
+  @Test
+  public void failedLastDispatchMustNotKeepTheThreadPastTheScheduledEnd() {
+    Result actual;
+    try (ScenarioFixture fixture = new ScenarioFixture(ControllerKind.ASYNC_FLAT)) {
+      // SEND_THROWS, not DISPATCH_THROWS: both leave the sampler without a response listener, but
+      // a ConnectException makes the error mapper resolve the stub's host name, which on some
+      // machines takes longer than the hold and would end the run for a reason unrelated to this.
+      fixture.transport().spec("S1").failure(StubAsyncTransport.Failure.SEND_THROWS);
+      actual = fixture.run(threadGroup("tg", -1), RUN_TIMEOUT_MILLIS,
+          AsyncScenarioRunner.schedulerEndingIn(LATENCY / 4),
+          node(fixture.controller("controller"),
+              node(fixture.http("S1", LATENCY))),
+          fixture.recorderNode());
+    }
+    System.out.println("failed dispatch: dispatched " + actual.dispatchOrder().size()
+        + " reported " + actual.topLevelLabels().size() + " hung: " + actual.hung());
+
+    SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(actual.hung())
+        .as("a failing request must not keep the thread past its scheduled end").isFalse();
+    softly.assertThat(actual.topLevelLabels())
+        .as("every failed dispatch is reported").hasSameSizeAs(actual.dispatchOrder());
+    softly.assertAll();
+  }
+
+  /**
+   * Same, with a request still on the wire ahead of the failed one: the end may only go back once
+   * that response has been collected and reported, and then it must stop the thread.
+   */
+  @Test
+  public void failedLastDispatchAfterALiveRequestMustStopAfterCollectingIt() {
+    long slowLatency = 5 * LATENCY;
+    Result actual;
+    // Armed at X, and well inside S1's latency, so that S2 has always been dispatched (and has
+    // failed) before the end, and S1 is still on the wire when it falls.
+    SchedulerArmingSampler before = new SchedulerArmingSampler("X", slowLatency / 2);
+    try (ScenarioFixture fixture = new ScenarioFixture(ControllerKind.ASYNC_FLAT)) {
+      fixture.transport().spec("S2").failure(StubAsyncTransport.Failure.SEND_THROWS);
+      actual = fixture.run(threadGroup("tg", -1), RUN_TIMEOUT_MILLIS, scheduledButNotYetArmed(),
+          node(before),
+          node(fixture.controller("controller"),
+              node(fixture.http("S1", slowLatency)),
+              node(fixture.http("S2", slowLatency))),
+          fixture.recorderNode());
+    }
+    System.out.println("failed after live: dispatched " + actual.dispatchOrder() + " reported "
+        + actual.topLevelLabels() + " hung: " + actual.hung());
+
+    SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(actual.hung()).as("the thread must stop at its scheduled end").isFalse();
+    softly.assertThat(actual.dispatchOrder()).as("only the first iteration's requests")
+        .containsExactly("S1", "S2");
+    softly.assertThat(before.invocations()).as("no second iteration").isEqualTo(1);
+    softly.assertThat(actual.topLevelLabels())
+        .as("the failed dispatch is reported when it fails, the live response once collected")
+        .containsExactly("X", "S2", "S1");
+    softly.assertAll();
+  }
+
+  /**
+   * The last response is collected before the end, and the end goes by while its post-processor
+   * runs. A stock thread is stopped by the check right after that sample. Here the end was still
+   * held at that check, so the Thread Group started another iteration before the end was given
+   * back.
+   */
+  @Test
+  public void endCrossedByThePostProcessorOfTheLastResponseMustStopTheThread() {
+    Result actual;
+    SchedulerArmingSampler before = new SchedulerArmingSampler("X", LATENCY + 100);
+    try (ScenarioFixture fixture = new ScenarioFixture(ControllerKind.ASYNC_FLAT)) {
+      actual = fixture.run(threadGroup("tg", -1), RUN_TIMEOUT_MILLIS, scheduledButNotYetArmed(),
+          node(before),
+          node(fixture.controller("controller"),
+              node(fixture.http("S1", LATENCY)),
+              node(fixture.http("S2", LATENCY),
+                  node(new SleepPastArmedEndPostProcessor(before, 20)))),
+          fixture.recorderNode());
+    }
+    System.out.println("post-processor crossing: dispatched " + actual.dispatchOrder()
+        + " reported " + actual.topLevelLabels() + " hung: " + actual.hung());
+
+    SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(actual.hung()).as("the thread must stop at its scheduled end").isFalse();
+    softly.assertThat(actual.dispatchOrder()).as("only the first iteration's requests")
+        .containsExactly("S1", "S2");
+    softly.assertThat(before.invocations()).as("no second iteration").isEqualTo(1);
+    softly.assertThat(actual.topLevelLabels()).containsExactly("X", "S1", "S2");
+    softly.assertAll();
+  }
+
   private Result runInsideParentTransaction(ControllerKind kind) {
     try (ScenarioFixture fixture = new ScenarioFixture(kind)) {
       // The end falls while the first iteration's requests are on the wire.
@@ -214,6 +314,7 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
     private static final long serialVersionUID = 1L;
 
     private final long millisFromNow;
+    private volatile long armedEnd;
 
     private SchedulerArmingSampler(String name, long millisFromNow) {
       super(name);
@@ -224,10 +325,43 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
     public SampleResult sample(Entry entry) {
       SampleResult result = super.sample(entry);
       if (invocations() == 1) {
-        JMeterContextService.getContext().getThread()
-            .setEndTime(System.currentTimeMillis() + millisFromNow);
+        armedEnd = System.currentTimeMillis() + millisFromNow;
+        JMeterContextService.getContext().getThread().setEndTime(armedEnd);
       }
       return result;
+    }
+
+    long armedEnd() {
+      return armedEnd;
+    }
+  }
+
+  /** Keeps its sample busy until a little after the end {@link SchedulerArmingSampler} armed. */
+  private static final class SleepPastArmedEndPostProcessor extends AbstractTestElement
+      implements PostProcessor {
+
+    private static final long serialVersionUID = 1L;
+
+    private final transient SchedulerArmingSampler arming;
+    private final long marginMillis;
+
+    private SleepPastArmedEndPostProcessor(SchedulerArmingSampler arming, long marginMillis) {
+      this.arming = arming;
+      this.marginMillis = marginMillis;
+      setName("sleep past the end");
+    }
+
+    @Override
+    public void process() {
+      long wait = arming.armedEnd() + marginMillis - System.currentTimeMillis();
+      if (wait <= 0) {
+        return;
+      }
+      try {
+        Thread.sleep(wait);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
     }
   }
 }
