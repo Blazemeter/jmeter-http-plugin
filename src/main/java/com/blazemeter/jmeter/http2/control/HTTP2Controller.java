@@ -26,6 +26,7 @@ import org.apache.jmeter.threads.JMeterThread;
 import org.apache.jmeter.threads.SamplePackage;
 import org.apache.jmeter.threads.TestCompiler;
 import org.apache.jmeter.util.JMeterUtils;
+import org.apache.jorphan.util.JMeterStopThreadException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -90,6 +91,11 @@ public class HTTP2Controller extends TransactionController implements Serializab
    * is not. See {@link #holdSchedulerWhileRequestsAreInFlight()}.
    */
   private transient Long heldSchedulerEndTime;
+  /**
+   * Set when the scheduled end went by while this controller was holding it off, at the moment the
+   * hold is given back. See {@link #stopThreadIfScheduledEndPassedWhileHeld()}.
+   */
+  private transient boolean scheduledEndPassedWhileHeld;
   /** How many children the open transaction had when its span was last measured. */
   private transient int measuredChildren;
 
@@ -170,6 +176,7 @@ public class HTTP2Controller extends TransactionController implements Serializab
    */
   @Override
   public Sampler next() {
+    stopThreadIfScheduledEndPassedWhileHeld();
     try {
       if (isGenerateParentSample()) {
         Sampler next = super.next();
@@ -185,7 +192,13 @@ public class HTTP2Controller extends TransactionController implements Serializab
         }
         return next;
       }
-      return nextWithoutTransactionBookkeeping();
+      Sampler next = nextWithoutTransactionBookkeeping();
+      if (next == null) {
+        // This pass is over and has given the held end back: stop before the Thread Group starts
+        // its next iteration in this same call.
+        stopThreadIfScheduledEndPassedWhileHeld();
+      }
+      return next;
     } finally {
       // After the turn, not before it: the request this turn dispatched is only on the wire once
       // getCurrentElement has run, and what the scheduler checks right after this call returns is
@@ -248,6 +261,37 @@ public class HTTP2Controller extends TransactionController implements Serializab
   }
 
   /**
+   * Ends the thread, as JMeter's scheduler would have, when the scheduled end went by while this
+   * controller was holding it off and the controller is asked for more.
+   *
+   * <p>The hold is given back when the iteration ends ({@code reInitialize}), so that the responses
+   * collected last are reported first. But the Thread Group's {@code LoopController} starts the
+   * next iteration inside that same {@code next()} call (its {@code nextIsNull()} returns
+   * {@code next()}), before {@code JMeterThread} gets to check the end it was just given back.
+   * Without this, the first dispatch of the new iteration found the end already gone by, held it
+   * again, and the thread never stopped: one request per iteration, past the end, for as long as
+   * the test was left running (BlazeMeter HTTP issue 169). With "Generate parent sample" on, the
+   * finished transaction is handed to {@code JMeterThread} first, its check stops the thread, and
+   * this never runs.
+   *
+   * <p>A stock sampler cannot get there: {@code JMeterThread} checks the end after every sample, so
+   * a stock thread stops right after the sample the end fell in, and never starts the next one.
+   * That is the outcome here: the check runs where this controller's pass ends (the flat path's
+   * {@code null}), so the Thread Group does not start another iteration and no element before
+   * this controller samples again; and at the start of {@code next()}, for any other path that gave
+   * the hold back. The exception is how JMeter's own elements end a thread from inside the
+   * controller tree (the CSV Data Set at the end of its file).
+   */
+  private void stopThreadIfScheduledEndPassedWhileHeld() {
+    if (!scheduledEndPassedWhileHeld) {
+      return;
+    }
+    scheduledEndPassedWhileHeld = false;
+    throw new JMeterStopThreadException("the Thread Group's scheduled end went by while '"
+        + getName() + "' was collecting its responses");
+  }
+
+  /**
    * Whether the thread's own scheduled end has already gone by while this controller was holding it
    * off. Read from the end time that was saved, not from the thread, whose end time is the held one
    * while the hold is on.
@@ -260,6 +304,9 @@ public class HTTP2Controller extends TransactionController implements Serializab
   private void releaseScheduler() {
     if (heldSchedulerEndTime == null) {
       return;
+    }
+    if (System.currentTimeMillis() >= heldSchedulerEndTime) {
+      scheduledEndPassedWhileHeld = true;
     }
     JMeterThread thread = JMeterContextService.getContext().getThread();
     if (thread != null) {
