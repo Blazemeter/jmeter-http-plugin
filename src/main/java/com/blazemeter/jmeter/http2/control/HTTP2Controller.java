@@ -742,6 +742,9 @@ public class HTTP2Controller extends TransactionController implements Serializab
     if (current < subControllersAndSamplers.size()) {
       TestElement sam = subControllersAndSamplers.get(current);
       if (sam instanceof HTTP2Sampler) {
+        if (isPastTheScheduledEndWithNothingOnTheWire()) {
+          return sampleSynchronouslyPastTheEnd((HTTP2Sampler) sam);
+        }
         return dispatchAsync((HTTP2Sampler) sam);
       } else { // Another type of element, use that for checkpoint mark
         HTTP2Sampler http2sam = waitForDoneHTTP2();
@@ -760,6 +763,40 @@ public class HTTP2Controller extends TransactionController implements Serializab
       }
     }
     return null;
+  }
+
+  /**
+   * Whether a flat controller is being asked for a request after the thread's own scheduled end
+   * has already gone by, with nothing held and nothing on the wire: the Thread Group started
+   * another pass before {@code JMeterThread} could check the end this controller had just given
+   * back.
+   *
+   * <p>That happens when the end goes back only as the pass ends ({@code reInitialize}), because no
+   * earlier moment saw that nothing was left to wait for: a failed dispatch whose error result a
+   * post-processor marked as ignored ({@code prev.setIgnore()}) is never notified to this
+   * controller, and has no response to collect. Dispatching asynchronously here would hold the
+   * expired end again, and with every pass ending the same way, the thread never stopped.
+   */
+  private boolean isPastTheScheduledEndWithNothingOnTheWire() {
+    if (isGenerateParentSample() || heldSchedulerEndTime != null || isResponseStillOnTheWire()) {
+      return false;
+    }
+    JMeterThread thread = JMeterContextService.getContext().getThread();
+    return thread != null && thread.getEndTime() > 0
+        && System.currentTimeMillis() >= thread.getEndTime();
+  }
+
+  /**
+   * Hands a request out to be sampled synchronously, as a stock sampler is: {@code JMeterThread}
+   * sends it, processes its result and then checks the scheduled end, which stops the thread. A
+   * stock thread asked for a sample past its end does the same - it runs that one sample and stops
+   * - so this is where the overrun ends, and the request is reported like any other.
+   */
+  private HTTP2Sampler sampleSynchronouslyPastTheEnd(HTTP2Sampler sampler) {
+    lowLevelDebug("Scheduled end already gone by in '{}'; sampling {} synchronously so the "
+        + "thread stops right after it", getName(), sampler.getName());
+    sampler.setSyncRequest(true);
+    return sampler;
   }
 
   /** Switches a sampler to asynchronous mode and queues it for a later completion turn. */

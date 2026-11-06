@@ -181,6 +181,42 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
   }
 
   /**
+   * Same, with the failed dispatch's error result marked as ignored by a post-processor: JMeter
+   * notifies no listener of it, so nothing tells the controller, before the end is checked, that
+   * nothing is left to wait for. The end then went back only as the pass ended, the next pass held
+   * it again, and the thread never stopped. A stock thread asked for a sample past its end runs
+   * that one sample and stops: at most one request may be sent once the end has gone by.
+   */
+  @Test
+  public void failedDispatchWhoseErrorIsIgnoredMustNotKeepTheThreadPastTheScheduledEnd() {
+    Result actual;
+    try (ScenarioFixture fixture = new ScenarioFixture(ControllerKind.ASYNC_FLAT)) {
+      fixture.transport().spec("S1").failure(StubAsyncTransport.Failure.SEND_THROWS);
+      actual = fixture.run(threadGroup("tg", -1), RUN_TIMEOUT_MILLIS,
+          AsyncScenarioRunner.schedulerEndingIn(LATENCY / 4),
+          node(fixture.controller("controller"),
+              node(new IgnoringPostProcessor()),
+              node(fixture.http("S1", LATENCY))),
+          fixture.recorderNode());
+    }
+    System.out.println("ignored failed dispatch: dispatched " + actual.dispatchOrder().size()
+        + " sampled past the end " + actual.syncSampled() + " reported "
+        + actual.topLevelLabels() + " hung: " + actual.hung());
+
+    SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(actual.uncaught()).as("the thread ended normally").isNull();
+    softly.assertThat(actual.dispatchOrder()).as("the failing request was dispatched").isNotEmpty();
+    softly.assertThat(actual.hung())
+        .as("an ignored failing request must not keep the thread past its scheduled end")
+        .isFalse();
+    softly.assertThat(actual.syncSampled().size())
+        .as("at most one request once the end has gone by, as a stock thread sends")
+        .isLessThanOrEqualTo(1);
+    softly.assertThat(actual.topLevelLabels()).as("every result was ignored").isEmpty();
+    softly.assertAll();
+  }
+
+  /**
    * Same, with a request still on the wire ahead of the failed one: the end may only go back once
    * that response has been collected and reported, and then it must stop the thread.
    */
