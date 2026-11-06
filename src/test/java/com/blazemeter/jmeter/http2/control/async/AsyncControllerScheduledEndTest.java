@@ -40,6 +40,12 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
   /** Far shorter than the runner's default: a thread that outlives its schedule is the failure. */
   private static final long RUN_TIMEOUT_MILLIS = 5_000L;
   /**
+   * Where the end falls in the post-processor scenarios: under the controller's hold
+   * ({@code blazemeter.http.schedulerHoldMillis}, 2 s), so it is held while the requests are on the
+   * wire, and well past {@link #LATENCY}, so the last response is collected before it.
+   */
+  private static final long CROSSING_END_MILLIS = 8 * LATENCY;
+  /**
    * The end falls a few milliseconds into the run: on a cold JVM it can come before S2 is
    * dispatched, and then S2 must not be (T6). Either way nothing may be sent twice.
    */
@@ -165,6 +171,8 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
         + " reported " + actual.topLevelLabels().size() + " hung: " + actual.hung());
 
     SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(actual.uncaught()).as("the thread ended normally").isNull();
+    softly.assertThat(actual.dispatchOrder()).as("the failing request was dispatched").isNotEmpty();
     softly.assertThat(actual.hung())
         .as("a failing request must not keep the thread past its scheduled end").isFalse();
     softly.assertThat(actual.topLevelLabels())
@@ -178,24 +186,29 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
    */
   @Test
   public void failedLastDispatchAfterALiveRequestMustStopAfterCollectingIt() {
-    long slowLatency = 5 * LATENCY;
+    long slowLatency = 12 * LATENCY;
     Result actual;
-    // Armed at X, and well inside S1's latency, so that S2 has always been dispatched (and has
-    // failed) before the end, and S1 is still on the wire when it falls.
-    SchedulerArmingSampler before = new SchedulerArmingSampler("X", slowLatency / 2);
+    MarkerSampler before = new MarkerSampler("X");
+    // Armed by S2's own failure, so S2 has always been dispatched and has failed before the end,
+    // and S1, far slower than the end is short, is still on the wire when it falls.
+    EndArmingPostProcessor armOnFailure = new EndArmingPostProcessor(LATENCY / 2);
     try (ScenarioFixture fixture = new ScenarioFixture(ControllerKind.ASYNC_FLAT)) {
       fixture.transport().spec("S2").failure(StubAsyncTransport.Failure.SEND_THROWS);
       actual = fixture.run(threadGroup("tg", -1), RUN_TIMEOUT_MILLIS, scheduledButNotYetArmed(),
           node(before),
           node(fixture.controller("controller"),
               node(fixture.http("S1", slowLatency)),
-              node(fixture.http("S2", slowLatency))),
+              node(fixture.http("S2", slowLatency), node(armOnFailure))),
           fixture.recorderNode());
     }
     System.out.println("failed after live: dispatched " + actual.dispatchOrder() + " reported "
-        + actual.topLevelLabels() + " hung: " + actual.hung());
+        + actual.topLevelLabels() + " completed " + actual.completionOrder() + " hung: "
+        + actual.hung());
 
     SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(actual.uncaught()).as("the thread ended normally").isNull();
+    softly.assertThat(armOnFailure.armedEnd()).as("the end was armed by S2's failure")
+        .isPositive();
     softly.assertThat(actual.hung()).as("the thread must stop at its scheduled end").isFalse();
     softly.assertThat(actual.dispatchOrder()).as("only the first iteration's requests")
         .containsExactly("S1", "S2");
@@ -215,25 +228,68 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
   @Test
   public void endCrossedByThePostProcessorOfTheLastResponseMustStopTheThread() {
     Result actual;
-    SchedulerArmingSampler before = new SchedulerArmingSampler("X", LATENCY + 100);
+    // The end is close enough for the controller to hold it while S1 and S2 are on the wire, and
+    // far enough past their latency for S2 to be collected before it; the post-processor then
+    // waits for it to go by, and says whether it really started before.
+    SchedulerArmingSampler before = new SchedulerArmingSampler("X", CROSSING_END_MILLIS);
+    SleepPastArmedEndPostProcessor crossing = new SleepPastArmedEndPostProcessor(before, 20);
     try (ScenarioFixture fixture = new ScenarioFixture(ControllerKind.ASYNC_FLAT)) {
       actual = fixture.run(threadGroup("tg", -1), RUN_TIMEOUT_MILLIS, scheduledButNotYetArmed(),
           node(before),
           node(fixture.controller("controller"),
               node(fixture.http("S1", LATENCY)),
-              node(fixture.http("S2", LATENCY),
-                  node(new SleepPastArmedEndPostProcessor(before, 20)))),
+              node(fixture.http("S2", LATENCY), node(crossing))),
           fixture.recorderNode());
     }
     System.out.println("post-processor crossing: dispatched " + actual.dispatchOrder()
         + " reported " + actual.topLevelLabels() + " hung: " + actual.hung());
 
     SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(actual.uncaught()).as("the thread ended normally").isNull();
+    softly.assertThat(crossing.startedBeforeTheEnd())
+        .as("S2 was collected before the end, and its post-processor crossed it").isTrue();
     softly.assertThat(actual.hung()).as("the thread must stop at its scheduled end").isFalse();
     softly.assertThat(actual.dispatchOrder()).as("only the first iteration's requests")
         .containsExactly("S1", "S2");
     softly.assertThat(before.invocations()).as("no second iteration").isEqualTo(1);
     softly.assertThat(actual.topLevelLabels()).containsExactly("X", "S1", "S2");
+    softly.assertAll();
+  }
+
+  /**
+   * Same, with the responses marked as ignored by a post-processor ({@code prev.setIgnore()}, as a
+   * JSR223 post-processor does to drop a sample from the results). JMeter then notifies no
+   * listener of them, but still checks the scheduled end right after, so the end has to be given
+   * back without waiting for a notification.
+   */
+  @Test
+  public void endCrossedWhileTheLastResponseIsIgnoredMustStopTheThread() {
+    Result actual;
+    SchedulerArmingSampler before = new SchedulerArmingSampler("X", CROSSING_END_MILLIS);
+    SleepPastArmedEndPostProcessor crossing = new SleepPastArmedEndPostProcessor(before, 20);
+    try (ScenarioFixture fixture = new ScenarioFixture(ControllerKind.ASYNC_FLAT)) {
+      actual = fixture.run(threadGroup("tg", -1), RUN_TIMEOUT_MILLIS, scheduledButNotYetArmed(),
+          node(before),
+          node(fixture.controller("controller"),
+              node(new IgnoringPostProcessor()),
+              node(fixture.http("S1", LATENCY)),
+              node(fixture.http("S2", LATENCY), node(crossing))),
+          fixture.recorderNode());
+    }
+    System.out.println("ignored crossing: dispatched " + actual.dispatchOrder() + " reported "
+        + actual.topLevelLabels() + " X runs: " + before.invocations() + " hung: "
+        + actual.hung());
+
+    SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(actual.uncaught()).as("the thread ended normally").isNull();
+    softly.assertThat(crossing.startedBeforeTheEnd())
+        .as("S2 was collected before the end, and its post-processor crossed it").isTrue();
+    softly.assertThat(actual.hung()).as("the thread must stop at its scheduled end").isFalse();
+    softly.assertThat(actual.dispatchOrder()).as("only the first iteration's requests")
+        .containsExactly("S1", "S2");
+    softly.assertThat(before.invocations()).as("no second iteration").isEqualTo(1);
+    softly.assertThat(actual.topLevelLabels()).as("the ignored responses are not reported")
+        .containsExactly("X");
     softly.assertAll();
   }
 
@@ -336,7 +392,11 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
     }
   }
 
-  /** Keeps its sample busy until a little after the end {@link SchedulerArmingSampler} armed. */
+  /**
+   * Keeps its sample busy until a little after the end {@link SchedulerArmingSampler} armed, and
+   * records whether it started before that end - i.e. whether the scenario really was the end
+   * going by during post-processing.
+   */
   private static final class SleepPastArmedEndPostProcessor extends AbstractTestElement
       implements PostProcessor {
 
@@ -344,6 +404,7 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
 
     private final transient SchedulerArmingSampler arming;
     private final long marginMillis;
+    private volatile Boolean startedBeforeTheEnd;
 
     private SleepPastArmedEndPostProcessor(SchedulerArmingSampler arming, long marginMillis) {
       this.arming = arming;
@@ -353,7 +414,11 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
 
     @Override
     public void process() {
-      long wait = arming.armedEnd() + marginMillis - System.currentTimeMillis();
+      long now = System.currentTimeMillis();
+      if (startedBeforeTheEnd == null) {
+        startedBeforeTheEnd = now < arming.armedEnd();
+      }
+      long wait = arming.armedEnd() + marginMillis - now;
       if (wait <= 0) {
         return;
       }
@@ -361,6 +426,56 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
         Thread.sleep(wait);
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
+      }
+    }
+
+    boolean startedBeforeTheEnd() {
+      return Boolean.TRUE.equals(startedBeforeTheEnd);
+    }
+  }
+
+  /** Moves the thread's scheduled end to {@code millisFromNow} the first time it runs. */
+  private static final class EndArmingPostProcessor extends AbstractTestElement
+      implements PostProcessor {
+
+    private static final long serialVersionUID = 1L;
+
+    private final long millisFromNow;
+    private volatile long armedEnd;
+
+    private EndArmingPostProcessor(long millisFromNow) {
+      this.millisFromNow = millisFromNow;
+      setName("arm the end");
+    }
+
+    @Override
+    public void process() {
+      if (armedEnd == 0) {
+        armedEnd = System.currentTimeMillis() + millisFromNow;
+        JMeterContextService.getContext().getThread().setEndTime(armedEnd);
+      }
+    }
+
+    long armedEnd() {
+      return armedEnd;
+    }
+  }
+
+  /** Drops every sample in its scope from the results, as {@code prev.setIgnore()} does. */
+  private static final class IgnoringPostProcessor extends AbstractTestElement
+      implements PostProcessor {
+
+    private static final long serialVersionUID = 1L;
+
+    private IgnoringPostProcessor() {
+      setName("ignore");
+    }
+
+    @Override
+    public void process() {
+      SampleResult previous = JMeterContextService.getContext().getPreviousResult();
+      if (previous != null) {
+        previous.setIgnore();
       }
     }
   }
