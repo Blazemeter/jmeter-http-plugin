@@ -2117,7 +2117,11 @@ public class HTTP2JettyClient {
       // Check if this is a protocol_error and attempt HTTP/1.1 fallback
       RetryableRequestException retryable =
           findRetryableRequestException(cause != null ? cause : e);
+      // Whether a request went out again after the failed one: if it fails too, the sample ends
+      // when that last attempt failed, not when the first one did.
+      boolean retried = false;
       if (retryable != null && goawayRetryEnabled && maxGoawayRetries > 0) {
+        retried = true;
         LOG.warn("RetryableRequestException detected (likely GOAWAY) in sampleFromListener()");
         LOG.warn("Error: {}", retryable.getMessage());
         try {
@@ -2165,6 +2169,7 @@ public class HTTP2JettyClient {
             + "Attempting fallback to HTTP/1.1");
         LOG.warn("Error: {}", cause != null ? cause.getMessage() : e.getMessage());
         if (enableHttp1) {
+          retried = true;
           try {
             // Retry with HTTP/1.1 only
             lowLevelDebug("Retrying request with HTTP/1.1 only: {}", result.getURL());
@@ -2185,6 +2190,9 @@ public class HTTP2JettyClient {
         }
       }
 
+      if (retried) {
+        listener.endAtFailedRetry();
+      }
       // Re-throw if fallback didn't work
       throw e;
     }

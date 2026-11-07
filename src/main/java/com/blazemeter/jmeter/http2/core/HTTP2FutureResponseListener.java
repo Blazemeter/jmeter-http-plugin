@@ -109,6 +109,16 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
   }
 
   /**
+   * Moves the end of the exchange to now, after a retry or fallback attempted for this listener's
+   * request failed too. The only completion this listener records is that of its own attempt, the
+   * one that failed first; a sample ended from it would leave out every attempt made after it, and
+   * report a failure faster than the request really failed.
+   */
+  public void endAtFailedRetry() {
+    setEnd();
+  }
+
+  /**
    * When the request went out as a {@link System#currentTimeMillis()} time, or 0. An absolute time
    * to report or to log; to stamp it on a sample use {@link #getResponseStartOn}, and to measure a
    * wait from it use {@link #getResponseStartNanos}.

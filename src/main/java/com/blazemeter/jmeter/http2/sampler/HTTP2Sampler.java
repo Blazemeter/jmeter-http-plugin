@@ -94,6 +94,12 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
   /** How often the concurrent embedded-resources drain checks a pending request for completion. */
   private static final long EMBEDDED_POLL_INTERVAL_MILLIS = 10;
+  /**
+   * How far before a sample's start an instant translated onto its clock can land and still be the
+   * same instant: each translation reads two clocks separately and truncates both to whole
+   * milliseconds (see SampleClock). Anything further back is not this request's completion.
+   */
+  private static final long CLOCK_TRANSLATION_TOLERANCE_MILLIS = 2;
 
   private static final String HTTP1_UPGRADE_PROPERTY = "HTTP2Sampler.http1_upgrade";
   private static final String PROFILE_PROPERTY = "HTTP2Sampler.profile";
@@ -525,6 +531,10 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
           } catch (Exception fallbackException) {
             LOG.error("Failed to attempt HTTP/1.1 fallback", fallbackException);
           }
+          if (collectedListener != null) {
+            // The request went out again and failed again: the sample ends now, with that attempt.
+            collectedListener.endAtFailedRetry();
+          }
         }
       }
 
@@ -599,8 +609,11 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       HTTP2FutureResponseListener listener =
           collectedListener != null ? collectedListener : this.asyncListener;
       long responseEnd = Objects.isNull(listener) ? 0 : listener.getResponseEndOn(result);
-      if (responseEnd >= result.getStartTime() && responseEnd > 0) {
-        result.setEndTime(responseEnd);
+      long start = result.getStartTime();
+      if (responseEnd > 0 && responseEnd >= start - CLOCK_TRANSLATION_TOLERANCE_MILLIS) {
+        // A failure within a millisecond of the start can translate to just before it; that is the
+        // translation, not the request, so it ends at the start rather than at the collection.
+        result.setEndTime(Math.max(responseEnd, start));
       } else {
         result.sampleEnd();
       }
