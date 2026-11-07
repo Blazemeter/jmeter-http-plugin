@@ -10,19 +10,29 @@ import static org.mockito.Mockito.when;
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
+import com.blazemeter.jmeter.http2.core.HTTP2JettyClientTestIsolation;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
 import com.blazemeter.jmeter.http2.core.SampleClock;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.URI;
 import java.net.URL;
+import java.nio.channels.ClosedChannelException;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.assertj.core.api.SoftAssertions;
 import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.client.Result;
 import org.junit.After;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -33,8 +43,10 @@ import org.junit.Test;
  * refused connection reported as taking as long as the slowest request ahead of it is a response
  * time that never happened, and it lands in the label's average and percentiles.
  *
- * <p>"The failure" is the last attempt's: when the request is sent again after failing (an
- * HTTP/1.1 fallback) and fails again, that time is part of the request too.
+ * <p>"The failure" is the last attempt's: when collecting the request sends it again after it
+ * failed (a GOAWAY retry, an HTTP/1.1 fallback) and that fails too, the time is part of the
+ * request. Each path that sends it again is covered here by what the sample reports, not by how
+ * that path tells the sampler, so a fallback added later is held to the same rule.
  */
 public class AsyncFailureElapsedTimeTest extends HTTP2TestBase {
 
@@ -47,17 +59,39 @@ public class AsyncFailureElapsedTimeTest extends HTTP2TestBase {
   private static final long CLOCK_TOLERANCE_MILLIS = 2;
 
   private HTTP2Sampler sampler;
+  private HTTP2JettyClient realClient;
+  private HttpClient probeClient;
+  private StallingServer server;
 
   @BeforeClass
   public static void setupClass() {
     JMeterTestUtils.setupJmeterEnv();
   }
 
+  /**
+   * A protocol property another class left behind ({@code httpJettyClient.enableHttp2=false}) makes
+   * the client skip the h2c upgrade these tests depend on, so the 426 never comes and no fallback is
+   * sent; a cached origin on a recycled port does the same.
+   */
+  @Before
+  public void resetSharedClientState() throws Exception {
+    HTTP2JettyClientTestIsolation.resetSharedClientState();
+  }
+
   @After
-  public void tearDown() {
+  public void tearDown() throws Exception {
     if (sampler != null) {
       // Stops the Jetty client this thread cached for the sampler, so it does not outlive the test.
       sampler.threadFinished();
+    }
+    if (realClient != null) {
+      realClient.stop();
+    }
+    if (probeClient != null) {
+      probeClient.stop();
+    }
+    if (server != null) {
+      server.close();
     }
   }
 
@@ -163,6 +197,156 @@ public class AsyncFailureElapsedTimeTest extends HTTP2TestBase {
         .as("a failure at the start ends at the start, not at the late collection")
         .isLessThan(COLLECTED_LATE_BY_MILLIS)
         .isNotNegative();
+  }
+
+  /**
+   * The h2c upgrade is refused with a 426, and the HTTP/1.1 fallback the client sends while
+   * collecting the response fails too: the sample counts that fallback, and still leaves out the
+   * wait to be collected.
+   */
+  @Test
+  public void failedFallbackAfterARefusedH2cUpgradeMustCountInTheElapsedTime() throws Exception {
+    server = new StallingServer(true);
+    realClient = new HTTP2JettyClient(true, "refused-h2c-upgrade");
+    realClient.start();
+    assertFallbackTimeCountedAndQueueWaitLeftOut(realClient);
+  }
+
+  /**
+   * The connection closes under the request, and the HTTP/1.1 fallback the client sends while
+   * collecting the response fails too.
+   */
+  @Test
+  public void failedFallbackAfterAClosedChannelMustCountInTheElapsedTime() throws Exception {
+    server = new StallingServer(false);
+    probeClient = new HttpClient();
+    probeClient.start();
+    realClient = new HTTP2JettyClient(false, "closed-channel") {
+      @Override
+      public Request dispatchAsync(HTTP2Sampler sampler, HTTPSampleResult result,
+                                   HTTP2FutureResponseListener listener) {
+        result.sampleStart();
+        Request request = probeClient.newRequest(URI.create(server.url()));
+        listener.setRequest(request);
+        // Without a message, so that it is not mistaken for a protocol error and the HTTP/1.1
+        // fallback taken while waiting for the response is the one under test.
+        listener.onComplete(new Result(request, new ClosedChannelException(), null));
+        return request;
+      }
+    };
+    realClient.start();
+    assertFallbackTimeCountedAndQueueWaitLeftOut(realClient);
+  }
+
+  private void assertFallbackTimeCountedAndQueueWaitLeftOut(HTTP2JettyClient client)
+      throws Exception {
+    sampler = new HTTP2Sampler(() -> client);
+    sampler.setName("fallback");
+    sampler.setSyncRequest(false);
+    sampler.setMethod(HTTPConstants.GET);
+    sampler.setDomain("127.0.0.1");
+    sampler.setProtocol(HTTPConstants.PROTOCOL_HTTP);
+    sampler.setPort(server.port());
+    sampler.setPath("/");
+    URL url = new URL(server.url());
+
+    long dispatchedAt = System.nanoTime();
+    assertThat(sampler.sample(url, HTTPConstants.GET, false, 0)).isNull();
+    HTTP2FutureResponseListener listener = sampler.getFutureResponseListener();
+    long deadline = System.currentTimeMillis() + 10_000;
+    while (!listener.isDone() && System.currentTimeMillis() < deadline) {
+      Thread.sleep(5);
+    }
+    assertThat(listener.isDone()).as("the first attempt ended").isTrue();
+    long firstAttemptMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - dispatchedAt);
+    Thread.sleep(COLLECTED_LATE_BY_MILLIS);
+    long collectionStartedAt = System.nanoTime();
+    HTTPSampleResult result = sampler.sample(url, HTTPConstants.GET, false, 0);
+    long collectionMillis =
+        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - collectionStartedAt);
+
+    SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(result.isSuccessful()).as("every attempt failed").isFalse();
+    softly.assertThat(collectionMillis)
+        .as("the collection sent the request again, and the server stalled it")
+        .isGreaterThanOrEqualTo(FAILED_FALLBACK_MILLIS - CLOCK_TOLERANCE_MILLIS);
+    softly.assertThat(result.getTime())
+        .as("the elapsed time counts the fallback the collection sent")
+        .isGreaterThanOrEqualTo(collectionMillis - CLOCK_TOLERANCE_MILLIS);
+    softly.assertThat(result.getTime())
+        .as("and not the %d ms the request waited to be collected", COLLECTED_LATE_BY_MILLIS)
+        .isLessThanOrEqualTo(firstAttemptMillis + collectionMillis + CLOCK_TOLERANCE_MILLIS);
+    softly.assertAll();
+  }
+
+  /**
+   * Answers HTTP/1.1 by hand. Every connection is held for {@link #FAILED_FALLBACK_MILLIS} and then
+   * closed without a response, so a request sent to it fails that long after it went out - except,
+   * when {@code refuseFirstUpgrade}, the first one, which gets a 426 refusing the h2c upgrade.
+   */
+  private static final class StallingServer implements AutoCloseable {
+
+    private final ServerSocket socket;
+    private final Thread acceptor;
+
+    private StallingServer(boolean refuseFirstUpgrade) throws IOException {
+      socket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+      acceptor = new Thread(() -> {
+        boolean refuseNext = refuseFirstUpgrade;
+        while (!socket.isClosed()) {
+          try {
+            Socket connection = socket.accept();
+            boolean refuse = refuseNext;
+            refuseNext = false;
+            Thread handler = new Thread(() -> serve(connection, refuse), "stalling-server-conn");
+            handler.setDaemon(true);
+            handler.start();
+          } catch (IOException closed) {
+            return;
+          }
+        }
+      }, "stalling-server");
+      acceptor.setDaemon(true);
+      acceptor.start();
+    }
+
+    private static void serve(Socket connection, boolean refuseUpgrade) {
+      try (Socket s = connection) {
+        readRequestHead(s.getInputStream());
+        if (refuseUpgrade) {
+          s.getOutputStream().write(("HTTP/1.1 426 Upgrade Required\r\n"
+              + "Content-Length: 0\r\nConnection: close\r\n\r\n")
+              .getBytes(StandardCharsets.US_ASCII));
+          s.getOutputStream().flush();
+        } else {
+          Thread.sleep(FAILED_FALLBACK_MILLIS);
+        }
+      } catch (IOException | InterruptedException ignored) {
+        // The connection is closed either way, which is all the request gets.
+      }
+    }
+
+    private static void readRequestHead(InputStream in) throws IOException {
+      int matched = 0;
+      byte[] end = {'\r', '\n', '\r', '\n'};
+      int b;
+      while (matched < end.length && (b = in.read()) != -1) {
+        matched = b == end[matched] ? matched + 1 : (b == '\r' ? 1 : 0);
+      }
+    }
+
+    private int port() {
+      return socket.getLocalPort();
+    }
+
+    private String url() {
+      return "http://127.0.0.1:" + port() + "/";
+    }
+
+    @Override
+    public void close() throws IOException {
+      socket.close();
+    }
   }
 
   private HTTP2JettyClient mockClient() {

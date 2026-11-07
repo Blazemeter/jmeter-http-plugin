@@ -29,6 +29,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -95,11 +96,11 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   /** How often the concurrent embedded-resources drain checks a pending request for completion. */
   private static final long EMBEDDED_POLL_INTERVAL_MILLIS = 10;
   /**
-   * How far before a sample's start an instant translated onto its clock can land and still be the
-   * same instant: each translation reads two clocks separately and truncates both to whole
-   * milliseconds (see SampleClock). Anything further back is not this request's completion.
+   * How far before a sample's start the end of an async failure can land and still belong to it:
+   * the start and the queue wait subtracted from the end are each truncated to whole milliseconds
+   * on their own. Anything further back is not this request's failure.
    */
-  private static final long CLOCK_TRANSLATION_TOLERANCE_MILLIS = 2;
+  private static final long END_TRUNCATION_TOLERANCE_MILLIS = 2;
 
   private static final String HTTP1_UPGRADE_PROPERTY = "HTTP2Sampler.http1_upgrade";
   private static final String PROFILE_PROPERTY = "HTTP2Sampler.profile";
@@ -411,9 +412,11 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     // still needs the same object (cookies / request headers already applied) for errorResult —
     // otherwise connect failures rebuild a blank result and assertions on "Cookie Data:" fail.
     HTTPSampleResult preparedResult = null;
-    // The listener of the exchange this turn collects. The finally below drops the field before the
-    // catch runs, and the catch still needs it to end an error result when the request failed.
+    // The listener of the exchange this turn collects, and when the collection began. The finally
+    // below drops the field before the catch runs, and the catch still needs both to end an error
+    // result when the request failed.
     HTTP2FutureResponseListener collectedListener = null;
+    OptionalLong collectionStartNanos = OptionalLong.empty();
     try {
       HTTP2JettyClient client = clientFactory.call();
       LOG.trace("=== Client obtained, proceeding with request ===");
@@ -441,6 +444,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
           // If there is a listener, it is processed using the result it had
           preparedResult = this.result;
           collectedListener = this.asyncListener;
+          collectionStartNanos = OptionalLong.of(System.nanoTime());
           try {
             int completionDepth = depth > 0 ? depth : pendingCompletionDepth;
             this.result = sampleFromListener(
@@ -477,7 +481,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       return buildErrorResult(e, resolveErrorResult(preparedResult, url, method),
-          collectedListener);
+          collectedListener, collectionStartNanos);
     } catch (Exception e) {
       logSampleFailure(e);
 
@@ -531,15 +535,11 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
           } catch (Exception fallbackException) {
             LOG.error("Failed to attempt HTTP/1.1 fallback", fallbackException);
           }
-          if (collectedListener != null) {
-            // The request went out again and failed again: the sample ends now, with that attempt.
-            collectedListener.endAtFailedRetry();
-          }
         }
       }
 
       return buildErrorResult(e, resolveErrorResult(preparedResult, url, method),
-          collectedListener);
+          collectedListener, collectionStartNanos);
     }
   }
 
@@ -593,27 +593,51 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   }
 
   /**
-   * @param collectedListener the listener of the async exchange this turn collected, or
-   *     {@code null}: when the request failed on the wire, it ends the sample at the failure, not
-   *     at the turn that collected it, which can come long after, behind slower requests queued
-   *     ahead of it in the async controller
+   * Ends an error result that is not ended yet when it is built: now, less the time an async
+   * request waited to be collected.
+   *
+   * <p>A failed async request is collected on a later turn, behind the slower requests queued ahead
+   * of it in the async controller, possibly long after it failed - and that wait is not the
+   * request's time. What the collection does after it is: the client may send the request again
+   * (a GOAWAY retry, the HTTP/1.1 fallbacks, ...) and only give up once those attempts fail too.
+   * Subtracting the wait, rather than ending at the failure the listener recorded, counts those
+   * attempts without every path that makes one having to report it.
+   *
+   * @param collectedListener   the listener of the async exchange this turn collected, or
+   *                            {@code null}
+   * @param collectionStartNanos when this turn began collecting it, or empty when the failure came
+   *                            before any collection began
    */
   private HTTPSampleResult buildErrorResult(Exception e, HTTPSampleResult result,
-                                            HTTP2FutureResponseListener collectedListener) {
+                                            HTTP2FutureResponseListener collectedListener,
+                                            OptionalLong collectionStartNanos) {
     if (result.getStartTime() == 0) {
       result.sampleStart();
     }
     if (result.getEndTime() == 0) {
-      // On this result's own clock: its start came from sampleStart(), and the listener records the
-      // exchange on the wall clock. See SampleClock.
       HTTP2FutureResponseListener listener =
           collectedListener != null ? collectedListener : this.asyncListener;
-      long responseEnd = Objects.isNull(listener) ? 0 : listener.getResponseEndOn(result);
-      long start = result.getStartTime();
-      if (responseEnd > 0 && responseEnd >= start - CLOCK_TRANSLATION_TOLERANCE_MILLIS) {
-        // A failure within a millisecond of the start can translate to just before it; that is the
-        // translation, not the request, so it ends at the start rather than at the collection.
-        result.setEndTime(Math.max(responseEnd, start));
+      OptionalLong exchangeEndNanos =
+          Objects.isNull(listener) ? OptionalLong.empty() : listener.getResponseEndNanos();
+      if (exchangeEndNanos.isPresent()) {
+        // Monotonic readings for the wait, subtracted from this result's own clock: no reading is
+        // carried from one clock to the other. See SampleClock.
+        long collectedAt = collectionStartNanos.isPresent()
+            ? collectionStartNanos.getAsLong()
+            : System.nanoTime();
+        // None when the exchange completed only after its collection began: waiting for it then
+        // was waiting for the request.
+        long queueWaitMillis = Math.max(0,
+            TimeUnit.NANOSECONDS.toMillis(collectedAt - exchangeEndNanos.getAsLong()));
+        long end = result.currentTimeInMillis() - queueWaitMillis;
+        long start = result.getStartTime();
+        if (end >= start - END_TRUNCATION_TOLERANCE_MILLIS) {
+          // A failure within a millisecond of the start can land just before it once both are
+          // truncated; that is the truncation, not the request.
+          result.setEndTime(Math.max(end, start));
+        } else {
+          result.sampleEnd();
+        }
       } else {
         result.sampleEnd();
       }
