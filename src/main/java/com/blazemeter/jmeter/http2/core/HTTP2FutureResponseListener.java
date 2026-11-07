@@ -138,6 +138,16 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
   }
 
   /**
+   * The {@link System#nanoTime()} reading of when the exchange completed, empty while it has not.
+   * For measuring how long a completed exchange waited before someone read it. See
+   * {@link #getResponseStartNanos()}.
+   */
+  public OptionalLong getResponseEndNanos() {
+    Stamp stamp = this.responseEndStamp;
+    return stamp == null ? OptionalLong.empty() : OptionalLong.of(stamp.nanoTime);
+  }
+
+  /**
    * When the request went out, on {@code result}'s own clock, or 0 when that was never recorded.
    *
    * <p>This, and never {@link #getResponseStart()}, is what a {@link SampleResult} must be stamped
