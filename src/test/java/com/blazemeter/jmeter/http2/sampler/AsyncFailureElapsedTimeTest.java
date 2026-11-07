@@ -12,6 +12,7 @@ import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClientTestIsolation;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
+import com.blazemeter.jmeter.http2.core.RequestsSentByThread;
 import com.blazemeter.jmeter.http2.core.SampleClock;
 import java.io.IOException;
 import java.io.InputStream;
@@ -136,6 +137,9 @@ public class AsyncFailureElapsedTimeTest extends HTTP2TestBase {
         .as("the elapsed time does not include the wait to be collected")
         .isLessThan(COLLECTED_LATE_BY_MILLIS);
     softly.assertThat(result.getTime()).as("and is not negative").isNotNegative();
+    softly.assertThat(result.getIdleTime())
+        .as("nothing was sent again, so the sample simply ends at the failure, with no idle time")
+        .isZero();
     softly.assertAll();
   }
 
@@ -156,6 +160,8 @@ public class AsyncFailureElapsedTimeTest extends HTTP2TestBase {
         .thenThrow(new ExecutionException(new ProtocolErrorException("protocol_error")));
     when(client.isProtocolErrorFallbackEnabled()).thenReturn(true);
     when(client.retryWithHTTP11Only(any(), any())).thenAnswer(invocation -> {
+      // What the real client's request listener records when the fallback goes out.
+      RequestsSentByThread.recordSent();
       Thread.sleep(FAILED_FALLBACK_MILLIS);
       throw new IOException("the HTTP/1.1 fallback failed too");
     });
@@ -264,6 +270,7 @@ public class AsyncFailureElapsedTimeTest extends HTTP2TestBase {
     HTTPSampleResult result = sampler.sample(url, HTTPConstants.GET, false, 0);
     long collectionMillis =
         TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - collectionStartedAt);
+    long collectionEndedAt = System.currentTimeMillis();
 
     SoftAssertions softly = new SoftAssertions();
     softly.assertThat(result.isSuccessful()).as("every attempt failed").isFalse();
@@ -276,6 +283,17 @@ public class AsyncFailureElapsedTimeTest extends HTTP2TestBase {
     softly.assertThat(result.getTime())
         .as("and not the %d ms the request waited to be collected", COLLECTED_LATE_BY_MILLIS)
         .isLessThanOrEqualTo(firstAttemptMillis + collectionMillis + CLOCK_TOLERANCE_MILLIS);
+    // The end is read by whoever spans several samples - the async controller's parent sample ends
+    // at its latest child end - so it must be when the fallback really failed, not an end moved
+    // back to make the elapsed time come out right.
+    softly.assertThat(SampleClock.toWallClock(result, result.getEndTime()))
+        .as("the sample ends when the fallback failed")
+        .isBetween(collectionEndedAt - collectionMillis - CLOCK_TOLERANCE_MILLIS
+                + FAILED_FALLBACK_MILLIS,
+            collectionEndedAt + CLOCK_TOLERANCE_MILLIS);
+    softly.assertThat(result.getIdleTime())
+        .as("and the wait to be collected is held as idle time, which JMeter leaves out")
+        .isGreaterThanOrEqualTo(COLLECTED_LATE_BY_MILLIS - CLOCK_TOLERANCE_MILLIS);
     softly.assertAll();
   }
 

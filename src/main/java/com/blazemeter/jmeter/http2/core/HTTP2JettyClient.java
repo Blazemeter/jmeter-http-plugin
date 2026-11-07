@@ -699,6 +699,10 @@ public class HTTP2JettyClient {
     this.httpClientHttp1Only.setName(name + "-http1");
     this.httpClientH2cPrior.setName(name + "-h2c");
     this.httpClientH2cUpgrade.setName(name + "-h2c-upgrade");
+    // Every request any of these clients sends - the first attempt and each one sent again - so the
+    // sampler can tell whether collecting a failed request sent it again.
+    forEachHttpClient(client -> client.getRequestListeners()
+        .addQueuedListener(request -> RequestsSentByThread.recordSent()));
   }
 
   public HTTP2JettyClient() {
@@ -1347,46 +1351,6 @@ public class HTTP2JettyClient {
       CustomWwwAuthenticationProtocolHandler.install(httpClientH2cUpgrade);
       lowLevelDebug("HttpClient (H2C upgrade) started successfully");
     }
-  }
-
-  /**
-   * Creates a new HttpClient configured with only HTTP/1.1 (no HTTP/2) for fallback scenarios.
-   * This is used when protocol_error is detected and we need to retry with HTTP/1.1 only.
-   *
-   * @param name Name for the HttpClient
-   * @return A new HttpClient configured for HTTP/1.1 only
-   */
-  private HttpClient createHTTP11OnlyClient(String name) throws Exception {
-    lowLevelDebug("Creating HTTP/1.1-only client for fallback");
-
-    ClientConnector clientConnector = createClientConnector(name + "-http11-fallback");
-
-    // Create transport with ONLY HTTP/1.1 (no HTTP/2)
-    ClientConnectionFactory.Info http11 = HttpClientConnectionFactory.HTTP11;
-    HttpClientTransport transport =
-        new RecordingHttpClientTransportDynamic(clientConnector, http11);
-    lowLevelDebug("HttpClientTransportDynamic configured with HTTP/1.1 only (fallback mode)");
-
-    HttpClient http11Client = new HttpClient(transport);
-    http11Client.setUserAgentField(null);
-    http11Client.setMaxRequestsQueuedPerDestination(maxRequestsQueuedPerDestination);
-    http11Client.setMaxConnectionsPerDestination(maxConnectionsPerDestination);
-    http11Client.setStrictEventOrdering(strictEventOrdering);
-    if (removeIdleDestinations) {
-      http11Client.setDestinationIdleTimeout(idleTimeout);
-    }
-    http11Client.setIdleTimeout(idleTimeout);
-    http11Client.setName(name + "-http11-fallback");
-
-    // Start the client
-    if (!http11Client.isStarted()) {
-      blockServiceLoaderDecoders(http11Client);
-      http11Client.start();
-      CustomWwwAuthenticationProtocolHandler.install(http11Client);
-      lowLevelDebug("HTTP/1.1-only fallback client started");
-    }
-
-    return http11Client;
   }
 
   /**

@@ -9,6 +9,7 @@ import com.blazemeter.jmeter.http2.core.HpackFailureDetector;
 import com.blazemeter.jmeter.http2.core.JMeterSourceAddressResolver;
 import com.blazemeter.jmeter.http2.core.JmeterHttpClientExceptionMapper;
 import com.blazemeter.jmeter.http2.core.ProtocolErrorException;
+import com.blazemeter.jmeter.http2.core.RequestsSentByThread;
 import com.blazemeter.jmeter.http2.core.SampleClock;
 import com.blazemeter.jmeter.http2.util.BzmHttpPluginProperties;
 import com.blazemeter.jmeter.http2.util.Rfc9110Redirects;
@@ -96,11 +97,11 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   /** How often the concurrent embedded-resources drain checks a pending request for completion. */
   private static final long EMBEDDED_POLL_INTERVAL_MILLIS = 10;
   /**
-   * How far before a sample's start the end of an async failure can land and still belong to it:
-   * the start and the queue wait subtracted from the end are each truncated to whole milliseconds
-   * on their own. Anything further back is not this request's failure.
+   * How far before a sample's start an instant translated onto its clock can land and still be the
+   * same instant: each translation reads two clocks separately and truncates both to whole
+   * milliseconds (see SampleClock). Anything further back is not this request's completion.
    */
-  private static final long END_TRUNCATION_TOLERANCE_MILLIS = 2;
+  private static final long CLOCK_TRANSLATION_TOLERANCE_MILLIS = 2;
 
   private static final String HTTP1_UPGRADE_PROPERTY = "HTTP2Sampler.http1_upgrade";
   private static final String PROFILE_PROPERTY = "HTTP2Sampler.profile";
@@ -417,6 +418,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     // result when the request failed.
     HTTP2FutureResponseListener collectedListener = null;
     OptionalLong collectionStartNanos = OptionalLong.empty();
+    long sentBeforeCollection = 0;
     try {
       HTTP2JettyClient client = clientFactory.call();
       LOG.trace("=== Client obtained, proceeding with request ===");
@@ -445,6 +447,7 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
           preparedResult = this.result;
           collectedListener = this.asyncListener;
           collectionStartNanos = OptionalLong.of(System.nanoTime());
+          sentBeforeCollection = RequestsSentByThread.current();
           try {
             int completionDepth = depth > 0 ? depth : pendingCompletionDepth;
             this.result = sampleFromListener(
@@ -481,7 +484,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       return buildErrorResult(e, resolveErrorResult(preparedResult, url, method),
-          collectedListener, collectionStartNanos);
+          collectedListener, collectionStartNanos,
+          sentAgainSince(collectionStartNanos, sentBeforeCollection));
     } catch (Exception e) {
       logSampleFailure(e);
 
@@ -539,7 +543,8 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
       }
 
       return buildErrorResult(e, resolveErrorResult(preparedResult, url, method),
-          collectedListener, collectionStartNanos);
+          collectedListener, collectionStartNanos,
+          sentAgainSince(collectionStartNanos, sentBeforeCollection));
     }
   }
 
@@ -593,59 +598,93 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
   }
 
   /**
-   * Ends an error result that is not ended yet when it is built: now, less the time an async
-   * request waited to be collected.
-   *
-   * <p>A failed async request is collected on a later turn, behind the slower requests queued ahead
-   * of it in the async controller, possibly long after it failed - and that wait is not the
-   * request's time. What the collection does after it is: the client may send the request again
-   * (a GOAWAY retry, the HTTP/1.1 fallbacks, ...) and only give up once those attempts fail too.
-   * Subtracting the wait, rather than ending at the failure the listener recorded, counts those
-   * attempts without every path that makes one having to report it.
-   *
    * @param collectedListener   the listener of the async exchange this turn collected, or
    *                            {@code null}
    * @param collectionStartNanos when this turn began collecting it, or empty when the failure came
    *                            before any collection began
+   * @param sentAgain           whether collecting it sent the request again
+   * @see #endFailedResult
    */
   private HTTPSampleResult buildErrorResult(Exception e, HTTPSampleResult result,
                                             HTTP2FutureResponseListener collectedListener,
-                                            OptionalLong collectionStartNanos) {
+                                            OptionalLong collectionStartNanos,
+                                            boolean sentAgain) {
     if (result.getStartTime() == 0) {
       result.sampleStart();
     }
     if (result.getEndTime() == 0) {
-      HTTP2FutureResponseListener listener =
-          collectedListener != null ? collectedListener : this.asyncListener;
-      OptionalLong exchangeEndNanos =
-          Objects.isNull(listener) ? OptionalLong.empty() : listener.getResponseEndNanos();
-      if (exchangeEndNanos.isPresent()) {
-        // Monotonic readings for the wait, subtracted from this result's own clock: no reading is
-        // carried from one clock to the other. See SampleClock.
-        long collectedAt = collectionStartNanos.isPresent()
-            ? collectionStartNanos.getAsLong()
-            : System.nanoTime();
-        // None when the exchange completed only after its collection began: waiting for it then
-        // was waiting for the request.
-        long queueWaitMillis = Math.max(0,
-            TimeUnit.NANOSECONDS.toMillis(collectedAt - exchangeEndNanos.getAsLong()));
-        long end = result.currentTimeInMillis() - queueWaitMillis;
-        long start = result.getStartTime();
-        if (end >= start - END_TRUNCATION_TOLERANCE_MILLIS) {
-          // A failure within a millisecond of the start can land just before it once both are
-          // truncated; that is the truncation, not the request.
-          result.setEndTime(Math.max(end, start));
-        } else {
-          result.sampleEnd();
-        }
-      } else {
-        result.sampleEnd();
-      }
+      endFailedResult(result,
+          collectedListener != null ? collectedListener : this.asyncListener,
+          collectionStartNanos, sentAgain);
     }
     Throwable failure =
         JmeterHttpClientExceptionMapper.forSampleResult(e, getAutoRedirects(), result.getURL());
     attachConnectAttempts(failure, result);
     return errorResult(failure, result);
+  }
+
+  /** Whether the current thread sent any request since a collection that began, if one did. */
+  private static boolean sentAgainSince(OptionalLong collectionStartNanos, long sentBefore) {
+    return collectionStartNanos.isPresent() && RequestsSentByThread.current() != sentBefore;
+  }
+
+  /**
+   * Ends a failed result when the request really failed, and keeps the time it waited to be
+   * collected out of its elapsed time.
+   *
+   * <p>A failed async request is collected on a later turn, behind the slower requests queued ahead
+   * of it in the async controller, possibly long after it failed - and that wait is not the
+   * request's time. What the collection does after it may be: the client can send the request
+   * again (a GOAWAY retry, the HTTP/1.1 fallbacks, ...) and only give up once those attempts fail
+   * too. So:
+   * <ul>
+   *   <li>When nothing was sent again, the result ends when the exchange did.</li>
+   *   <li>Otherwise it ends now, when the last attempt failed, and the wait goes into
+   *   {@code idleTime} - the field JMeter subtracts from {@code end - start}, and the one
+   *   {@code HTTP2Controller} keeps a parent's pauses in. Moving the end back by the wait instead
+   *   gave the same elapsed time but an end that never happened, and the controller, which spans
+   *   its parent sample up to the latest child end, reported the parent short by it.</li>
+   * </ul>
+   * Whether anything was sent again comes from {@link RequestsSentByThread}, which counts every
+   * request the collecting thread sends, rather than from each path that sends one having to
+   * report it. How long the collection took cannot tell: the failure path's own logging alone can
+   * take longer than a retry to a refused port.
+   */
+  private static void endFailedResult(HTTPSampleResult result,
+                                      HTTP2FutureResponseListener listener,
+                                      OptionalLong collectionStartNanos, boolean sentAgain) {
+    OptionalLong exchangeEndNanos =
+        listener == null ? OptionalLong.empty() : listener.getResponseEndNanos();
+    if (!exchangeEndNanos.isPresent()) {
+      result.sampleEnd();
+      return;
+    }
+    long start = result.getStartTime();
+    if (!sentAgain) {
+      // On this result's own clock: its start came from sampleStart(), and the listener records
+      // the exchange on the wall clock. See SampleClock.
+      long exchangeEnd = listener.getResponseEndOn(result);
+      if (exchangeEnd >= start - CLOCK_TRANSLATION_TOLERANCE_MILLIS) {
+        // A failure within a millisecond of the start can translate to just before it; that is
+        // the translation, not the request.
+        result.setEndTime(Math.max(exchangeEnd, start));
+      } else {
+        result.sampleEnd();
+      }
+      return;
+    }
+    // Something was sent again, so a collection began: the turn that collects is the one that
+    // sends again. None when the exchange completed only after the collection began: waiting for
+    // it then was waiting for the request.
+    long collectedAt = collectionStartNanos.orElseGet(System::nanoTime);
+    long queueWaitMillis =
+        Math.max(0, TimeUnit.NANOSECONDS.toMillis(collectedAt - exchangeEndNanos.getAsLong()));
+    long end = result.currentTimeInMillis();
+    // setEndTime computes elapsed = end - start - idle, so the idle time has to be in first; and
+    // never more than the whole interval, which the truncation of each reading could otherwise make
+    // it by a millisecond.
+    result.setIdleTime(result.getIdleTime() + Math.min(queueWaitMillis, Math.max(0, end - start)));
+    result.setEndTime(end);
   }
 
   /**
