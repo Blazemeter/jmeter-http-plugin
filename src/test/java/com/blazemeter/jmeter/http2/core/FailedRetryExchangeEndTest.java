@@ -8,6 +8,7 @@ import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.net.URL;
+import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.ExecutionException;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
@@ -19,7 +20,7 @@ import org.junit.Test;
 
 /**
  * When collecting an async request finds it failed, the client may send it again (a GOAWAY retry,
- * an HTTP/1.1 fallback). If that fails too, the exchange ended when the last attempt failed, and
+ * an HTTP/1.1 fallback), either while waiting for the response or once the wait has failed. If that fails too, the exchange ended when the last attempt failed, and
  * the listener the sample is ended from has to say so: its own completion is the first attempt's,
  * and a sample ended there leaves out every attempt made after it.
  */
@@ -42,6 +43,26 @@ public class FailedRetryExchangeEndTest extends HTTP2TestBase {
 
   @Test
   public void failedFallbackMustMoveTheExchangeEndToWhenItFailed() throws Exception {
+    assertExchangeEndsWhenTheFallbackFailed(new ProtocolErrorException("protocol_error"));
+  }
+
+  /**
+   * A connection closed under the request is retried over HTTP/1.1 while waiting for the response,
+   * before the collection's own retries are considered - and the failure that reaches them is the
+   * original one, which none of them retries. Without a message, so that it is not mistaken for a
+   * protocol error and the wait's fallback is the only one taken.
+   */
+  @Test
+  public void failedFallbackAfterAClosedChannelMustMoveTheExchangeEndToWhenItFailed()
+      throws Exception {
+    assertExchangeEndsWhenTheFallbackFailed(new ClosedChannelException());
+  }
+
+  /**
+   * The first attempt fails with {@code firstFailure}, an error the client retries over HTTP/1.1,
+   * and that retry fails too: nothing listens on the port.
+   */
+  private void assertExchangeEndsWhenTheFallbackFailed(Throwable firstFailure) throws Exception {
     int closedPort;
     try (ServerSocket socket = new ServerSocket(0)) {
       closedPort = socket.getLocalPort();
@@ -57,9 +78,7 @@ public class FailedRetryExchangeEndTest extends HTTP2TestBase {
     HTTP2FutureResponseListener listener = new HTTP2FutureResponseListener();
     Request request = probeClient.newRequest(URI.create(url.toString()));
     listener.setRequest(request);
-    // The first attempt fails with an error the client retries over HTTP/1.1, which then fails
-    // too: nothing listens on the port.
-    listener.onComplete(new Result(request, new ProtocolErrorException("protocol_error"), null));
+    listener.onComplete(new Result(request, firstFailure, null));
     long firstAttemptEnd = listener.getResponseEnd();
     Thread.sleep(COLLECTED_AFTER_MILLIS);
 

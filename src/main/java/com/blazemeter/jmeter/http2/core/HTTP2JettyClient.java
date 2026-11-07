@@ -2635,11 +2635,16 @@ public class HTTP2JettyClient {
         LOG.debug("Request failed after {}ms with ExecutionException", elapsed, e);
       }
 
+      // Whether the request went out again after it failed. When every attempt fails, the original
+      // failure is what gets thrown, and the listener still holds when that first attempt ended:
+      // it has to end when the last attempt did, or the sample leaves those attempts out.
+      boolean retried = false;
       // Check if the cause is a ProtocolErrorException
       RetryableRequestException retryable =
           findRetryableRequestException(cause != null ? cause : e);
       if (retryable != null && goawayRetryEnabled && maxGoawayRetries > 0
           && originalRequest != null) {
+        retried = true;
         LOG.warn("RetryableRequestException detected (likely GOAWAY): {}",
             retryable.getMessage());
         try {
@@ -2669,6 +2674,7 @@ public class HTTP2JettyClient {
         if (originalRequest != null && enableHttp1) {
           lowLevelDebug("Original request available, attempting HTTP/1.1 fallback for URI: {}",
               originalRequest.getURI());
+          retried = true;
           try {
             lowLevelDebug("Falling back to HTTP/1.1 for URI: {}", originalRequest.getURI());
             ContentResponse fallbackResponse = sendWithHTTP11Only(originalRequest, listener);
@@ -2677,6 +2683,7 @@ public class HTTP2JettyClient {
             return fallbackResponse;
           } catch (Exception fallbackException) {
             LOG.error("HTTP/1.1 fallback also failed", fallbackException);
+            endAtFailedRetry(listener, retried);
             // Re-throw the original protocol_error, not the fallback exception
             throw e;
           }
@@ -2696,6 +2703,7 @@ public class HTTP2JettyClient {
         LOG.warn("HTTP/3 connect timeout detected; marking origin as broken and retrying "
             + "without HTTP/3");
         markHttp3Broken(originalRequest.getURI());
+        retried = true;
         try {
           ContentResponse fallbackResponse = sendWithHttp2Only(originalRequest);
           lowLevelDebug("HTTP/2 fallback succeeded: status={}, version={}",
@@ -2705,12 +2713,20 @@ public class HTTP2JettyClient {
           LOG.error("HTTP/2 fallback after HTTP/3 timeout failed", fallbackException);
         }
       }
+      endAtFailedRetry(listener, retried);
       if (e.getCause() != null && e.getCause() instanceof TimeoutException) {
         throw (TimeoutException) e.getCause();
       } else if (e.getCause() != null && e.getCause() instanceof IllegalArgumentException) {
         throw (IllegalArgumentException) e.getCause();
       }
       throw e;
+    }
+  }
+
+  /** See {@link HTTP2FutureResponseListener#endAtFailedRetry()}. */
+  private static void endAtFailedRetry(HTTP2FutureResponseListener listener, boolean retried) {
+    if (retried && listener != null) {
+      listener.endAtFailedRetry();
     }
   }
 
