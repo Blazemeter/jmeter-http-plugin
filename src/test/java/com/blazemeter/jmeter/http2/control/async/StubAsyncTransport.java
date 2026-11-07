@@ -9,9 +9,11 @@ import static org.mockito.Mockito.when;
 
 import com.blazemeter.jmeter.http2.core.HTTP2FutureResponseListener;
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
+import com.blazemeter.jmeter.http2.core.RequestsSentByThread;
 import com.blazemeter.jmeter.http2.core.SampleClock;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
 import java.io.Closeable;
+import java.io.IOException;
 import java.net.ConnectException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -20,6 +22,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -64,6 +67,14 @@ public final class StubAsyncTransport implements Closeable {
       // Production async path goes through dispatchAsync (HTTP/3 race); sampleAsync alone is no
       // longer what HTTP2Sampler calls on the first pass.
       when(client.dispatchAsync(any(), any(), any())).thenAnswer(invocation -> {
+        HTTP2Sampler dispatched = invocation.getArgument(0);
+        if (spec(dispatched.getName()).failure == Failure.RETRY_FAILS) {
+          // The real client starts the sample at dispatch. The other modes leave it to the
+          // completion, which stamps the whole interval at once; this one never completes the
+          // sample, so the error result needs the start the real client would have given it.
+          HTTPSampleResult result = invocation.getArgument(1);
+          result.sampleStart();
+        }
         Request request = onDispatch(invocation.getArgument(0), invocation.getArgument(2));
         // Same second step as HTTP2JettyClient.dispatchAsync: fire the listener (or throw when
         // the stub is configured with SEND_THROWS).
@@ -92,6 +103,7 @@ public final class StubAsyncTransport implements Closeable {
     private boolean success = true;
     private long latencyMillis = 40;
     private Failure failure = Failure.NONE;
+    private long retryMillis;
     private int clientFactoryFailsFromCall;
 
     private ResponseSpec(String uri) {
@@ -136,6 +148,13 @@ public final class StubAsyncTransport implements Closeable {
       return this;
     }
 
+    /** {@link Failure#RETRY_FAILS}, with the retry taking {@code millis} to fail. */
+    public ResponseSpec retryFailsAfter(long millis) {
+      this.failure = Failure.RETRY_FAILS;
+      this.retryMillis = millis;
+      return this;
+    }
+
     /**
      * Makes the sampler's client factory throw from the n-th call on. Call 1 is the async dispatch
      * pass and call 2 the completion pass, so {@code 2} reproduces a client that becomes
@@ -156,7 +175,12 @@ public final class StubAsyncTransport implements Closeable {
     /** {@code request.send(listener)} throws, e.g. connection refused at dispatch time. */
     SEND_THROWS,
     /** The request is accepted but its listener is never completed, e.g. a dropped connection. */
-    NEVER_COMPLETES
+    NEVER_COMPLETES,
+    /**
+     * The request fails after its latency, and collecting it sends it again (a GOAWAY retry, an
+     * HTTP/1.1 fallback), which fails too after {@link ResponseSpec#retryMillis}.
+     */
+    RETRY_FAILS
   }
 
   public HTTP2JettyClient client() {
@@ -250,13 +274,21 @@ public final class StubAsyncTransport implements Closeable {
 
   private HTTPSampleResult onCompletion(HTTP2Sampler sampler, HTTPSampleResult result,
                                         HTTP2FutureResponseListener listener)
-      throws TimeoutException {
+      throws TimeoutException, InterruptedException, ExecutionException {
     if (listener.isCancelled() || !listener.isDone()) {
       // Mirrors the real client: sampleFromListener goes through listener.get(timeout), which throws
       // rather than inventing a response when the exchange never completed or was aborted.
       throw new TimeoutException("stub transport: no response for " + sampler.getName());
     }
     ResponseSpec spec = spec(sampler.getName());
+    if (spec.failure == Failure.RETRY_FAILS) {
+      // The real client sends the request again from here, on the collecting thread - which its
+      // request listener counts - and throws the original failure once that attempt fails too.
+      RequestsSentByThread.recordSent();
+      Thread.sleep(spec.retryMillis);
+      throw new ExecutionException(
+          new IOException("stub transport: request and its retry failed for " + sampler.getName()));
+    }
     // On this result's own clock, like the real client: a SampleResult keeps a nano-derived clock of
     // its own by default, so stamping children with System.currentTimeMillis() readings would put
     // every child's times a clock offset away from the transaction's. See SampleClock.
