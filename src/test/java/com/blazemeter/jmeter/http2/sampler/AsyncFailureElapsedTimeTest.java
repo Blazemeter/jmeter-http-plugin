@@ -176,6 +176,92 @@ public class AsyncFailureElapsedTimeTest extends HTTP2TestBase {
         .isGreaterThanOrEqualTo(FAILED_FALLBACK_MILLIS - CLOCK_TOLERANCE_MILLIS);
   }
 
+  /**
+   * The client's HTTP/1.1 fallback, sent while collecting, gets an HTTP error back: the response
+   * ends the result, and the client still rethrows the first attempt's failure. The end the
+   * response set must not carry the wait to be collected into the elapsed time.
+   */
+  @Test
+  public void fallbackAnsweredWithAnHttpErrorWhileCollectingMustLeaveOutTheQueueWait()
+      throws Exception {
+    HTTP2JettyClient client = mockClientFailingAtOnceWithAProtocolError();
+    when(client.sampleFromListener(any(), any(), anyBoolean(), anyInt(), any()))
+        .thenAnswer(invocation -> {
+          answerFallbackWithHttpError(invocation.getArgument(1));
+          throw new ExecutionException(new ProtocolErrorException("protocol_error"));
+        });
+    assertHttpErrorFallbackTimeCountedAndQueueWaitLeftOut();
+  }
+
+  /** The same, with the HTTP/1.1 fallback the sampler sends itself once the client gives up. */
+  @Test
+  public void samplerFallbackAnsweredWithAnHttpErrorMustLeaveOutTheQueueWait() throws Exception {
+    HTTP2JettyClient client = mockClientFailingAtOnceWithAProtocolError();
+    when(client.sampleFromListener(any(), any(), anyBoolean(), anyInt(), any()))
+        .thenThrow(new ExecutionException(new ProtocolErrorException("protocol_error")));
+    when(client.isProtocolErrorFallbackEnabled()).thenReturn(true);
+    when(client.retryWithHTTP11Only(any(), any())).thenAnswer(invocation -> {
+      HTTPSampleResult result = invocation.getArgument(1);
+      answerFallbackWithHttpError(result);
+      return result;
+    });
+    assertHttpErrorFallbackTimeCountedAndQueueWaitLeftOut();
+  }
+
+  private HTTP2JettyClient mockClientFailingAtOnceWithAProtocolError() throws Exception {
+    HTTP2JettyClient client = mockClient();
+    when(client.dispatchAsync(any(), any(), any())).thenAnswer(invocation -> {
+      HTTPSampleResult dispatched = invocation.getArgument(1);
+      HTTP2FutureResponseListener listener = invocation.getArgument(2);
+      dispatched.sampleStart();
+      Request request = mock(Request.class);
+      listener.setRequest(request);
+      listener.onComplete(new Result(request, new ProtocolErrorException("protocol_error"), null));
+      return request;
+    });
+    return client;
+  }
+
+  /**
+   * What the real client does with a fallback that gets an HTTP error: the request listener counts
+   * it, and the response sets the result's code and ends it, as {@code postContentResponse} does.
+   */
+  private static void answerFallbackWithHttpError(HTTPSampleResult result)
+      throws InterruptedException {
+    RequestsSentByThread.recordSent();
+    Thread.sleep(FAILED_FALLBACK_MILLIS);
+    result.setResponseCode("500");
+    result.setSuccessful(false);
+    result.sampleEnd();
+  }
+
+  private void assertHttpErrorFallbackTimeCountedAndQueueWaitLeftOut() throws Exception {
+    URL url = new URL("https://example.com/");
+    assertThat(sampler.sample(url, HTTPConstants.GET, false, 0)).isNull();
+    Thread.sleep(COLLECTED_LATE_BY_MILLIS);
+    long collectionStartedAt = System.nanoTime();
+    HTTPSampleResult result = sampler.sample(url, HTTPConstants.GET, false, 0);
+    long collectionMillis =
+        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - collectionStartedAt);
+    long collectionEndedAt = System.currentTimeMillis();
+
+    SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(result.isSuccessful()).as("the fallback got an HTTP error").isFalse();
+    softly.assertThat(result.getTime())
+        .as("the elapsed time counts the fallback the collection sent")
+        .isGreaterThanOrEqualTo(FAILED_FALLBACK_MILLIS - CLOCK_TOLERANCE_MILLIS);
+    softly.assertThat(result.getTime())
+        .as("and not the %d ms the request waited to be collected", COLLECTED_LATE_BY_MILLIS)
+        .isLessThanOrEqualTo(collectionMillis + CLOCK_TOLERANCE_MILLIS);
+    softly.assertThat(SampleClock.toWallClock(result, result.getEndTime()))
+        .as("the sample keeps the end the fallback's response gave it")
+        .isLessThanOrEqualTo(collectionEndedAt + CLOCK_TOLERANCE_MILLIS);
+    softly.assertThat(result.getIdleTime())
+        .as("and the wait to be collected is held as idle time, which JMeter leaves out")
+        .isGreaterThanOrEqualTo(COLLECTED_LATE_BY_MILLIS - CLOCK_TOLERANCE_MILLIS);
+    softly.assertAll();
+  }
+
   @Test
   public void failureTranslatedJustBeforeTheStartMustNotFallBackToCollectionTime()
       throws Exception {
@@ -308,7 +394,9 @@ public class AsyncFailureElapsedTimeTest extends HTTP2TestBase {
     private final Thread acceptor;
 
     private StallingServer(boolean refuseFirstUpgrade) throws IOException {
-      socket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+      // The address url() and the samplers connect to: the loopback address is ::1 when the JVM
+      // prefers IPv6, and the requests would then be refused instead of reaching this server.
+      socket = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
       acceptor = new Thread(() -> {
         boolean refuseNext = refuseFirstUpgrade;
         while (!socket.isClosed()) {

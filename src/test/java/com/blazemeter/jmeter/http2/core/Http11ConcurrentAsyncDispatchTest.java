@@ -51,8 +51,15 @@ public class Http11ConcurrentAsyncDispatchTest extends HTTP2TestBase {
     JMeterTestUtils.setupJmeterEnv();
   }
 
+  /**
+   * An origin a previous test cached as HTTP/1.1-only, on a recycled port, sends these requests to
+   * the HTTP/1.1-only client, which already took one exchange per connection, and a protocol
+   * property left behind can change the transport: either way the test would pass without the
+   * dynamic transport it is about.
+   */
   @Before
   public void setUp() throws Exception {
+    HTTP2JettyClientTestIsolation.resetSharedClientState();
     server = new Server();
     ServerConnector connector = new ServerConnector(server, new HttpConnectionFactory());
     connector.setHost("127.0.0.1");
