@@ -311,6 +311,10 @@ Common configurations:
 >
 > HTTP/3 is **discovered via Alt-Svc** (and optionally cached), not via ALPN.
 
+> [!NOTE]
+>
+> On HTTP/2 the request authority travels in the `:authority` pseudo-header, which keeps the port written in the URL (`http://host:80/` sends `host:80`). The plugin does not send a `Host` header on HTTP/2, even when a Header Manager sets one, so the two can never disagree (RFC 9113 §8.3.1). This holds for HTTPS, h2c upgrade and h2c prior knowledge. **View Results Tree** still lists `Host` under the request headers; it is not on the wire.
+
 
 <a id="readme-buffer-capacity"></a>
 ### Buffer capacity / response store truncation
