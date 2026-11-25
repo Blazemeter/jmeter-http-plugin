@@ -42,8 +42,9 @@ public class HttpMirrorRawBodyParityTest extends HTTP2TestBase {
 
   @Before
   public void setUp() throws Exception {
-    mirrorPort = HttpMirrorParitySupport.findFreePort();
-    mirrorServer = HttpMirrorParitySupport.startMirrorServer(mirrorPort);
+    HttpMirrorParitySupport.RunningMirror mirror = HttpMirrorParitySupport.startMirrorServer();
+    mirrorServer = mirror.server();
+    mirrorPort = mirror.port();
     client = HttpClient4PluginParitySupport.newHttp1PluginClient("mirror-raw-body");
   }
 

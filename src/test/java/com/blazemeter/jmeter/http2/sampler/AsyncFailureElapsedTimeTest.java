@@ -438,9 +438,14 @@ public class AsyncFailureElapsedTimeTest extends HTTP2TestBase {
     softly.assertThat(collectionMillis)
         .as("the collection sent the request again, and the server stalled it")
         .isGreaterThanOrEqualTo(FAILED_FALLBACK_MILLIS - CLOCK_TOLERANCE_MILLIS);
+    // Held against the stall, not the whole collection: the collection also spends time outside
+    // the sample - handling the first attempt's failure before the fallback goes out, logging it -
+    // and on a loaded runner that alone is more than the clock tolerance (309 ms of elapsed time
+    // against a 320 ms collection was seen in CI). The server holds the fallback that long, so an
+    // elapsed time that left the fallback out still falls far below this.
     softly.assertThat(result.getTime())
         .as("the elapsed time counts the fallback the collection sent")
-        .isGreaterThanOrEqualTo(collectionMillis - CLOCK_TOLERANCE_MILLIS);
+        .isGreaterThanOrEqualTo(FAILED_FALLBACK_MILLIS - CLOCK_TOLERANCE_MILLIS);
     softly.assertThat(result.getTime())
         .as("and not the %d ms the request waited to be collected", COLLECTED_LATE_BY_MILLIS)
         .isLessThanOrEqualTo(firstAttemptMillis + collectionMillis + CLOCK_TOLERANCE_MILLIS);
