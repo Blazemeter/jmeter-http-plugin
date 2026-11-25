@@ -272,13 +272,7 @@
     <dependency>
       <groupId>com.blazemeter</groupId>
       <artifactId>jmeter-bzm-commons</artifactId>
-      <version>0.2.3</version>
-      <exclusions>
-        <exclusion>
-          <groupId>org.apache.maven.plugins</groupId>
-          <artifactId>maven-checkstyle-plugin</artifactId>
-        </exclusion>
-      </exclusions>
+      <version>0.2.5</version>
     </dependency>
     <dependency>
       <groupId>kg.apc</groupId>
@@ -430,6 +424,16 @@
                 <relocation>
                   <pattern>com.google</pattern>
                   <shadedPattern>com.blazemeter.jmeter.http2.shaded.com.google</shadedPattern>
+                </relocation>
+                <!--
+                  Other BlazeMeter plugins put their own jmeter-bzm-commons jar in JMeter's lib/,
+                  which JMeter loads before lib/ext/, so an unrelocated copy would lose to whatever
+                  version they ship. Its theme icons are looked up with absolute paths
+                  (/light-theme, /dark-theme) and stay at the jar root.
+                -->
+                <relocation>
+                  <pattern>com.blazemeter.jmeter.commons</pattern>
+                  <shadedPattern>com.blazemeter.jmeter.http2.shaded.com.blazemeter.jmeter.commons</shadedPattern>
                 </relocation>
               </relocations>
               <filters>

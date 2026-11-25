@@ -5,9 +5,12 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.fail;
 
 import com.blazemeter.jmeter.http2.HTTP2TestBase;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -17,7 +20,9 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import javax.swing.ImageIcon;
 import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -94,6 +99,15 @@ public class HTTP2DependenciesIntegrationTest extends HTTP2TestBase {
       "lib/osx-x86_64/libbrotli.dylib",
       "lib/osx-aarch64/libbrotli.dylib"
   );
+
+  private static final String BZM_COMMONS_PATH = "com/blazemeter/jmeter/commons/";
+  private static final String SHADED_BZM_COMMONS_PATH =
+      "com/blazemeter/jmeter/http2/shaded/" + BZM_COMMONS_PATH;
+  private static final List<String> BZM_COMMONS_CLASSES = Arrays.asList(
+      "BlazemeterLabsLogo", "ThemeUtils", "ThemedIcon");
+  private static final String BZM_LOGO_RESOURCE = "blazemeter-by-perforce-logo.png";
+  private static final String SAMPLER_GUI_CLASS_RESOURCE =
+      "com/blazemeter/jmeter/http2/sampler/gui/HTTP2SamplerGui.class";
 
   @BeforeClass
   public static void once() {
@@ -273,6 +287,100 @@ public class HTTP2DependenciesIntegrationTest extends HTTP2TestBase {
       assertJarContainsClass(pluginJar, SHADED_QUIC_CLIENT_RESOURCE,
           "Shaded jar should include " + SHADED_QUIC_CLIENT_RESOURCE);
     }
+  }
+
+  /*
+   Other BlazeMeter plugins ship their own jmeter-bzm-commons in JMeter's lib/, which is loaded
+   before lib/ext/. Only a relocated copy keeps the sampler GUI on the version this plugin ships.
+   */
+  @Test
+  public void shouldBundleBzmCommonsOnlyRelocated() {
+    Path pluginJar = requireShadedJar();
+
+    for (String className : BZM_COMMONS_CLASSES) {
+      assertJarContainsClass(pluginJar, SHADED_BZM_COMMONS_PATH + className + ".class",
+          "Shaded jar should include relocated bzm-commons class " + className);
+      assertJarDoesNotContainClass(pluginJar, BZM_COMMONS_PATH + className + ".class",
+          "Shaded jar must not include unrelocated bzm-commons class " + className);
+    }
+    for (String theme : Arrays.asList("light-theme", "dark-theme")) {
+      assertJarContainsClass(pluginJar, theme + "/" + BZM_LOGO_RESOURCE,
+          "Shaded jar should keep bzm-commons icons at the jar root: " + theme);
+    }
+  }
+
+  @Test
+  public void shouldReferenceRelocatedBzmCommonsFromSamplerGui() throws IOException {
+    Path pluginJar = requireShadedJar();
+
+    byte[] guiClass;
+    try (JarFile jarFile = new JarFile(pluginJar.toFile())) {
+      JarEntry entry = jarFile.getJarEntry(SAMPLER_GUI_CLASS_RESOURCE);
+      assertNotNull("Shaded jar should include " + SAMPLER_GUI_CLASS_RESOURCE, entry);
+      try (InputStream in = jarFile.getInputStream(entry)) {
+        guiClass = readAll(in);
+      }
+    }
+
+    assertThat(hasUtf8Constant(guiClass, SHADED_BZM_COMMONS_PATH + "BlazemeterLabsLogo"))
+        .as("HTTP2SamplerGui should use the relocated BlazemeterLabsLogo")
+        .isTrue();
+    assertThat(hasUtf8Constant(guiClass, BZM_COMMONS_PATH + "BlazemeterLabsLogo"))
+        .as("HTTP2SamplerGui must not reference the unrelocated BlazemeterLabsLogo")
+        .isFalse();
+  }
+
+  @Test
+  public void shouldLoadIconsWithRelocatedBzmCommons() throws Exception {
+    Path pluginJar = requireShadedJar();
+    URL pluginJarUrl = pluginJar.toUri().toURL();
+
+    // The parent provides JMeter, which ThemeUtils asks for the active look and feel.
+    try (URLClassLoader jmeterClassLoader = new URLClassLoader(new URL[] {pluginJarUrl},
+        Thread.currentThread().getContextClassLoader())) {
+      Class<?> themedIcon = jmeterClassLoader.loadClass(
+          SHADED_BZM_COMMONS_PATH.replace('/', '.') + "ThemedIcon");
+      assertThat(themedIcon.getProtectionDomain().getCodeSource().getLocation())
+          .as("Relocated ThemedIcon should come from the shaded jar")
+          .isEqualTo(pluginJarUrl);
+
+      ImageIcon logo = (ImageIcon) themedIcon.getMethod("fromResourceName", String.class)
+          .invoke(null, BZM_LOGO_RESOURCE);
+      assertThat(logo.getIconWidth())
+          .as("Relocated ThemedIcon should load " + BZM_LOGO_RESOURCE)
+          .isPositive();
+    }
+  }
+
+  private static boolean hasUtf8Constant(byte[] classBytes, String value) {
+    // A CONSTANT_Utf8 entry is tag 1, a two-byte length, then the bytes: matching the whole
+    // entry keeps the unrelocated name from matching inside the relocated one.
+    byte[] text = value.getBytes(StandardCharsets.UTF_8);
+    byte[] entry = new byte[text.length + 3];
+    entry[0] = 1;
+    entry[1] = (byte) (text.length >> 8);
+    entry[2] = (byte) text.length;
+    System.arraycopy(text, 0, entry, 3, text.length);
+    outer:
+    for (int i = 0; i <= classBytes.length - entry.length; i++) {
+      for (int j = 0; j < entry.length; j++) {
+        if (classBytes[i + j] != entry[j]) {
+          continue outer;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private static byte[] readAll(InputStream in) throws IOException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    byte[] buffer = new byte[8192];
+    int read;
+    while ((read = in.read(buffer)) != -1) {
+      out.write(buffer, 0, read);
+    }
+    return out.toByteArray();
   }
 
   private Path requireShadedJar() {
