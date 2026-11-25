@@ -16,6 +16,7 @@ import org.apache.jmeter.control.Controller;
 import org.apache.jmeter.control.NextIsNullException;
 import org.apache.jmeter.control.TransactionController;
 import org.apache.jmeter.control.TransactionSampler;
+import org.apache.jmeter.samplers.SampleEvent;
 import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.samplers.Sampler;
 import org.apache.jmeter.testelement.TestElement;
@@ -77,6 +78,8 @@ public class HTTP2Controller extends TransactionController implements Serializab
 
   private transient List<HTTP2Sampler> http2SamplesSync = new ArrayList<>();
   private transient boolean handingOutPendingSampler;
+  /** Whether the current {@link #next()} turn sent a request out. */
+  private transient boolean dispatchedOnThisTurn;
   private transient boolean nestedSequentialRequestWarned;
   private boolean generateControllerSample;
   /**
@@ -170,6 +173,7 @@ public class HTTP2Controller extends TransactionController implements Serializab
    */
   @Override
   public Sampler next() {
+    dispatchedOnThisTurn = false;
     try {
       if (isGenerateParentSample()) {
         Sampler next = super.next();
@@ -191,6 +195,11 @@ public class HTTP2Controller extends TransactionController implements Serializab
       // getCurrentElement has run, and what the scheduler checks right after this call returns is
       // whether anything is out there now.
       holdSchedulerWhileRequestsAreInFlight();
+      if (!dispatchedOnThisTurn) {
+        // A request dispatched on this turn has no response listener until JMeterThread samples
+        // it, so it must not be taken for one that has nothing left to wait for.
+        releaseSchedulerWhenNothingIsLeftOnTheWire();
+      }
     }
   }
 
@@ -225,7 +234,11 @@ public class HTTP2Controller extends TransactionController implements Serializab
    * iteration instead (see {@link #discardPendingAsyncSamples()}, reached through
    * {@code reInitialize}), by which point every collected response has been reported; and since it
    * stops being renewed as soon as the queue empties, a push left behind by any path that does not
-   * reach that point expires on its own.
+   * reach that point expires on its own. The one exception is a flat controller: there the
+   * deadline goes back as soon as no response is left on the wire, because the end of the
+   * iteration comes too late to stop the thread (see
+   * {@link #releaseSchedulerWhenNothingIsLeftOnTheWire()}). The response collected last is still
+   * reported: {@code JMeterThread} checks the end only after it has sampled and processed it.
    */
   private void holdSchedulerWhileRequestsAreInFlight() {
     if (http2SamplesSync.isEmpty()) {
@@ -245,6 +258,76 @@ public class HTTP2Controller extends TransactionController implements Serializab
           thread.getThreadName(), http2SamplesSync.size(), getName());
     }
     thread.setEndTime(hold);
+  }
+
+  /**
+   * Gives the scheduled end back once no response is left on the wire, so that
+   * {@code JMeterThread}'s own check, which runs right after every sample has been processed,
+   * stops the thread if the end has gone by - during the request, during its post-processors or
+   * assertions, or before any of it.
+   *
+   * <p>A pass runs out of responses in two ways, and this runs for both:
+   * <ul>
+   *   <li>The last one is collected: from {@link #next()}, on the turn that hands it out, before
+   *   {@code JMeterThread} samples it. The check after that sample then reads the real end, whether
+   *   the sample is reported, ignored by a post-processor ({@code prev.setIgnore()}, after which
+   *   JMeter notifies no listener of it) or crossed by one.</li>
+   *   <li>The last request queued failed at dispatch: it was sampled and reported as an error, and
+   *   never gets a response listener, hence no collection turn of its own. Only after that sample
+   *   is it known to have nothing to wait for, so this runs from
+   *   {@link #sampleOccurred(SampleEvent)}.</li>
+   * </ul>
+   *
+   * <p>With "Generate parent sample" off, waiting for the end of the iteration
+   * ({@code reInitialize}) is too late: that happens on the turn this controller returns
+   * {@code null}, and the Thread Group's {@code LoopController} starts the next iteration inside
+   * that same {@code next()} call (its {@code nextIsNull()} returns {@code next()}), before
+   * {@code JMeterThread} checks the end it was just given back. The first dispatch of the new
+   * iteration then found the end already gone by and held it again, and the thread never stopped:
+   * one request per iteration past the end, for as long as the test was left running (BlazeMeter
+   * HTTP issue 169). Every response is reported before the end goes back, so none is lost to it.
+   *
+   * <p>Handing the end back here instead ends the thread the way a stock sampler does: right after
+   * the sample the end fell in, through the check {@code JMeterThread} runs after every sample. So
+   * no element before this controller samples again, and a Transaction Controller enclosing this
+   * one is closed and reported by {@code JMeterThread} as for any thread stopped by its schedule.
+   * Stopping the thread from inside {@code next()} instead (a {@code JMeterStopThreadException})
+   * would unwind past that enclosing transaction and lose it, along with every result it holds.
+   *
+   * <p>With "Generate parent sample" on, the end goes back at {@code reInitialize}, before the
+   * finished transaction is handed to {@code JMeterThread}, whose check after it stops the thread:
+   * that path closes its own transaction and is left as it is.
+   */
+  private void releaseSchedulerWhenNothingIsLeftOnTheWire() {
+    if (!isGenerateParentSample() && !isResponseStillOnTheWire()) {
+      releaseScheduler();
+    }
+  }
+
+  /**
+   * This controller is a {@code SampleListener} by inheritance ({@link TransactionController}), so
+   * JMeter notifies it of every sample under it that is not ignored, after its post-processors and
+   * assertions and before the scheduler check: the moment a failed dispatch is known to have left
+   * nothing to wait for. See {@link #releaseSchedulerWhenNothingIsLeftOnTheWire()}.
+   */
+  @Override
+  public void sampleOccurred(SampleEvent event) {
+    super.sampleOccurred(event);
+    releaseSchedulerWhenNothingIsLeftOnTheWire();
+  }
+
+  /**
+   * Whether a queued request is still waiting for its response. A queued sampler without a
+   * response listener at this point has already been sampled: its dispatch failed and was reported,
+   * and {@link #waitForDoneHTTP2()} drops it on a later turn.
+   */
+  private boolean isResponseStillOnTheWire() {
+    for (HTTP2Sampler queued : http2SamplesSync) {
+      if (queued.getFutureResponseListener() != null) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -659,6 +742,9 @@ public class HTTP2Controller extends TransactionController implements Serializab
     if (current < subControllersAndSamplers.size()) {
       TestElement sam = subControllersAndSamplers.get(current);
       if (sam instanceof HTTP2Sampler) {
+        if (isPastTheScheduledEndWithNothingOnTheWire()) {
+          return sampleSynchronouslyPastTheEnd((HTTP2Sampler) sam);
+        }
         return dispatchAsync((HTTP2Sampler) sam);
       } else { // Another type of element, use that for checkpoint mark
         HTTP2Sampler http2sam = waitForDoneHTTP2();
@@ -679,11 +765,46 @@ public class HTTP2Controller extends TransactionController implements Serializab
     return null;
   }
 
+  /**
+   * Whether a flat controller is being asked for a request after the thread's own scheduled end
+   * has already gone by, with nothing held and nothing on the wire: the Thread Group started
+   * another pass before {@code JMeterThread} could check the end this controller had just given
+   * back.
+   *
+   * <p>That happens when the end goes back only as the pass ends ({@code reInitialize}), because no
+   * earlier moment saw that nothing was left to wait for: a failed dispatch whose error result a
+   * post-processor marked as ignored ({@code prev.setIgnore()}) is never notified to this
+   * controller, and has no response to collect. Dispatching asynchronously here would hold the
+   * expired end again, and with every pass ending the same way, the thread never stopped.
+   */
+  private boolean isPastTheScheduledEndWithNothingOnTheWire() {
+    if (isGenerateParentSample() || heldSchedulerEndTime != null || isResponseStillOnTheWire()) {
+      return false;
+    }
+    JMeterThread thread = JMeterContextService.getContext().getThread();
+    return thread != null && thread.getEndTime() > 0
+        && System.currentTimeMillis() >= thread.getEndTime();
+  }
+
+  /**
+   * Hands a request out to be sampled synchronously, as a stock sampler is: {@code JMeterThread}
+   * sends it, processes its result and then checks the scheduled end, which stops the thread. A
+   * stock thread asked for a sample past its end does the same - it runs that one sample and stops
+   * - so this is where the overrun ends, and the request is reported like any other.
+   */
+  private HTTP2Sampler sampleSynchronouslyPastTheEnd(HTTP2Sampler sampler) {
+    lowLevelDebug("Scheduled end already gone by in '{}'; sampling {} synchronously so the "
+        + "thread stops right after it", getName(), sampler.getName());
+    sampler.setSyncRequest(true);
+    return sampler;
+  }
+
   /** Switches a sampler to asynchronous mode and queues it for a later completion turn. */
   private HTTP2Sampler dispatchAsync(HTTP2Sampler sampler) {
     sampler.setSyncRequest(false); // Force to run async the first time
     lowLevelDebug("Convert http2 sample to Async and add to wait list");
     http2SamplesSync.add(sampler);
+    dispatchedOnThisTurn = true;
     return sampler;
   }
 

@@ -96,6 +96,63 @@ public class AsyncControllerTransactionTimingTest extends HTTP2TestBase {
     softly.assertAll();
   }
 
+  /**
+   * S2 fails at once, waits behind S1 to be collected, and collecting it sends it again, which
+   * fails 300 ms later. The parent sample spans up to the latest child end, so S2's end has to be
+   * when that retry failed: an S2 ended earlier by its wait to be collected - the right elapsed
+   * time, reached through an end that never happened - left the parent reporting S1's 400 ms for a
+   * transaction that took 700.
+   */
+  @Test
+  public void t6AFailedRetryAfterTheQueueWaitMustEndTheParentWhenItFailed() {
+    long slow = 400L;
+    long retry = 300L;
+    TreeShape shape = fixture -> {
+      AsyncScenarioRunner.Node[] nodes = {
+          node(fixture.controller("controller"),
+              node(fixture.http("S1", slow)),
+              node(fixture.http("S2", 10)))
+      };
+      fixture.transport().spec("S2").retryFailsAfter(retry);
+      return nodes;
+    };
+    Result actual = execute(ControllerKind.ASYNC_PARENT, 1, shape);
+    SampleResult parent = actual.topLevelResult("controller");
+    report("T6 controller[S1 400ms, S2 fails at once then its retry 300ms later]", actual, parent);
+
+    SoftAssertions softly = new SoftAssertions();
+    softly.assertThat(parent).as("a parent sample must be reported").isNotNull();
+    if (parent != null) {
+      SampleResult failed = childLabelled(parent, "S2");
+      softly.assertThat(failed).as("S2 must be reported under the controller").isNotNull();
+      if (failed != null) {
+        softly.assertThat(failed.isSuccessful()).as("precondition: S2 failed").isFalse();
+        softly.assertThat(failed.getTime())
+            .as("S2 took its own failure plus the retry, not its wait behind S1")
+            .isLessThan(slow);
+        softly.assertThat(failed.getIdleTime())
+            .as("S2's wait behind S1 is held as idle time")
+            .isGreaterThan(0L);
+      }
+      softly.assertThat(parent.getTime())
+          .as("the transaction lasted until S2's retry failed, %d ms after S1 answered", retry)
+          .isGreaterThanOrEqualTo(slow + retry - 20);
+      softly.assertThat(parent.getTime())
+          .as("the parent sample must measure the span of its requests")
+          .isEqualTo(requestSpan(parent));
+    }
+    softly.assertAll();
+  }
+
+  private static SampleResult childLabelled(SampleResult parent, String label) {
+    for (SampleResult child : children(parent)) {
+      if (label.equals(child.getSampleLabel())) {
+        return child;
+      }
+    }
+    return null;
+  }
+
   @Test
   public void t3ThinkTimeMustNotBubbleUpToAnEnclosingTransactionController() {
     TreeShape shape = fixture -> new AsyncScenarioRunner.Node[]{

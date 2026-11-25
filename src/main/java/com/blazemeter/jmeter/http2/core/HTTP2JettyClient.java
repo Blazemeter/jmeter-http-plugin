@@ -144,6 +144,7 @@ import org.eclipse.jetty.io.ssl.SslConnection;
 import org.eclipse.jetty.io.ssl.SslHandshakeListener;
 import org.eclipse.jetty.quic.quiche.client.QuicheClientQuicConfiguration;
 import org.eclipse.jetty.quic.quiche.client.QuicheTransport;
+import org.eclipse.jetty.util.ConcurrentPool;
 import org.eclipse.jetty.util.Fields;
 import org.eclipse.jetty.util.component.LifeCycle;
 import org.eclipse.jetty.util.compression.InflaterPool;
@@ -698,6 +699,10 @@ public class HTTP2JettyClient {
     this.httpClientHttp1Only.setName(name + "-http1");
     this.httpClientH2cPrior.setName(name + "-h2c");
     this.httpClientH2cUpgrade.setName(name + "-h2c-upgrade");
+    // Every request any of these clients sends - the first attempt and each one sent again - so the
+    // sampler can tell whether collecting a failed request sent it again.
+    forEachHttpClient(client -> client.getRequestListeners()
+        .addQueuedListener(request -> RequestsSentByThread.recordSent()));
   }
 
   public HTTP2JettyClient() {
@@ -1346,46 +1351,6 @@ public class HTTP2JettyClient {
       CustomWwwAuthenticationProtocolHandler.install(httpClientH2cUpgrade);
       lowLevelDebug("HttpClient (H2C upgrade) started successfully");
     }
-  }
-
-  /**
-   * Creates a new HttpClient configured with only HTTP/1.1 (no HTTP/2) for fallback scenarios.
-   * This is used when protocol_error is detected and we need to retry with HTTP/1.1 only.
-   *
-   * @param name Name for the HttpClient
-   * @return A new HttpClient configured for HTTP/1.1 only
-   */
-  private HttpClient createHTTP11OnlyClient(String name) throws Exception {
-    lowLevelDebug("Creating HTTP/1.1-only client for fallback");
-
-    ClientConnector clientConnector = createClientConnector(name + "-http11-fallback");
-
-    // Create transport with ONLY HTTP/1.1 (no HTTP/2)
-    ClientConnectionFactory.Info http11 = HttpClientConnectionFactory.HTTP11;
-    HttpClientTransport transport =
-        new RecordingHttpClientTransportDynamic(clientConnector, http11);
-    lowLevelDebug("HttpClientTransportDynamic configured with HTTP/1.1 only (fallback mode)");
-
-    HttpClient http11Client = new HttpClient(transport);
-    http11Client.setUserAgentField(null);
-    http11Client.setMaxRequestsQueuedPerDestination(maxRequestsQueuedPerDestination);
-    http11Client.setMaxConnectionsPerDestination(maxConnectionsPerDestination);
-    http11Client.setStrictEventOrdering(strictEventOrdering);
-    if (removeIdleDestinations) {
-      http11Client.setDestinationIdleTimeout(idleTimeout);
-    }
-    http11Client.setIdleTimeout(idleTimeout);
-    http11Client.setName(name + "-http11-fallback");
-
-    // Start the client
-    if (!http11Client.isStarted()) {
-      blockServiceLoaderDecoders(http11Client);
-      http11Client.start();
-      CustomWwwAuthenticationProtocolHandler.install(http11Client);
-      lowLevelDebug("HTTP/1.1-only fallback client started");
-    }
-
-    return http11Client;
   }
 
   /**
@@ -2094,12 +2059,25 @@ public class HTTP2JettyClient {
     lowLevelDebug("URL: {}", result.getURL());
 
     Request request = listener.getRequest();
+    // When this collection began, and how many requests this thread had sent by then: a successful
+    // response that came from sending the request again must end when that last attempt did, and
+    // leave out the time the request waited to be collected. See
+    // HTTP2FutureResponseListener#endHoldingQueueWaitAsIdle.
+    long collectedAtNanos = System.nanoTime();
+    long sentBeforeCollection = RequestsSentByThread.current();
     try {
       ContentResponse contentResponse = getContent(listener, request);
       JettyCacheManager cacheManager =
           JettyCacheManager.fromCacheManager(sampler.getCacheManager());
       postContentResponse(sampler, request, result, contentResponse, cacheManager);
-      stampSampleEnd(result, listener);
+      if (RequestsSentByThread.current() != sentBeforeCollection) {
+        // getContent sent the request again (an HTTP/1.1 fallback, a GOAWAY retry, ...) and this
+        // response is that attempt's: postContentResponse ended the result when it arrived.
+        // Stamping the exchange's end, the first attempt's, reported only that first attempt.
+        listener.endHoldingQueueWaitAsIdle(result, collectedAtNanos, result.getEndTime());
+      } else {
+        stampSampleEnd(result, listener);
+      }
 
       resetSamplerDataBeforeResultProcessing(result);
       return sampler.resultProcessing(areFollowingRedirect, depth, result);
@@ -2129,8 +2107,10 @@ public class HTTP2JettyClient {
           // Not from the listener: the only completion it ever recorded is the GOAWAY that killed
           // the first attempt. retryAfterGoAway sends a clone of its own and returns the response
           // it got, so the sample ends now - stamping the listener's end reported a sample that
-          // finished before the response it carries, missing the whole retry.
-          result.setEndTime(result.currentTimeInMillis());
+          // finished before the response it carries, missing the whole retry. The wait to be
+          // collected before the retry is not the request's time, though.
+          listener.endHoldingQueueWaitAsIdle(result, collectedAtNanos,
+              result.currentTimeInMillis());
           resetSamplerDataBeforeResultProcessing(result);
           return sampler.resultProcessing(areFollowingRedirect, depth, result);
         } catch (Exception retryException) {
@@ -2143,6 +2123,8 @@ public class HTTP2JettyClient {
               if (fallbackResult != null && fallbackResult.isSuccessful()) {
                 lowLevelDebug("HTTP/1.1 fallback succeeded: status={}",
                     fallbackResult.getResponseCode());
+                listener.endHoldingQueueWaitAsIdle(fallbackResult, collectedAtNanos,
+                    fallbackResult.getEndTime());
                 return fallbackResult;
               }
               LOG.warn("HTTP/1.1 fallback returned unsuccessful result");
@@ -2172,6 +2154,8 @@ public class HTTP2JettyClient {
             if (fallbackResult != null && fallbackResult.isSuccessful()) {
               lowLevelDebug("HTTP/1.1 fallback succeeded: status={}",
                   fallbackResult.getResponseCode());
+              listener.endHoldingQueueWaitAsIdle(fallbackResult, collectedAtNanos,
+                  fallbackResult.getEndTime());
               return fallbackResult;
             } else {
               LOG.warn("HTTP/1.1 fallback returned unsuccessful result");
@@ -3938,19 +3922,51 @@ public class HTTP2JettyClient {
   }
 
   /**
-   * @param maxMultiplex max concurrent exchanges per connection (HTTP/2/3); use {@code 1} for
-   *     HTTP/1-only transports so parallel requests open extra TCP connections instead of
-   *     failing with "Pipelined requests not supported".
+   * How many exchanges a connection carries at once is decided per connection, not per transport,
+   * because a dynamic transport settles the protocol per connection (ALPN, or plain {@code http://}
+   * as HTTP/1.1): see {@link #maxConcurrentExchanges}. This is how Jetty's own transports work -
+   * its HTTP/2, HTTP/3 and dynamic transports pool with {@code MultiplexConnectionPool} and take
+   * each connection's streams from the connection, and its HTTP/1.1 transport pools one exchange
+   * per connection.
+   *
+   * @param maxMultiplex how many exchanges the pool assumes a connection that is still being
+   *     opened will carry, which sizes how many connections it opens ahead of the requests waiting
+   *     for one; {@code 1} for HTTP/1-only transports, so parallel requests open their own
+   *     connections at once.
    */
   private void configureTransport(HttpClientTransport transport, int maxMultiplex) {
     transport.setConnectionPoolFactory((destination) -> {
-      MultiplexConnectionPool mcp = new MultiplexConnectionPool(
-          destination,
-          destination.getHttpClient().getMaxConnectionsPerDestination(),
-          maxMultiplex);
+      int maxConnections = destination.getHttpClient().getMaxConnectionsPerDestination();
+      // The protected constructor is the one that takes the pool, hence the subclass.
+      MultiplexConnectionPool mcp = new MultiplexConnectionPool(destination,
+          () -> new ConcurrentPool<>(ConcurrentPool.StrategyType.FIRST, maxConnections,
+              HTTP2JettyClient::maxConcurrentExchanges),
+          maxMultiplex) {
+      };
       mcp.setInitialMaxMultiplex(maxMultiplex);
       return mcp;
     });
+  }
+
+  /**
+   * How many exchanges the pool may put on one connection at a time.
+   *
+   * <p>An HTTP/2 or HTTP/3 connection says so itself ({@code MaxMultiplexable}: the streams its
+   * peer allows). An HTTP/1.1 connection does not, and carries one exchange at a time: Jetty
+   * aborts a second one put on it with "Pipelined requests not supported". Jetty's pool falls
+   * back to the transport's multiplexing value for such a connection, and on a transport that can
+   * end up on HTTP/1.1 - plain {@code http://}, or ALPN settling on {@code http/1.1} - that value
+   * is the stream count meant for HTTP/2. So every request the async controller had on the wire
+   * after the first went onto the first request's connection and failed.
+   *
+   * <p>The transport's value still sizes how many connections the pool opens ahead of demand, as
+   * before, so an HTTP/2 origin keeps sharing one connection.
+   */
+  static int maxConcurrentExchanges(org.eclipse.jetty.client.Connection connection) {
+    if (connection instanceof ConnectionPool.MaxMultiplexable) {
+      return ((ConnectionPool.MaxMultiplexable) connection).getMaxMultiplex();
+    }
+    return 1;
   }
 
   private String originKey(URI uri) {

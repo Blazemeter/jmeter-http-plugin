@@ -13,7 +13,7 @@ import org.apache.jmeter.util.JMeterUtils;
  * instead. Global {@code blazemeter.http.*} / {@code httpJettyClient.*} properties similarly leak
  * across classes when a test forces the legacy profile and cleanup is skipped or incomplete.
  */
-final class HTTP2JettyClientTestIsolation {
+public final class HTTP2JettyClientTestIsolation {
 
   private static final String[] PROTOCOL_PROPERTY_SUFFIXES = {
       "profile",
@@ -37,7 +37,7 @@ final class HTTP2JettyClientTestIsolation {
   private HTTP2JettyClientTestIsolation() {
   }
 
-  static void resetSharedClientState() throws Exception {
+  public static void resetSharedClientState() throws Exception {
     clearStaticMap("ALT_SVC_CACHE");
     clearStaticMap("HTTP1_ONLY_CACHE");
     clearStaticMap("H2C_CACHE");
