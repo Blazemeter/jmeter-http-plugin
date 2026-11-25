@@ -82,12 +82,15 @@ import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.util.JMeterUtils;
 import org.brotli.dec.BrotliInputStream;
 import org.eclipse.jetty.client.AbstractAuthentication;
+import org.eclipse.jetty.client.AbstractConnectionPool;
 import org.eclipse.jetty.client.Authentication;
 import org.eclipse.jetty.client.AuthenticationStore;
 import org.eclipse.jetty.client.BasicAuthentication;
 import org.eclipse.jetty.client.BytesRequestContent;
+import org.eclipse.jetty.client.ConnectionPool;
 import org.eclipse.jetty.client.ContentDecoder;
 import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.CustomConnectionPoolAccessor;
 import org.eclipse.jetty.client.Destination;
 import org.eclipse.jetty.client.DigestAuthentication;
 import org.eclipse.jetty.client.FormRequestContent;
@@ -105,6 +108,7 @@ import org.eclipse.jetty.client.RetryableRequestException;
 import org.eclipse.jetty.client.StringRequestContent;
 import org.eclipse.jetty.client.transport.HttpClientConnectionFactory;
 import org.eclipse.jetty.client.transport.HttpClientTransportDynamic;
+import org.eclipse.jetty.client.transport.HttpDestination;
 import org.eclipse.jetty.compression.brotli.BrotliCompression;
 import org.eclipse.jetty.compression.client.CompressionContentDecoderFactory;
 import org.eclipse.jetty.compression.gzip.GzipCompression;
@@ -133,12 +137,14 @@ import org.eclipse.jetty.io.ByteBufferPool;
 import org.eclipse.jetty.io.ClientConnectionFactory;
 import org.eclipse.jetty.io.ClientConnector;
 import org.eclipse.jetty.io.Connection;
+import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.io.EndPoint;
 import org.eclipse.jetty.io.Transport;
 import org.eclipse.jetty.io.ssl.SslConnection;
 import org.eclipse.jetty.io.ssl.SslHandshakeListener;
 import org.eclipse.jetty.quic.quiche.client.QuicheClientQuicConfiguration;
 import org.eclipse.jetty.quic.quiche.client.QuicheTransport;
+import org.eclipse.jetty.util.ConcurrentPool;
 import org.eclipse.jetty.util.Fields;
 import org.eclipse.jetty.util.component.LifeCycle;
 import org.eclipse.jetty.util.compression.InflaterPool;
@@ -229,6 +235,8 @@ public class HTTP2JettyClient {
   private static final Object SHARED_POOL_LOCK = new Object();
   private static final String SHARED_POOL_NAME = "http2-shared";
   private static volatile QueuedThreadPool sharedThreadPool;
+  /** Guarded by the class lock; see {@link #sharedZstdCompression(int)}. */
+  private static ZstandardCompression sharedZstdCompression;
   private static volatile Executor sharedExecutor;
   private static volatile int sharedMaxThreads = -1;
   private static volatile int sharedMinThreads = -1;
@@ -691,6 +699,10 @@ public class HTTP2JettyClient {
     this.httpClientHttp1Only.setName(name + "-http1");
     this.httpClientH2cPrior.setName(name + "-h2c");
     this.httpClientH2cUpgrade.setName(name + "-h2c-upgrade");
+    // Every request any of these clients sends - the first attempt and each one sent again - so the
+    // sampler can tell whether collecting a failed request sent it again.
+    forEachHttpClient(client -> client.getRequestListeners()
+        .addQueuedListener(request -> RequestsSentByThread.recordSent()));
   }
 
   public HTTP2JettyClient() {
@@ -815,17 +827,76 @@ public class HTTP2JettyClient {
     return null;
   }
 
-  public void clearBufferPool() {
-    if (bufferPool != null) {
-      bufferPool.clear();
+  /**
+   * Closes every pooled connection that carries no exchange, so the next iteration opens a new one.
+   * This mirrors what JMeter's own HttpClient4 sampler does on a new-user iteration ({@code
+   * HTTPHC4Impl#closeCurrentConnections} closes expired connections and anything idle for 1
+   * microsecond, connection by connection), and matches the Thread Group documentation for "Same
+   * user on each iteration": when it is unchecked, a new connection is opened between iterations.
+   *
+   * <p>The decision is per connection, not per destination: an in-use connection stays open until
+   * its exchange completes, and does not keep its idle siblings on the same origin alive. The
+   * destination itself is never removed, because {@code HttpClient.removeDestination} stops a
+   * managed destination and that aborts every exchange still in flight on it.
+   *
+   * <p>Each connection is taken out of its pool before it is closed. That is the order an HTTP/1.1
+   * connection's own {@code close()} follows, but an HTTP/2 connection only leaves the pool once
+   * its GOAWAY is written, and the next sample must not pick it up in between.
+   */
+  public void closeIdleConnections() {
+    forEachHttpClient(client -> {
+      if (client == null) {
+        return;
+      }
+      for (Destination destination : client.getDestinations()) {
+        closeIdleConnections(destination);
+      }
+    });
+  }
+
+  private static void closeIdleConnections(Destination destination) {
+    ConnectionPool connectionPool = destination.getConnectionPool();
+    // Every pool this client builds is an AbstractConnectionPool (Jetty's duplex default, or the
+    // multiplex pool from the transport factory). An unknown one cannot tell idle from in use.
+    if (!(connectionPool instanceof AbstractConnectionPool)
+        || !(destination instanceof HttpDestination)) {
+      return;
+    }
+    HttpDestination httpDestination = (HttpDestination) destination;
+    AbstractConnectionPool pool = (AbstractConnectionPool) connectionPool;
+    for (org.eclipse.jetty.client.Connection connection
+        : CustomConnectionPoolAccessor.getIdleConnections(pool)) {
+      if (httpDestination.remove(connection)) {
+        connection.close();
+      }
     }
   }
 
   /**
    * Caps how much pooled buffer memory Jetty may retain. Without a cap, {@code ArrayByteBufferPool}
    * keeps the high-water mark for the JVM lifetime of the client under continuous load.
+   *
+   * <p>Never call {@code clear()} on the returned pool while this client is alive. {@code
+   * maxBucketSize} is unbounded, so Jetty gives each bucket a {@code CompoundPool} whose secondary
+   * is a {@code QueuedPool} (a plain {@code ConcurrentPool} is only used up to
+   * {@code ConcurrentPool.OPTIMAL_MAX_SIZE}). {@code ArrayByteBufferPool.clear()} removes entries
+   * with {@code stream().forEach(Pool.Entry::remove)}, and {@code QueuedPool.QueuedEntry.remove()}
+   * nulls the pooled buffer but leaves the entry in its queue - so the next {@code acquire()} polls
+   * a terminated entry and NPEs inside Jetty. Reported upstream as jetty/jetty.project#15807, which
+   * is the third call site to hit that same {@code QueuedPool} behaviour (jetty#11098 and
+   * jetty#12790 were the first two, both fixed at the caller). See the regression test
+   * {@code BufferPoolIterationResetRegressionTest}.
+   *
+   * <p>The other paths that remove pool entries are safe in this Jetty version, so dropping the
+   * {@code clear()} calls is enough: {@code RetainedBucket.evict()} (which the memory caps above do
+   * trigger) dequeues the entry before removing it and never reads {@code getPooled()}, and
+   * {@code removeAndRelease()} no longer exists in 12.1.x.
    */
   private ByteBufferPool createByteBufferPool() {
+    return newByteBufferPool(byteBufferPoolFactor);
+  }
+
+  private static ByteBufferPool newByteBufferPool(int byteBufferPoolFactor) {
     long maxHeap = Long.parseLong(BzmHttpPluginProperties.getPropDefault(
         "httpJettyClient.byteBufferPoolMaxHeapMemory",
         String.valueOf(DEFAULT_BYTE_BUFFER_POOL_MAX_MEMORY)));
@@ -1244,6 +1315,7 @@ public class HTTP2JettyClient {
     if (!httpClient.isStarted()) {
       lowLevelDebug("Starting HttpClient: name={}, http1UpgradeRequired={}",
           httpClient.getName(), http1UpgradeRequired);
+      blockServiceLoaderDecoders(httpClient);
       httpClient.start();
       CustomWwwAuthenticationProtocolHandler.install(httpClient);
       lowLevelDebug("HttpClient started successfully");
@@ -1252,12 +1324,14 @@ public class HTTP2JettyClient {
     }
     if (httpClientNoH3 != httpClient && !httpClientNoH3.isStarted()) {
       lowLevelDebug("Starting HttpClient (no HTTP/3): name={}", httpClientNoH3.getName());
+      blockServiceLoaderDecoders(httpClientNoH3);
       httpClientNoH3.start();
       CustomWwwAuthenticationProtocolHandler.install(httpClientNoH3);
       lowLevelDebug("HttpClient (no HTTP/3) started successfully");
     }
     if (!httpClientHttp1Only.isStarted()) {
       lowLevelDebug("Starting HttpClient (HTTP/1.1 only): name={}", httpClientHttp1Only.getName());
+      blockServiceLoaderDecoders(httpClientHttp1Only);
       httpClientHttp1Only.start();
       CustomWwwAuthenticationProtocolHandler.install(httpClientHttp1Only);
       lowLevelDebug("HttpClient (HTTP/1.1 only) started successfully");
@@ -1265,55 +1339,18 @@ public class HTTP2JettyClient {
     if (!httpClientH2cPrior.isStarted()) {
       lowLevelDebug("Starting HttpClient (H2C prior knowledge): name={}",
           httpClientH2cPrior.getName());
+      blockServiceLoaderDecoders(httpClientH2cPrior);
       httpClientH2cPrior.start();
       CustomWwwAuthenticationProtocolHandler.install(httpClientH2cPrior);
       lowLevelDebug("HttpClient (H2C prior knowledge) started successfully");
     }
     if (!httpClientH2cUpgrade.isStarted()) {
       lowLevelDebug("Starting HttpClient (H2C upgrade): name={}", httpClientH2cUpgrade.getName());
+      blockServiceLoaderDecoders(httpClientH2cUpgrade);
       httpClientH2cUpgrade.start();
       CustomWwwAuthenticationProtocolHandler.install(httpClientH2cUpgrade);
       lowLevelDebug("HttpClient (H2C upgrade) started successfully");
     }
-  }
-
-  /**
-   * Creates a new HttpClient configured with only HTTP/1.1 (no HTTP/2) for fallback scenarios.
-   * This is used when protocol_error is detected and we need to retry with HTTP/1.1 only.
-   *
-   * @param name Name for the HttpClient
-   * @return A new HttpClient configured for HTTP/1.1 only
-   */
-  private HttpClient createHTTP11OnlyClient(String name) throws Exception {
-    lowLevelDebug("Creating HTTP/1.1-only client for fallback");
-
-    ClientConnector clientConnector = createClientConnector(name + "-http11-fallback");
-
-    // Create transport with ONLY HTTP/1.1 (no HTTP/2)
-    ClientConnectionFactory.Info http11 = HttpClientConnectionFactory.HTTP11;
-    HttpClientTransport transport =
-        new RecordingHttpClientTransportDynamic(clientConnector, http11);
-    lowLevelDebug("HttpClientTransportDynamic configured with HTTP/1.1 only (fallback mode)");
-
-    HttpClient http11Client = new HttpClient(transport);
-    http11Client.setUserAgentField(null);
-    http11Client.setMaxRequestsQueuedPerDestination(maxRequestsQueuedPerDestination);
-    http11Client.setMaxConnectionsPerDestination(maxConnectionsPerDestination);
-    http11Client.setStrictEventOrdering(strictEventOrdering);
-    if (removeIdleDestinations) {
-      http11Client.setDestinationIdleTimeout(idleTimeout);
-    }
-    http11Client.setIdleTimeout(idleTimeout);
-    http11Client.setName(name + "-http11-fallback");
-
-    // Start the client
-    if (!http11Client.isStarted()) {
-      http11Client.start();
-      CustomWwwAuthenticationProtocolHandler.install(http11Client);
-      lowLevelDebug("HTTP/1.1-only fallback client started");
-    }
-
-    return http11Client;
   }
 
   /**
@@ -1635,7 +1672,9 @@ public class HTTP2JettyClient {
       firstFailure = stopClient(httpClientH2cPrior, firstFailure);
       firstFailure = stopClient(httpClientH2cUpgrade, firstFailure);
       stopCompressionResources();
-      clearBufferPool();
+      // The buffer pool is dropped with this client, so there is nothing to reclaim by clearing it
+      // - and clearing it would poison it for any I/O thread still finishing its shutdown. See
+      // createByteBufferPool().
       if (heExecutorsRegistered) {
         int remaining = HAPPY_EYEBALLS_CLIENTS.decrementAndGet();
         if (remaining <= 0) {
@@ -1689,7 +1728,7 @@ public class HTTP2JettyClient {
     gzipCompression = null;
     stopLifeCycleQuietly(brotliCompression);
     brotliCompression = null;
-    stopLifeCycleQuietly(zstdCompression);
+    // Shared by every client (see sharedZstdCompression), so only the reference goes.
     zstdCompression = null;
     brotliDecoderFactory = null;
     zstdDecoderFactory = null;
@@ -2020,12 +2059,25 @@ public class HTTP2JettyClient {
     lowLevelDebug("URL: {}", result.getURL());
 
     Request request = listener.getRequest();
+    // When this collection began, and how many requests this thread had sent by then: a successful
+    // response that came from sending the request again must end when that last attempt did, and
+    // leave out the time the request waited to be collected. See
+    // HTTP2FutureResponseListener#endHoldingQueueWaitAsIdle.
+    long collectedAtNanos = System.nanoTime();
+    long sentBeforeCollection = RequestsSentByThread.current();
     try {
       ContentResponse contentResponse = getContent(listener, request);
       JettyCacheManager cacheManager =
           JettyCacheManager.fromCacheManager(sampler.getCacheManager());
       postContentResponse(sampler, request, result, contentResponse, cacheManager);
-      stampSampleEnd(result, listener);
+      if (RequestsSentByThread.current() != sentBeforeCollection) {
+        // getContent sent the request again (an HTTP/1.1 fallback, a GOAWAY retry, ...) and this
+        // response is that attempt's: postContentResponse ended the result when it arrived.
+        // Stamping the exchange's end, the first attempt's, reported only that first attempt.
+        listener.endHoldingQueueWaitAsIdle(result, collectedAtNanos, result.getEndTime());
+      } else {
+        stampSampleEnd(result, listener);
+      }
 
       resetSamplerDataBeforeResultProcessing(result);
       return sampler.resultProcessing(areFollowingRedirect, depth, result);
@@ -2055,8 +2107,10 @@ public class HTTP2JettyClient {
           // Not from the listener: the only completion it ever recorded is the GOAWAY that killed
           // the first attempt. retryAfterGoAway sends a clone of its own and returns the response
           // it got, so the sample ends now - stamping the listener's end reported a sample that
-          // finished before the response it carries, missing the whole retry.
-          result.setEndTime(result.currentTimeInMillis());
+          // finished before the response it carries, missing the whole retry. The wait to be
+          // collected before the retry is not the request's time, though.
+          listener.endHoldingQueueWaitAsIdle(result, collectedAtNanos,
+              result.currentTimeInMillis());
           resetSamplerDataBeforeResultProcessing(result);
           return sampler.resultProcessing(areFollowingRedirect, depth, result);
         } catch (Exception retryException) {
@@ -2069,6 +2123,8 @@ public class HTTP2JettyClient {
               if (fallbackResult != null && fallbackResult.isSuccessful()) {
                 lowLevelDebug("HTTP/1.1 fallback succeeded: status={}",
                     fallbackResult.getResponseCode());
+                listener.endHoldingQueueWaitAsIdle(fallbackResult, collectedAtNanos,
+                    fallbackResult.getEndTime());
                 return fallbackResult;
               }
               LOG.warn("HTTP/1.1 fallback returned unsuccessful result");
@@ -2098,6 +2154,8 @@ public class HTTP2JettyClient {
             if (fallbackResult != null && fallbackResult.isSuccessful()) {
               lowLevelDebug("HTTP/1.1 fallback succeeded: status={}",
                   fallbackResult.getResponseCode());
+              listener.endHoldingQueueWaitAsIdle(fallbackResult, collectedAtNanos,
+                  fallbackResult.getEndTime());
               return fallbackResult;
             } else {
               LOG.warn("HTTP/1.1 fallback returned unsuccessful result");
@@ -2638,6 +2696,39 @@ public class HTTP2JettyClient {
     }
   }
 
+  /**
+   * Must run before every {@code HttpClient.start()}: {@code doStop()} clears the factories, so a
+   * restarted client would do the lookup again. See {@link ServiceLoaderDecodersPlaceholder}.
+   */
+  private static void blockServiceLoaderDecoders(HttpClient client) {
+    ContentDecoder.Factories factories = client.getContentDecoderFactories();
+    if (factories != null && factories.isEmpty()) {
+      factories.put(new ServiceLoaderDecodersPlaceholder());
+    }
+  }
+
+  /**
+   * What {@code HttpClient.doStart()} finds instead of an empty factory list. When it finds none,
+   * it creates a new instance of every {@code Compression} on the classpath through
+   * {@code ServiceLoader}, and in Jetty 12.1.11 each {@link ZstandardCompression} starts a
+   * {@code Cleaner} thread that only ends when a GC collects it: one per internal
+   * {@link HttpClient}, five per plugin client, thousands per load test. The plugin never decodes
+   * with those instances, since every request clears the factories and registers its own (see
+   * {@link #configureContentDecoders}), so this placeholder is dropped by the first request and
+   * never reaches the wire. Drop it once Jetty stops creating a {@code Cleaner} per instance.
+   */
+  private static final class ServiceLoaderDecodersPlaceholder extends ContentDecoder.Factory {
+
+    private ServiceLoaderDecodersPlaceholder() {
+      super("identity");
+    }
+
+    @Override
+    public Content.Source newDecoderContentSource(Content.Source source) {
+      return source;
+    }
+  }
+
   private void ensureDecoderFactoriesInitialized() {
     if (decoderFactoriesInitialized) {
       return;
@@ -2665,8 +2756,7 @@ public class HTTP2JettyClient {
       lowLevelDebug("Zstd decoder disabled by blazemeter.http.disableZstdDecoder");
     } else {
       try {
-        zstdCompression = new ZstandardCompression();
-        zstdCompression.setByteBufferPool(bufferPool);
+        zstdCompression = sharedZstdCompression(byteBufferPoolFactor);
         zstdDecoderFactory = new CompressionContentDecoderFactory(zstdCompression);
         lowLevelDebug("Initialized Zstandard content decoder factory");
       } catch (Throwable t) {
@@ -2710,6 +2800,29 @@ public class HTTP2JettyClient {
         LOG.warn("Deflate decoder not available; skipping factory initialization", t);
       }
     }
+  }
+
+  /**
+   * One {@link ZstandardCompression} for every client in the JVM: in Jetty 12.1.11 each instance
+   * starts a {@code Cleaner} thread that only ends when a GC collects it, so one per client cost a
+   * thread per client for the whole test. It decodes with its own pool rather than a client's,
+   * since it outlives them all; zstd-jni needs direct buffers, which that pool also caps.
+   *
+   * <p>Started here, before any factory wraps it, on purpose:
+   * {@code CompressionContentDecoderFactory} installs a {@code Compression} that is already
+   * running as an unmanaged bean, so stopping one client's {@link HttpClient} stops its factory
+   * but never this instance. That is also why {@link #stopCompressionResources} only drops the
+   * reference.
+   */
+  private static synchronized ZstandardCompression sharedZstdCompression(int byteBufferPoolFactor)
+      throws Exception {
+    if (sharedZstdCompression == null) {
+      ZstandardCompression compression = new ZstandardCompression();
+      compression.setByteBufferPool(newByteBufferPool(byteBufferPoolFactor));
+      compression.start();
+      sharedZstdCompression = compression;
+    }
+    return sharedZstdCompression;
   }
 
   private void configureContentDecoders(HttpClient client, Request request) {
@@ -3041,7 +3154,17 @@ public class HTTP2JettyClient {
     if (entry == null) {
       return;
     }
-    ALT_SVC_CACHE.put(origin, entry);
+    // A refresh renews what the origin advertises, not what this client learned by using it. An
+    // origin that sends Alt-Svc on every HTTP/2 response would otherwise end its HTTP/3 broken
+    // cooldown after one request, and forget a recent HTTP/3 success that sets the race delay.
+    // compute() keeps a markHttp3Broken landing between the read and the write from being lost.
+    ALT_SVC_CACHE.compute(origin, (key, previous) -> {
+      if (previous != null) {
+        entry.brokenUntil = previous.brokenUntil;
+        entry.lastH3SuccessAt = previous.lastH3SuccessAt;
+      }
+      return entry;
+    });
     HTTP3_EXPLORE_IN_FLIGHT.remove(origin);
     if (ALT_SVC_CACHE.size() > PROTOCOL_CACHE_SOFT_MAX) {
       pruneExpiredProtocolCaches();
@@ -3439,6 +3562,7 @@ public class HTTP2JettyClient {
     URI uri = originalRequest.getURI();
     if (!client.isStarted()) {
       try {
+        blockServiceLoaderDecoders(client);
         client.start();
       } catch (Exception e) {
         throw new ExecutionException("Failed to start HTTP client", e);
@@ -3798,19 +3922,51 @@ public class HTTP2JettyClient {
   }
 
   /**
-   * @param maxMultiplex max concurrent exchanges per connection (HTTP/2/3); use {@code 1} for
-   *     HTTP/1-only transports so parallel requests open extra TCP connections instead of
-   *     failing with "Pipelined requests not supported".
+   * How many exchanges a connection carries at once is decided per connection, not per transport,
+   * because a dynamic transport settles the protocol per connection (ALPN, or plain {@code http://}
+   * as HTTP/1.1): see {@link #maxConcurrentExchanges}. This is how Jetty's own transports work -
+   * its HTTP/2, HTTP/3 and dynamic transports pool with {@code MultiplexConnectionPool} and take
+   * each connection's streams from the connection, and its HTTP/1.1 transport pools one exchange
+   * per connection.
+   *
+   * @param maxMultiplex how many exchanges the pool assumes a connection that is still being
+   *     opened will carry, which sizes how many connections it opens ahead of the requests waiting
+   *     for one; {@code 1} for HTTP/1-only transports, so parallel requests open their own
+   *     connections at once.
    */
   private void configureTransport(HttpClientTransport transport, int maxMultiplex) {
     transport.setConnectionPoolFactory((destination) -> {
-      MultiplexConnectionPool mcp = new MultiplexConnectionPool(
-          destination,
-          destination.getHttpClient().getMaxConnectionsPerDestination(),
-          maxMultiplex);
+      int maxConnections = destination.getHttpClient().getMaxConnectionsPerDestination();
+      // The protected constructor is the one that takes the pool, hence the subclass.
+      MultiplexConnectionPool mcp = new MultiplexConnectionPool(destination,
+          () -> new ConcurrentPool<>(ConcurrentPool.StrategyType.FIRST, maxConnections,
+              HTTP2JettyClient::maxConcurrentExchanges),
+          maxMultiplex) {
+      };
       mcp.setInitialMaxMultiplex(maxMultiplex);
       return mcp;
     });
+  }
+
+  /**
+   * How many exchanges the pool may put on one connection at a time.
+   *
+   * <p>An HTTP/2 or HTTP/3 connection says so itself ({@code MaxMultiplexable}: the streams its
+   * peer allows). An HTTP/1.1 connection does not, and carries one exchange at a time: Jetty
+   * aborts a second one put on it with "Pipelined requests not supported". Jetty's pool falls
+   * back to the transport's multiplexing value for such a connection, and on a transport that can
+   * end up on HTTP/1.1 - plain {@code http://}, or ALPN settling on {@code http/1.1} - that value
+   * is the stream count meant for HTTP/2. So every request the async controller had on the wire
+   * after the first went onto the first request's connection and failed.
+   *
+   * <p>The transport's value still sizes how many connections the pool opens ahead of demand, as
+   * before, so an HTTP/2 origin keeps sharing one connection.
+   */
+  static int maxConcurrentExchanges(org.eclipse.jetty.client.Connection connection) {
+    if (connection instanceof ConnectionPool.MaxMultiplexable) {
+      return ((ConnectionPool.MaxMultiplexable) connection).getMaxMultiplex();
+    }
+    return 1;
   }
 
   private String originKey(URI uri) {

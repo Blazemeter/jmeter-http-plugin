@@ -493,6 +493,30 @@ public class HTTP2JettyClientTest extends HTTP2TestBase {
   }
 
   @Test
+  public void shouldDecodeZstdAfterAnotherClientDecodingZstdWasStopped() throws Exception {
+    // Every client decodes zstd with the same ZstandardCompression; stopping a client stops the
+    // decoder factories it registered, and that must not stop the instance the others still use.
+    buildStartedServer();
+    HeaderManager hm = new HeaderManager();
+    hm.add(new Header(HttpHeader.ACCEPT_ENCODING.asString(), "zstd"));
+    sampler.setHeaderManager(hm);
+    HTTP2JettyClient other = new HTTP2JettyClient(false, "zstd-shared-other");
+    other.start();
+    try {
+      HTTPSampleResult first = other.sample(sampler,
+          buildBaseResult(createURL(SERVER_PATH_200_ZSTD), HTTPConstants.GET), false, 0);
+      assertThat(first.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
+    } finally {
+      other.stop();
+    }
+
+    HTTPSampleResult result = sampleWithGet(SERVER_PATH_200_ZSTD);
+    assertThat(result.isSuccessful()).isTrue();
+    assertThat(result.getResponseHeaders()).containsIgnoringCase("content-encoding: zstd");
+    assertThat(result.getResponseData()).containsExactly(BINARY_RESPONSE_BODY);
+  }
+
+  @Test
   public void shouldNotDuplicateSamplerDataForSingleRequest() throws Exception {
     buildStartedServer();
     HTTPSampleResult result = sampleWithGet(SERVER_PATH_200);

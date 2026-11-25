@@ -11,8 +11,11 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.util.JMeterUtils;
@@ -38,6 +41,13 @@ import org.junit.Assume;
 import org.junit.Test;
 
 public class HTTP3HappyEyeballsIntegrationTest extends HTTP2TestBase {
+
+  // Kept under the sampler's 5000ms response timeout, so a hold that is never released still ends
+  // in an HTTP/2 answer and the assertion that follows reports it.
+  private static final long H2_HOLD_MAX_MS = 4000L;
+
+  // While set, the HTTP/2 server does not answer until the HTTP/3 server has received a request.
+  private final AtomicReference<CountDownLatch> h2HeldUntilH3 = new AtomicReference<>();
 
   @Test
   public void shouldPreferHttp2WhenNoRecentH3SuccessUsesHalfDelay() throws Exception {
@@ -276,17 +286,23 @@ public class HTTP3HappyEyeballsIntegrationTest extends HTTP2TestBase {
         h3DelayMs.set(0L);
 
         // Second, confirm HTTP/3 is actually being attempted now, so that its absence later means
-        // something. No protocol is asserted on these samples: either side of the race may win.
-        boolean http3Attempted = false;
-        for (int attempt = 0; attempt < 6 && !http3Attempted; attempt++) {
-          int before = h3Requests.get();
-          HTTPSampleResult warmup = sample(client, sampler, url);
-          assertThat(warmup.isSuccessful()).isTrue();
-          http3Attempted = h3Requests.get() > before;
+        // something. No protocol is asserted on this sample: either side of the race may win.
+        // HTTP/2 is held until the HTTP/3 request has reached its server. Left to timing, HTTP/3
+        // only gets a 100ms head start while the first QUIC connection takes several of those to
+        // come up, so HTTP/2 answers first over its open connection and HTTP/3 never arrives.
+        CountDownLatch h3Reached = new CountDownLatch(1);
+        int h3BeforeWarmup = h3Requests.get();
+        HTTPSampleResult warmup;
+        h2HeldUntilH3.set(h3Reached);
+        try {
+          warmup = sample(client, sampler, url);
+        } finally {
+          h2HeldUntilH3.set(null);
         }
-        assertThat(http3Attempted)
+        assertThat(warmup.isSuccessful()).isTrue();
+        assertThat(h3Requests.get())
             .as("the origin must be reaching HTTP/3 before the cooldown can be shown to stop it")
-            .isTrue();
+            .isGreaterThan(h3BeforeWarmup);
 
         markHttp3Broken(client, url.toURI());
         int h3RequestsWhenBroken = h3Requests.get();
@@ -297,6 +313,133 @@ public class HTTP3HappyEyeballsIntegrationTest extends HTTP2TestBase {
         assertThat(h3Requests.get())
             .as("no HTTP/3 may be attempted once the origin is in the broken cooldown")
             .isEqualTo(h3RequestsWhenBroken);
+      } finally {
+        client.stop();
+      }
+    } catch (UnsatisfiedLinkError | NoClassDefFoundError e) {
+      Assume.assumeNoException("HTTP/3 native libraries not available", e);
+    } finally {
+      stopServer(h3Server);
+      stopServer(h2Server);
+      restoreProperty("httpJettyClient.enableHttp1", originalEnableHttp1);
+      restoreProperty("httpJettyClient.enableHttp2", originalEnableHttp2);
+      restoreProperty("httpJettyClient.enableHttp3", originalEnableHttp3);
+      restoreProperty("httpJettyClient.altSvcCacheEnabled", originalAltSvc);
+      restoreProperty("httpJettyClient.http3PriorKnowledge", originalH3Prior);
+      restoreProperty("httpJettyClient.happyEyeballsDelayMs", originalHappyEyeballs);
+      restoreProperty("httpJettyClient.fallbackEnabled", originalFallback);
+      restoreProperty("httpJettyClient.http3BrokenCooldownMs", originalBrokenCooldown);
+    }
+  }
+
+  @Test
+  public void shouldKeepHttp3BrokenCooldownWhenHttp2ResponsesRefreshAltSvc() throws Exception {
+    Assume.assumeTrue("HTTP/3 IT can be disabled with -Dit.http3=false", Boolean.parseBoolean(
+        System.getProperty("it.http3", "true")));
+
+    String originalEnableHttp1 = JMeterUtils.getProperty("httpJettyClient.enableHttp1");
+    String originalEnableHttp2 = JMeterUtils.getProperty("httpJettyClient.enableHttp2");
+    String originalEnableHttp3 = JMeterUtils.getProperty("httpJettyClient.enableHttp3");
+    String originalAltSvc = JMeterUtils.getProperty("httpJettyClient.altSvcCacheEnabled");
+    String originalH3Prior = JMeterUtils.getProperty("httpJettyClient.http3PriorKnowledge");
+    String originalHappyEyeballs = JMeterUtils.getProperty("httpJettyClient.happyEyeballsDelayMs");
+    String originalFallback = JMeterUtils.getProperty("httpJettyClient.fallbackEnabled");
+    String originalBrokenCooldown =
+        JMeterUtils.getProperty("httpJettyClient.http3BrokenCooldownMs");
+
+    // Long enough to cover both cooldown samples, the second of which can hold HTTP/2 for up to
+    // H2_HOLD_MAX_MS; short enough that the test can wait it out and see HTTP/3 come back.
+    long brokenCooldownMs = 8000L;
+
+    Server h2Server = null;
+    Server h3Server = null;
+
+    try {
+      clearClientProtocolCaches();
+      JMeterUtils.setProperty("httpJettyClient.enableHttp1", "false");
+      JMeterUtils.setProperty("httpJettyClient.enableHttp2", "true");
+      JMeterUtils.setProperty("httpJettyClient.enableHttp3", "true");
+      JMeterUtils.setProperty("httpJettyClient.altSvcCacheEnabled", "true");
+      JMeterUtils.setProperty("httpJettyClient.http3PriorKnowledge", "false");
+      JMeterUtils.setProperty("httpJettyClient.happyEyeballsDelayMs", "200");
+      JMeterUtils.setProperty("httpJettyClient.fallbackEnabled", "true");
+      JMeterUtils.setProperty("httpJettyClient.http3BrokenCooldownMs",
+          String.valueOf(brokenCooldownMs));
+
+      AtomicInteger h2Requests = new AtomicInteger();
+      AtomicLong h2DelayMs = new AtomicLong(0L);
+      AtomicInteger h3Requests = new AtomicInteger();
+      AtomicLong h3DelayMs = new AtomicLong(0L);
+      AtomicInteger altSvcPort = new AtomicInteger();
+
+      h2Server = startH2Server(h2Requests, h2DelayMs, altSvcPort);
+      int port = ((ServerConnector) h2Server.getConnectors()[0]).getLocalPort();
+      altSvcPort.set(port);
+
+      h3Server = startH3Server(port, h3Requests, h3DelayMs);
+
+      HTTP2Sampler sampler = buildSampler(port);
+      URL url = URI.create("https://localhost:" + port + "/").toURL();
+
+      HTTP2JettyClient client = new HTTP2JettyClient(false, "IT-HTTP3-HE-BrokenRefresh");
+      try {
+        client.start();
+        // First contact has nothing cached, so it goes over HTTP/2 alone and caches h3=true from
+        // its Alt-Svc. No race runs here, which matters: a race leaves its losing attempt writing
+        // the Alt-Svc cache after the sample returns, and that write is not ordered with the
+        // markHttp3Broken call below.
+        HTTPSampleResult altSvcLearn = sample(client, sampler, url);
+        assertThat(altSvcLearn.isSuccessful()).isTrue();
+        assertThat(altSvcLearn.getResponseHeaders()).startsWith("HTTP/2");
+        assertThat(h3Requests.get()).isZero();
+
+        long brokenAt = System.currentTimeMillis();
+        markHttp3Broken(client, url.toURI());
+
+        // Every HTTP/2 answer from this origin carries Alt-Svc again, so this one refreshes the
+        // cached entry while the origin is in its cooldown.
+        HTTPSampleResult refresh = sample(client, sampler, url);
+        assertThat(refresh.isSuccessful()).isTrue();
+        assertThat(refresh.getResponseHeaders()).startsWith("HTTP/2");
+        assertThat(h3Requests.get())
+            .as("no HTTP/3 may be attempted right after the origin is marked broken")
+            .isZero();
+
+        // The point of the test. HTTP/2 is held until HTTP/3 reaches its server, so an HTTP/3
+        // attempt cannot lose the race unseen while its first QUIC connection is still coming up.
+        HTTPSampleResult afterRefresh;
+        h2HeldUntilH3.set(new CountDownLatch(1));
+        try {
+          afterRefresh = sample(client, sampler, url);
+        } finally {
+          h2HeldUntilH3.set(null);
+        }
+        assertThat(System.currentTimeMillis() - brokenAt)
+            .as("both cooldown samples must run inside the cooldown for the check to mean anything")
+            .isLessThan(brokenCooldownMs);
+        assertThat(afterRefresh.isSuccessful()).isTrue();
+        assertThat(afterRefresh.getResponseHeaders()).startsWith("HTTP/2");
+        assertThat(h3Requests.get())
+            .as("an Alt-Svc refresh over HTTP/2 must not end the HTTP/3 broken cooldown")
+            .isZero();
+
+        // Control: once the cooldown is over HTTP/3 is attempted again, so the cooldown was the
+        // only thing keeping it off above, and carrying it over did not make it permanent.
+        long remainingMs = brokenAt + brokenCooldownMs - System.currentTimeMillis();
+        if (remainingMs > 0) {
+          Thread.sleep(remainingMs + 200L);
+        }
+        HTTPSampleResult afterCooldown;
+        h2HeldUntilH3.set(new CountDownLatch(1));
+        try {
+          afterCooldown = sample(client, sampler, url);
+        } finally {
+          h2HeldUntilH3.set(null);
+        }
+        assertThat(afterCooldown.isSuccessful()).isTrue();
+        assertThat(h3Requests.get())
+            .as("HTTP/3 must be attempted again once the cooldown has elapsed")
+            .isGreaterThan(0);
       } finally {
         client.stop();
       }
@@ -342,12 +485,16 @@ public class HTTP3HappyEyeballsIntegrationTest extends HTTP2TestBase {
       public boolean handle(Request request, Response response, Callback callback) {
         h2Requests.incrementAndGet();
         long delay = h2DelayMs.get();
-        if (delay > 0) {
-          try {
+        CountDownLatch hold = h2HeldUntilH3.get();
+        try {
+          if (delay > 0) {
             Thread.sleep(delay);
-          } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
           }
+          if (hold != null) {
+            hold.await(H2_HOLD_MAX_MS, TimeUnit.MILLISECONDS);
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
         }
         response.setStatus(200);
         response.getHeaders().put(HttpHeader.CONTENT_TYPE, "text/plain; charset=utf-8");
@@ -383,6 +530,10 @@ public class HTTP3HappyEyeballsIntegrationTest extends HTTP2TestBase {
       @Override
       public boolean handle(Request request, Response response, Callback callback) {
         h3Requests.incrementAndGet();
+        CountDownLatch h3Arrival = h2HeldUntilH3.get();
+        if (h3Arrival != null) {
+          h3Arrival.countDown();
+        }
         long delay = h3DelayMs.get();
         if (delay > 0) {
           try {

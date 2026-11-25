@@ -4,16 +4,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.blazemeter.jmeter.http2.core.HTTP2JettyClient;
 import com.blazemeter.jmeter.http2.sampler.HTTP2Sampler;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.apache.jmeter.config.Arguments;
 import org.apache.jmeter.engine.util.ValueReplacer;
@@ -35,39 +40,112 @@ public final class HttpMirrorParitySupport {
   private HttpMirrorParitySupport() {
   }
 
-  public static int findFreePort() throws IOException {
+  private static final int MIRROR_START_ATTEMPTS = 5;
+  private static final long MIRROR_START_TIMEOUT_MILLIS = 5_000;
+  private static final int PROBE_TIMEOUT_MILLIS = 1_000;
+
+  /** A started {@link HttpMirrorServer} and the port it really listens on. */
+  public static final class RunningMirror {
+
+    private final HttpMirrorServer server;
+    private final int port;
+
+    private RunningMirror(HttpMirrorServer server, int port) {
+      this.server = server;
+      this.port = port;
+    }
+
+    public HttpMirrorServer server() {
+      return server;
+    }
+
+    public int port() {
+      return port;
+    }
+  }
+
+  /**
+   * Starts a mirror on a free port and returns once that mirror - not something else - answers on
+   * it.
+   *
+   * <p>{@link HttpMirrorServer} extends {@link Thread} and binds its listening socket inside
+   * {@code run()}, so {@code start()} returns before the socket is bound. The free port is also
+   * only free when it is picked: something else can take it before the mirror binds, and the
+   * mirror then only logs the failure and ends, while the port keeps answering - or appears to: a
+   * probe to a free ephemeral port can even connect to itself. In CI a test got its connection
+   * refused that way. So the mirror is asked to echo a token, the answer must be an HTTP response
+   * carrying it, and a mirror that could not bind is replaced by one on another port.
+   */
+  public static RunningMirror startMirrorServer() throws Exception {
+    Exception lastFailure = null;
+    for (int attempt = 0; attempt < MIRROR_START_ATTEMPTS; attempt++) {
+      int port = findFreePort();
+      HttpMirrorServer server = new HttpMirrorServer(port, 10, 10);
+      server.start();
+      try {
+        awaitMirrorAnswering(server, port);
+        return new RunningMirror(server, port);
+      } catch (IllegalStateException e) {
+        lastFailure = e;
+        server.stopServer();
+        server.join(TimeUnit.SECONDS.toMillis(1));
+      }
+    }
+    throw new IllegalStateException(
+        "HttpMirrorServer did not start after " + MIRROR_START_ATTEMPTS + " attempts", lastFailure);
+  }
+
+  private static int findFreePort() throws IOException {
     try (ServerSocket socket = new ServerSocket(0)) {
       return socket.getLocalPort();
     }
   }
 
-  /**
-   * {@link HttpMirrorServer} extends {@link Thread} and binds its listening socket inside
-   * {@code run()}, so {@code start()} returns before the socket is actually bound - a race that
-   * only shows up under load (e.g. running the full suite), not when a test runs alone. Poll the
-   * port until it accepts a real connection before handing the server back.
-   */
-  public static HttpMirrorServer startMirrorServer(int port) throws Exception {
-    HttpMirrorServer server = new HttpMirrorServer(port, 10, 10);
-    server.start();
-    awaitListening(port);
-    return server;
-  }
-
-  private static void awaitListening(int port) throws InterruptedException {
-    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+  private static void awaitMirrorAnswering(HttpMirrorServer server, int port)
+      throws InterruptedException {
+    String token = "mirror-probe-" + UUID.randomUUID();
+    long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(MIRROR_START_TIMEOUT_MILLIS);
     IOException lastFailure = null;
     while (System.nanoTime() < deadline) {
-      try (Socket probe = new Socket()) {
-        probe.connect(new InetSocketAddress("localhost", port), 200);
-        return;
+      if (server.getException() != null || !server.isAlive()) {
+        throw new IllegalStateException(
+            "HttpMirrorServer could not listen on port " + port, server.getException());
+      }
+      try {
+        if (mirrorEchoes(port, token)) {
+          return;
+        }
       } catch (IOException e) {
         lastFailure = e;
-        Thread.sleep(20);
       }
+      Thread.sleep(20);
     }
     throw new IllegalStateException(
-        "HttpMirrorServer did not start listening on port " + port + " within 5s", lastFailure);
+        "HttpMirrorServer did not answer on port " + port + " within "
+            + MIRROR_START_TIMEOUT_MILLIS + " ms", lastFailure);
+  }
+
+  private static boolean mirrorEchoes(int port, String token) throws IOException {
+    try (Socket probe = new Socket()) {
+      probe.connect(new InetSocketAddress("localhost", port), PROBE_TIMEOUT_MILLIS);
+      probe.setSoTimeout(PROBE_TIMEOUT_MILLIS);
+      OutputStream out = probe.getOutputStream();
+      out.write(("GET /" + token + " HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+          .getBytes(StandardCharsets.US_ASCII));
+      out.flush();
+      ByteArrayOutputStream answer = new ByteArrayOutputStream();
+      InputStream in = probe.getInputStream();
+      byte[] buffer = new byte[1024];
+      int read;
+      while ((read = in.read(buffer)) != -1) {
+        answer.write(buffer, 0, read);
+      }
+      // A socket connected to itself reads back the request: only a response is the mirror's.
+      String text = answer.toString(StandardCharsets.ISO_8859_1.name());
+      return text.startsWith("HTTP/") && text.contains(token);
+    } catch (SocketTimeoutException e) {
+      return false;
+    }
   }
 
   public static HTTP2Sampler baseMirrorSampler(int mirrorPort, String method) {
