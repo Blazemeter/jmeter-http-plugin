@@ -125,9 +125,13 @@ public class SampleClockTest extends HTTP2TestBase {
     HTTP2FutureResponseListener listener = new HTTP2FutureResponseListener(-1);
     listener.completeWith(null, start, start + EXCHANGE_MILLIS);
 
+    // Each end is translated on its own call, and each call reads both clocks afresh. The two clocks
+    // tick their whole milliseconds at different moments, so the distance read between them can
+    // move by 1 ms from one call to the next - the resolution SampleClock documents (seen in CI:
+    // 61 ms for a 60 ms interval).
     assertThat(listener.getResponseEndOn(result) - listener.getResponseStartOn(result))
         .as("translating both ends of the same interval must preserve it")
-        .isEqualTo(EXCHANGE_MILLIS);
+        .isCloseTo(EXCHANGE_MILLIS, within(1L));
     assertThat(listener.getResponseStartOn(result) - start)
         .as("both stamps must land on the result's clock, %d ms from the wall clock here",
             -SKEW_MILLIS)
