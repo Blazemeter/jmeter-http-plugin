@@ -168,6 +168,39 @@ public class HTTP2FutureResponseListener extends BufferingResponseListener
   }
 
   /**
+   * Ends {@code result} at {@code end}, holding as idle time how long this exchange waited, once it
+   * completed, before it was collected at {@code collectedAtNanos}.
+   *
+   * <p>For a request sent again while it was being collected - a GOAWAY retry, an HTTP/1.1
+   * fallback, whether that last attempt succeeded or not. The result ends when the last attempt
+   * did, since that is when the request really finished. An async request is only collected on a
+   * later turn, behind the slower requests queued ahead of it in the async controller, and the time
+   * this exchange spent completed and waiting to be collected is not the request's time. It goes
+   * into {@code idleTime}, which JMeter subtracts from {@code end - start} and the async controller
+   * keeps a parent's pauses in: moving the start or the end instead would report a time that never
+   * happened, and the controller, which spans its parent sample from the earliest child start to
+   * the latest child end, would report the parent short by it.
+   *
+   * <p>No idle time when this exchange never completed, or completed only after the collection
+   * began: waiting for it then was waiting for the request.
+   *
+   * @param collectedAtNanos the {@link System#nanoTime()} reading of when the collection began
+   */
+  public void endHoldingQueueWaitAsIdle(SampleResult result, long collectedAtNanos, long end) {
+    OptionalLong exchangeEndNanos = getResponseEndNanos();
+    if (exchangeEndNanos.isPresent()) {
+      long queueWaitMillis = Math.max(0,
+          TimeUnit.NANOSECONDS.toMillis(collectedAtNanos - exchangeEndNanos.getAsLong()));
+      // setEndTime computes elapsed = end - start - idle, so the idle time has to be in first; and
+      // never more than the whole interval, which the truncation of each reading could otherwise
+      // make it by a millisecond.
+      result.setIdleTime(result.getIdleTime()
+          + Math.min(queueWaitMillis, Math.max(0, end - result.getStartTime())));
+    }
+    result.setEndTime(end);
+  }
+
+  /**
    * Adopts a result produced by a different request, used when a protocol race resolves in favour
    * of a competing attempt and the winner's response is reported through this listener.
    *

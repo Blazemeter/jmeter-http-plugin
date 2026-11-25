@@ -532,6 +532,12 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
             if (fallbackResult != null && fallbackResult.isSuccessful()) {
               LOG.info("HTTP/1.1 fallback succeeded: status={}", fallbackResult.getResponseCode());
+              if (collectionStartNanos.isPresent()) {
+                // Sent again while collecting: the response ended the result when the fallback
+                // got it, and the wait to be collected before it is still not the request's time.
+                holdQueueWaitAsIdle(fallbackResult, collectedListener, collectionStartNanos,
+                    fallbackResult.getEndTime());
+              }
               return fallbackResult;
             } else {
               LOG.warn("HTTP/1.1 fallback returned unsuccessful result");
@@ -683,33 +689,24 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
 
   /**
    * Ends a result that was sent again while being collected at {@code end}, holding the time it
-   * waited to be collected as idle time.
+   * waited to be collected as idle time. See
+   * {@link HTTP2FutureResponseListener#endHoldingQueueWaitAsIdle}.
    *
-   * <p>Also for a result a fallback already ended with the unsuccessful response it got: that end
-   * stays, since it is when the last attempt finished, but the wait before the collection is no
-   * more the request's time than when the fallback threw.
+   * <p>Also for a result a fallback already ended with the response it got: that end stays, since
+   * it is when the last attempt finished, but the wait before the collection is no more the
+   * request's time than when the fallback threw.
    */
   private static void holdQueueWaitAsIdle(HTTPSampleResult result,
                                           HTTP2FutureResponseListener listener,
                                           OptionalLong collectionStartNanos, long end) {
-    OptionalLong exchangeEndNanos =
-        listener == null ? OptionalLong.empty() : listener.getResponseEndNanos();
-    if (!exchangeEndNanos.isPresent()) {
+    if (listener == null) {
       result.setEndTime(end);
       return;
     }
     // Something was sent again, so a collection began: the turn that collects is the one that
-    // sends again. None when the exchange completed only after the collection began: waiting for
-    // it then was waiting for the request.
-    long collectedAt = collectionStartNanos.orElseGet(System::nanoTime);
-    long queueWaitMillis =
-        Math.max(0, TimeUnit.NANOSECONDS.toMillis(collectedAt - exchangeEndNanos.getAsLong()));
-    long start = result.getStartTime();
-    // setEndTime computes elapsed = end - start - idle, so the idle time has to be in first; and
-    // never more than the whole interval, which the truncation of each reading could otherwise make
-    // it by a millisecond.
-    result.setIdleTime(result.getIdleTime() + Math.min(queueWaitMillis, Math.max(0, end - start)));
-    result.setEndTime(end);
+    // sends again.
+    listener.endHoldingQueueWaitAsIdle(result, collectionStartNanos.orElseGet(System::nanoTime),
+        end);
   }
 
   /**

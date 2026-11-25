@@ -2059,12 +2059,25 @@ public class HTTP2JettyClient {
     lowLevelDebug("URL: {}", result.getURL());
 
     Request request = listener.getRequest();
+    // When this collection began, and how many requests this thread had sent by then: a successful
+    // response that came from sending the request again must end when that last attempt did, and
+    // leave out the time the request waited to be collected. See
+    // HTTP2FutureResponseListener#endHoldingQueueWaitAsIdle.
+    long collectedAtNanos = System.nanoTime();
+    long sentBeforeCollection = RequestsSentByThread.current();
     try {
       ContentResponse contentResponse = getContent(listener, request);
       JettyCacheManager cacheManager =
           JettyCacheManager.fromCacheManager(sampler.getCacheManager());
       postContentResponse(sampler, request, result, contentResponse, cacheManager);
-      stampSampleEnd(result, listener);
+      if (RequestsSentByThread.current() != sentBeforeCollection) {
+        // getContent sent the request again (an HTTP/1.1 fallback, a GOAWAY retry, ...) and this
+        // response is that attempt's: postContentResponse ended the result when it arrived.
+        // Stamping the exchange's end, the first attempt's, reported only that first attempt.
+        listener.endHoldingQueueWaitAsIdle(result, collectedAtNanos, result.getEndTime());
+      } else {
+        stampSampleEnd(result, listener);
+      }
 
       resetSamplerDataBeforeResultProcessing(result);
       return sampler.resultProcessing(areFollowingRedirect, depth, result);
@@ -2094,8 +2107,10 @@ public class HTTP2JettyClient {
           // Not from the listener: the only completion it ever recorded is the GOAWAY that killed
           // the first attempt. retryAfterGoAway sends a clone of its own and returns the response
           // it got, so the sample ends now - stamping the listener's end reported a sample that
-          // finished before the response it carries, missing the whole retry.
-          result.setEndTime(result.currentTimeInMillis());
+          // finished before the response it carries, missing the whole retry. The wait to be
+          // collected before the retry is not the request's time, though.
+          listener.endHoldingQueueWaitAsIdle(result, collectedAtNanos,
+              result.currentTimeInMillis());
           resetSamplerDataBeforeResultProcessing(result);
           return sampler.resultProcessing(areFollowingRedirect, depth, result);
         } catch (Exception retryException) {
@@ -2108,6 +2123,8 @@ public class HTTP2JettyClient {
               if (fallbackResult != null && fallbackResult.isSuccessful()) {
                 lowLevelDebug("HTTP/1.1 fallback succeeded: status={}",
                     fallbackResult.getResponseCode());
+                listener.endHoldingQueueWaitAsIdle(fallbackResult, collectedAtNanos,
+                    fallbackResult.getEndTime());
                 return fallbackResult;
               }
               LOG.warn("HTTP/1.1 fallback returned unsuccessful result");
@@ -2137,6 +2154,8 @@ public class HTTP2JettyClient {
             if (fallbackResult != null && fallbackResult.isSuccessful()) {
               lowLevelDebug("HTTP/1.1 fallback succeeded: status={}",
                   fallbackResult.getResponseCode());
+              listener.endHoldingQueueWaitAsIdle(fallbackResult, collectedAtNanos,
+                  fallbackResult.getEndTime());
               return fallbackResult;
             } else {
               LOG.warn("HTTP/1.1 fallback returned unsuccessful result");
