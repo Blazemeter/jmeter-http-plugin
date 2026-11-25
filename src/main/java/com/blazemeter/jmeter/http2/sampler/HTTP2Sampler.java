@@ -720,6 +720,9 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
    * <p>The recorder keeps its attempts on the wall clock, so the sample's own start is converted
    * before being used to select them: comparing the two clocks directly dropped attempts of this
    * very sample, or picked up attempts of the previous one, by however far apart the clocks were.
+   * The converted start is still only exact to the truncation of each reading, and can land a
+   * millisecond after it really was: a refused connection to a loopback address fails within that
+   * millisecond, so the start is moved back by the translation tolerance rather than drop it.
    * See {@link SampleClock}.
    */
   private void attachConnectAttempts(Throwable failure, HTTPSampleResult result) {
@@ -729,15 +732,22 @@ public class HTTP2Sampler extends HTTPSamplerBase implements LoopIterationListen
     try {
       HTTP2JettyClient client = CONNECTIONS.get().get(buildConnectionKey());
       if (client != null) {
-        long sampleStart = result.getStartTime();
-        client.attachConnectAttempts(failure, result.getURL(),
-            // 0 is the recorder's "everything held", and must stay a 0 rather than become the
-            // distance between the clocks.
-            sampleStart == 0 ? 0 : SampleClock.toWallClock(result, sampleStart));
+        client.attachConnectAttempts(failure, result.getURL(), connectAttemptsSince(result));
       }
     } catch (Exception ignored) {
       // Diagnostics must never replace the failure the sample is actually reporting.
     }
+  }
+
+  /** The wall-clock time from which connection attempts belong to {@code result}'s sample. */
+  @VisibleForTesting
+  static long connectAttemptsSince(SampleResult result) {
+    long sampleStart = result.getStartTime();
+    // 0 is the recorder's "everything held", and must stay a 0 rather than become the distance
+    // between the clocks.
+    return sampleStart == 0
+        ? 0
+        : SampleClock.toWallClock(result, sampleStart) - CLOCK_TRANSLATION_TOLERANCE_MILLIS;
   }
 
   /**
