@@ -168,15 +168,24 @@ public class AsyncControllerScheduledEndTest extends HTTP2TestBase {
           fixture.recorderNode());
     }
     System.out.println("failed dispatch: dispatched " + actual.dispatchOrder().size()
-        + " reported " + actual.topLevelLabels().size() + " hung: " + actual.hung());
+        + " sampled past the end " + actual.syncSampled() + " reported "
+        + actual.topLevelLabels().size() + " hung: " + actual.hung());
 
     SoftAssertions softly = new SoftAssertions();
     softly.assertThat(actual.uncaught()).as("the thread ended normally").isNull();
     softly.assertThat(actual.dispatchOrder()).as("the failing request was dispatched").isNotEmpty();
     softly.assertThat(actual.hung())
         .as("a failing request must not keep the thread past its scheduled end").isFalse();
-    softly.assertThat(actual.topLevelLabels())
-        .as("every failed dispatch is reported").hasSameSizeAs(actual.dispatchOrder());
+    // When the end falls between JMeterThread's check after a failed sample and the next turn, the
+    // controller sends that request synchronously and the thread stops after it, as a stock thread
+    // does. That one request is not a dispatch, so it is counted apart (seen in CI: 48 dispatched,
+    // 49 reported).
+    softly.assertThat(actual.syncSampled().size())
+        .as("at most one request once the end has gone by, as a stock thread sends")
+        .isLessThanOrEqualTo(1);
+    softly.assertThat(actual.topLevelLabels().size())
+        .as("every failed dispatch is reported, and so is a request sent past the end")
+        .isEqualTo(actual.dispatchOrder().size() + actual.syncSampled().size());
     softly.assertAll();
   }
 
